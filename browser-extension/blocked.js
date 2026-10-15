@@ -15,6 +15,10 @@ const COPY = {
     "This site was broken into and is being used to spread malware. Its owner may not know.",
   ],
   "blocked by you": ["Site blocked by you", "You added this site to your blocked sites in Phalanx."],
+  ads: [
+    "Ad or tracker blocked",
+    "This address serves ads or follows you across sites. Phalanx blocks these because ad blocking is on.",
+  ],
 };
 const [headline, lead] = COPY[category] || [
   "Dangerous site blocked",

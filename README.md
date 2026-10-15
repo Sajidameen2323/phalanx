@@ -157,6 +157,34 @@ popup. The popup also shows:
 
 It also has a button that opens Phalanx.
 
+**Ad and tracker blocking (optional, off by default).** Turn on **Block ads and
+trackers** on the Web protection page, in the extension's popup, or with
+`phalanx-cli web ads on`. Phalanx then also blocks the names on the
+[StevenBlack hosts](https://github.com/StevenBlack/hosts) list (about 74,000 ad,
+tracking and adware names, saved as `signatures/feed-ads.txt`). They match with
+their subdomains, like other domain rules, and report category `ads` from the list
+`adsBlockList` with verdict code 2. Threat rules are checked first, so a name on
+both lists still reports as malware. Known-good sites, your allowed sites,
+false-positive entries and the extension's exclusions still win.
+
+* **In the browser**, Browser Guard turns the names into `declarativeNetRequest`
+  rules, so scripts, images, frames and other requests *inside* pages are blocked,
+  not just pages you open. The connector hands the names out in list order, and the
+  extension packs them 1,000 to a rule within the browser's dynamic-rule limit. If
+  the browser refuses that many, the first half of the list is kept and the rest
+  dropped. Allowed and excluded names are left out of the rules. The rules are
+  rebuilt only when the list or your settings change. Opening an ad address
+  directly shows the warning page with the reason "Ad or tracker blocked". The
+  popup counts blocked ad requests today and in total. This count is read from the
+  browser at most once a minute, so it is approximate.
+* **In the DNS filter**, ad names get the sinkhole answer, and the block-page
+  server answers their `http://` requests with an empty `204` instead of a warning
+  page. Ad blocks are not written to the event log and never notify. The app shows
+  how many the filter blocked since it started.
+
+Ad blocking only blocks in **Block** mode. In report-only mode or with web
+protection off, ads load normally and nothing is logged.
+
 **DNS filter (whole PC).** When it is on and the app is running, a resolver runs on
 `127.0.0.1:53` and forwards lookups to the PC's own resolvers. It checks the name
 before forwarding and the answers afterwards, so a CNAME to a bad domain or an answer
@@ -279,6 +307,7 @@ phalanx-cli inspect FILE             # ask Gemini (needs GEMINI_API_KEY)
 phalanx-cli web check example.com https://x.example/a.exe [--resolve]
 phalanx-cli web status               # mode, rule counts, connected browsers, DNS filter
 phalanx-cli web mode block|report-only|off
+phalanx-cli web ads on|off           # ad and tracker blocking (off by default)
 phalanx-cli web allow SITE | block SITE | forget SITE
 phalanx-cli web events               # recent blocks
 phalanx-cli web connect              # register Browser Guard's connector, write the extension
@@ -325,6 +354,7 @@ The feeds are:
 | [ThreatFox](https://threatfox.abuse.ch/) recent SHA-256 IOCs | SHA-256 hashes with malware family names | CC0 |
 | [URLhaus](https://urlhaus.abuse.ch/) host file and online URLs | malware-distribution hosts and download links (web protection) | CC0 |
 | [ThreatFox](https://threatfox.abuse.ch/) recent domains, URLs and C2 addresses | malware sites and command-and-control servers (web protection; addresses only at confidence 75 or more) | CC0 |
+| [StevenBlack hosts](https://github.com/StevenBlack/hosts) base list | ad, tracker and adware names (used only when ad blocking is on) | MIT |
 
 How updates work:
 
@@ -336,6 +366,12 @@ How updates work:
   so each update merges new hashes into `signatures/feed-hashes.txt`. The list is
   capped at 750,000 entries, oldest dropped first. Update regularly to build up
   coverage.
+* **The ad list is replaced, not merged.** Names its maintainers drop are usually
+  false positives, so each changed download replaces `signatures/feed-ads.txt`. A
+  download with fewer than 1,000 names is treated as broken, and the previous list
+  is kept. The ad list is downloaded even while ad blocking is off (about 2 MB, and
+  only when it changed), so turning it on works straight away. The scanner never
+  reads it as a hash list.
 * **Downloaded rules are stored encoded** (`*.rules`). Plaintext signature
   collections are flagged by other antivirus products. Windows Defender reported a
   plaintext compiled copy as `Trojan:JS/Webshell`.

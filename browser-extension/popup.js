@@ -81,8 +81,33 @@ async function showSite(enabled) {
   $("total").textContent = reply.blockedTotal.toLocaleString();
   $("rules").textContent = status.rules >= 10000 ? `${Math.round(status.rules / 1000)}k` : status.rules.toLocaleString();
   $("updated").textContent = `Rules updated ${ago(status.feeds_updated)}`;
+  showAds(status, reply);
   await showSite(status.enabled);
 })();
+
+function showAds(status, reply) {
+  if (!reply.adsSupported || status.block_ads === undefined) return; // browser or Phalanx too old
+  $("ads").classList.remove("hidden");
+  $("ads-toggle").checked = status.block_ads;
+  if (status.block_ads && !status.ads) $("ads-note").textContent = "On, but the ad list is not downloaded yet. Update signatures in Phalanx.";
+  else if (status.block_ads && status.mode !== "block") $("ads-note").textContent = "On, but not blocking: Phalanx is in report-only mode.";
+  $("ads-count").textContent = status.block_ads || reply.adsTotal
+    ? `${reply.adsToday.toLocaleString()} blocked today · ${reply.adsTotal.toLocaleString()} in total`
+    : "";
+}
+
+$("ads-toggle").addEventListener("change", async (e) => {
+  const toggle = e.target;
+  toggle.disabled = true;
+  const reply = await api.runtime.sendMessage({ type: "setAds", on: toggle.checked });
+  toggle.disabled = false;
+  if (!reply || !reply.ok) {
+    toggle.checked = !toggle.checked;
+    $("ads-note").textContent = "Could not change it: " + ((reply && reply.error) || "Phalanx is not reachable");
+  } else {
+    $("ads-note").textContent = reply.block_ads ? "On. Ads and trackers are blocked inside pages." : "Off. Ads load normally.";
+  }
+});
 
 $("mark").addEventListener("change", (e) => api.storage.local.set({ markResults: e.target.checked }));
 

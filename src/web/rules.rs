@@ -2,7 +2,8 @@
 //!
 //! Rules block on five axes (domain, URL, IP/CIDR, TCP port, and DNS CNAME
 //! targets) and come from three places: the built-in list, downloaded feeds
-//! and the user's own block list. Allow lists (the user's, known-good names,
+//! and the user's own block list. The optional ad and tracker list is kept
+//! apart and only consulted when no threat rule matched. Allow lists (the user's, known-good names,
 //! false-positive reductions and exclusions requested by the browser
 //! extension) override a match.
 //!
@@ -72,6 +73,8 @@ pub enum Origin {
     /// Downloaded threat-intelligence feeds (refreshed by `update`).
     Feed,
     User,
+    /// The optional ad and tracker list (domains only).
+    Ads,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +245,8 @@ pub struct RuleCounts {
     pub networks: usize,
     pub ports: usize,
     pub allowed: usize,
+    /// Ad and tracker domains (not counted as threat rules).
+    pub ads: usize,
 }
 
 impl RuleCounts {
@@ -267,6 +272,8 @@ pub struct WebRules {
     /// prefix length in use.
     networks: BTreeMap<(bool, u8), HashMap<IpAddr, RuleInfo>>,
     ports: HashMap<u16, RuleInfo>,
+    /// Ad and tracker domains, checked after the threat rules.
+    ads: HashMap<String, RuleInfo>,
     known_good: HashSet<String>,
     fp_domains: HashSet<String>,
     fp_networks: Vec<Cidr>,
@@ -283,12 +290,19 @@ impl WebRules {
     /// Built-in rules, the downloaded feed file (when given and present) and
     /// the user's lists.
     pub fn load(feed_file: Option<&Path>, user: &UserLists) -> Result<Self> {
+        Self::load_with_ads(feed_file, None, user)
+    }
+
+    /// As [`load`](Self::load), plus the ad and tracker list when given and
+    /// present.
+    pub fn load_with_ads(feed_file: Option<&Path>, ads_file: Option<&Path>, user: &UserLists) -> Result<Self> {
         let mut rules = Self::default();
         rules.add_text(BUILTIN_RULES, Origin::Builtin, "built-in web rules")?;
-        if let Some(path) = feed_file {
+        for (path, origin) in [(feed_file, Origin::Feed), (ads_file, Origin::Ads)] {
+            let Some(path) = path else { continue };
             match std::fs::read_to_string(path) {
                 Ok(text) => {
-                    rules.add_text(&text, Origin::Feed, &path.display().to_string())?;
+                    rules.add_text(&text, origin, &path.display().to_string())?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
@@ -342,6 +356,9 @@ impl WebRules {
             let threat = if rest.is_empty() { format!("Web.{}", capitalize(category)) } else { rest.join(" ") };
             let info = RuleInfo { category: self.intern(category), threat: self.intern(&threat), origin };
             let ok = match kind {
+                // The ad list only blocks names; anything else in it is ignored.
+                "domain" if origin == Origin::Ads => normalize_host(value).map(|h| self.ads.insert(h, info)).is_some(),
+                _ if origin == Origin::Ads => false,
                 "domain" => normalize_host(value).map(|h| self.domains.insert(h, info)).is_some(),
                 "url" => WebAddress::parse(value).map(|a| self.urls.insert(a.normalized(), info)).is_some(),
                 "ip" => Cidr::parse(value)
@@ -382,6 +399,7 @@ impl WebRules {
             networks: self.networks.values().map(HashMap::len).sum(),
             ports: self.ports.len(),
             allowed: self.user_allow.len() + self.user_allow_networks.len(),
+            ads: self.ads.len(),
         }
     }
 
@@ -390,6 +408,7 @@ impl WebRules {
             Origin::Builtin => format!("{kind}BlockList"),
             Origin::Feed => format!("feed{}BlockList", capitalize(kind)),
             Origin::User => "userBlockList".to_string(),
+            Origin::Ads => "adsBlockList".to_string(),
         }
     }
 
@@ -397,12 +416,13 @@ impl WebRules {
     /// classifier: find the most specific matching block rule, then let
     /// known-good, user, false-positive and extension exclusions override it.
     /// The user's own block rules are only overridden by the user's allow list.
+    /// Ad and tracker names are only looked up when no threat rule matched.
     pub fn classify_domain(&self, name: &str) -> Verdict {
         let Some(name) = normalize_host(name) else { return Verdict::clean(name) };
         if let Ok(ip) = name.parse::<IpAddr>() {
             return self.classify_ip(ip, None);
         }
-        let Some((rule, info)) = suffix_lookup(&self.domains, &name) else {
+        let Some((rule, info)) = suffix_lookup(&self.domains, &name).or_else(|| suffix_lookup(&self.ads, &name)) else {
             return Verdict::clean(&name);
         };
         if info.origin != Origin::User && self.is_known_good(&name) {
@@ -518,6 +538,21 @@ impl WebRules {
             }
         }
         excluded.unwrap_or(first)
+    }
+
+    /// Names that would otherwise fall under an ad rule but are allowed
+    /// (known-good, the user's allow list, false positives and browser
+    /// exclusions), for blockers that cannot ask per request.
+    pub fn ad_exclusions(&self) -> Vec<String> {
+        let mut out: Vec<String> = [&self.known_good, &self.user_allow, &self.fp_domains, &self.extension_exclusions]
+            .into_iter()
+            .flatten()
+            .filter(|name| suffix_lookup(&self.ads, name).is_some())
+            .cloned()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn is_known_good(&self, name: &str) -> bool {
@@ -651,6 +686,24 @@ mod tests {
             .map(VerdictCode::number)
             .collect();
         assert_eq!(blocking, [1, 2, 3]);
+    }
+
+    #[test]
+    fn ad_rules_are_separate_and_still_excludable() {
+        let user = UserLists { allow: vec!["ok.ads.example".into()], ..Default::default() };
+        let mut r = rules("domain both.example malware Real.Threat\n", user);
+        let ads = "domain ads.example ads StevenBlack.Ads\ndomain both.example ads X\ndomain google.com ads X\nurl http://x.example/a ads X\n";
+        assert_eq!(r.add_text(ads, Origin::Ads, "ads").unwrap(), 3);
+        let v = r.classify_domain("pixel.ads.example");
+        assert_eq!((v.code, v.list.as_str(), v.category.as_str(), v.threat.as_str()), (VerdictCode::BadDomain, "adsBlockList", "ads", "StevenBlack.Ads"));
+        assert_eq!(r.classify_url("https://ads.example/track.js").list, "adsBlockList");
+        assert_eq!(r.classify_domain("both.example").category, "malware", "threat rules win");
+        assert_eq!(r.classify_domain("ok.ads.example").code, VerdictCode::UserAllowed);
+        assert_eq!(r.classify_domain("google.com").code, VerdictCode::KnownGood);
+        assert_eq!(r.classify_url("http://x.example/a").code, VerdictCode::Clean, "only names come from the ad list");
+        // Known-good names under the google.com ad rule come along too.
+        assert_eq!(r.ad_exclusions(), ["docs.google.com", "drive.google.com", "google.com", "ok.ads.example"]);
+        assert_eq!((r.counts().ads, r.counts().domains), (3, WebRules::load(None, &UserLists::default()).unwrap().counts().domains + 1));
     }
 
     #[test]

@@ -8,6 +8,10 @@
 //! name never leaves the PC); the answers are checked after (CNAME targets
 //! and resolved addresses). Serves UDP and TCP (for truncated replies).
 //!
+//! Ad and tracker names (only in the rules when ad blocking is on) are
+//! sinkholed the same way but never logged or notified, which would be far
+//! too noisy; they are only counted.
+//!
 //! It only filters programs that use Windows' resolver, so Windows' DNS
 //! server must point at the listen address, and browsers' own "secure DNS"
 //! (DNS over HTTPS) bypasses it.
@@ -23,7 +27,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -56,10 +60,12 @@ struct FilterContext {
     recent: Mutex<HashMap<String, Instant>>,
     on_event: Option<OnEvent>,
     in_flight: AtomicUsize,
+    ads_blocked: Arc<AtomicU64>,
 }
 
 pub struct DnsFilter {
     stop: Arc<AtomicBool>,
+    ads_blocked: Arc<AtomicU64>,
     tcp_addr: SocketAddr,
     threads: Vec<JoinHandle<()>>,
     udp_addr: SocketAddr,
@@ -81,6 +87,7 @@ impl DnsFilter {
         udp.set_read_timeout(Some(Duration::from_millis(400)))?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let ads_blocked = Arc::new(AtomicU64::new(0));
         let ctx = Arc::new(FilterContext {
             config,
             rules,
@@ -88,6 +95,7 @@ impl DnsFilter {
             recent: Mutex::new(HashMap::new()),
             on_event,
             in_flight: AtomicUsize::new(0),
+            ads_blocked: ads_blocked.clone(),
         });
         let mut threads = Vec::new();
         {
@@ -98,11 +106,16 @@ impl DnsFilter {
             let (ctx, stop) = (ctx.clone(), stop.clone());
             threads.push(std::thread::Builder::new().name("dns-filter-tcp".into()).spawn(move || serve_tcp(tcp, ctx, stop))?);
         }
-        Ok(Self { stop, tcp_addr, threads, udp_addr })
+        Ok(Self { stop, ads_blocked, tcp_addr, threads, udp_addr })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.udp_addr
+    }
+
+    /// Ad and tracker lookups answered with the sinkhole since it started.
+    pub fn ads_blocked(&self) -> u64 {
+        self.ads_blocked.load(Ordering::Relaxed)
     }
 
     pub fn stop(mut self) {
@@ -217,6 +230,13 @@ fn answer(ctx: &FilterContext, query: &[u8], tcp: bool) -> Option<Vec<u8>> {
 /// Records a match. Returns whether to block (false in report-only mode).
 fn report(ctx: &FilterContext, name: &str, verdict: &Verdict) -> bool {
     let block = ctx.config.mode == Mode::Block;
+    if verdict.category == "ads" {
+        if block {
+            ctx.ads_blocked.fetch_add(1, Ordering::Relaxed);
+            ctx.cache.insert_quiet(name);
+        }
+        return block;
+    }
     if block {
         ctx.cache.insert(name, verdict);
     }
@@ -348,6 +368,41 @@ mod tests {
         assert_eq!(cache.find("hosted.example").unwrap().verdict.code, crate::web::VerdictCode::BadIp);
         assert_eq!(*seen.lock().unwrap(), ["blocktest.phalanx.invalid", "alias.example", "hosted.example"], "logged once per name");
         assert_eq!(events::recent(tmp.path(), 10).len(), 3);
+        filter.stop();
+    }
+
+    #[test]
+    fn ads_are_sinkholed_quietly_and_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rules = WebRules::load(None, &UserLists::default()).unwrap();
+        rules.add_text("domain doubleclick.net ads StevenBlack.Ads\n", Origin::Ads, "t").unwrap();
+        let cache = Arc::new(RedirectionCache::new());
+        let sinkhole: Ipv4Addr = "127.66.0.1".parse().unwrap();
+        let notified = Arc::new(AtomicUsize::new(0));
+        let n2 = notified.clone();
+        let filter = DnsFilter::start(
+            FilterConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstreams: vec![fake_upstream()],
+                sinkhole,
+                mode: Mode::Block,
+                data_dir: Some(tmp.path().to_path_buf()),
+            },
+            Arc::new(RwLock::new(Arc::new(rules))),
+            cache.clone(),
+            Some(Box::new(move |_: &WebEvent| {
+                n2.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .unwrap();
+        let server = filter.local_addr();
+        assert_eq!(lookup(server, "ad.doubleclick.net", TYPE_A).answers, [Answer::Address(sinkhole.into())]);
+        lookup(server, "ad.doubleclick.net", TYPE_AAAA);
+        assert_eq!(lookup(server, "fine.example", TYPE_A).answers, [Answer::Address("192.0.2.1".parse().unwrap())]);
+        assert_eq!(filter.ads_blocked(), 2);
+        assert_eq!(notified.load(Ordering::SeqCst), 0, "not notified");
+        assert!(events::recent(tmp.path(), 10).is_empty(), "not logged");
+        assert!(cache.find("ad.doubleclick.net").is_none() && cache.is_quiet("ad.doubleclick.net"));
         filter.stop();
     }
 

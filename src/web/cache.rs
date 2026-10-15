@@ -5,9 +5,13 @@
 //! Entries are keyed by a token handed out on insert (it goes into the block
 //! page link) and looked up by name (from the HTTP `Host` header). The cache
 //! is bounded and drops its oldest entry first.
+//!
+//! Blocked ad and tracker names are kept in a separate bounded set without a
+//! reason, so the block-page server answers them with an empty response (no
+//! warning page inside an ad frame) and they never push real blocks out.
 
 use super::rules::Verdict;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,6 +32,8 @@ struct Inner {
     by_domain: HashMap<String, u32>,
     order: VecDeque<u32>,
     next: u32,
+    quiet: HashSet<String>,
+    quiet_order: VecDeque<String>,
 }
 
 pub struct RedirectionCache {
@@ -76,6 +82,23 @@ impl RedirectionCache {
         token
     }
 
+    /// Records a blocked ad or tracker name (no block page for it).
+    pub fn insert_quiet(&self, domain: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.quiet.insert(domain.to_string()) {
+            inner.quiet_order.push_back(domain.to_string());
+            while inner.quiet_order.len() > CAPACITY {
+                if let Some(old) = inner.quiet_order.pop_front() {
+                    inner.quiet.remove(&old);
+                }
+            }
+        }
+    }
+
+    pub fn is_quiet(&self, domain: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).quiet.contains(domain)
+    }
+
     pub fn get(&self, token: u32) -> Option<Entry> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).by_token.get(&token).cloned()
     }
@@ -116,5 +139,16 @@ mod tests {
         assert!(cache.find("d0.example").is_none());
         let last = cache.find(&format!("d{CAPACITY}.example")).unwrap();
         assert_eq!(cache.get(last.token).unwrap().domain, format!("d{CAPACITY}.example"));
+    }
+
+    #[test]
+    fn quiet_names_are_bounded_and_separate() {
+        let cache = RedirectionCache::new();
+        for i in 0..=CAPACITY {
+            cache.insert_quiet(&format!("ad{i}.example"));
+        }
+        assert!(!cache.is_quiet("ad0.example"), "oldest dropped");
+        assert!(cache.is_quiet(&format!("ad{CAPACITY}.example")));
+        assert!(cache.is_empty(), "no block-page entries");
     }
 }

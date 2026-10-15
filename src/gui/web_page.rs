@@ -50,8 +50,8 @@ pub(super) struct WebState {
 }
 
 /// The settings that decide which rules are loaded.
-fn rule_inputs(c: &WebConfig) -> (&[String], &[String], &[String], bool) {
-    (&c.user_allow, &c.user_block, &c.extension_exclusions, c.use_feeds)
+fn rule_inputs(c: &WebConfig) -> (&[String], &[String], &[String], bool, bool) {
+    (&c.user_allow, &c.user_block, &c.extension_exclusions, c.use_feeds, c.block_ads)
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -302,6 +302,7 @@ impl App {
 
     fn web_status_card(&mut self, ui: &mut Ui) {
         let connected = self.web.browsers.iter().filter(|b| b.current).count();
+        let ads_blocked = self.web.filter.as_ref().map(|(f, _)| f.ads_blocked());
         let config = &mut self.web.config;
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -346,6 +347,22 @@ impl App {
                 "Use downloaded threat feeds",
                 "URLhaus and ThreatFox lists of malware sites, download links and command-and-control servers, refreshed with Update signatures.",
             );
+            setting_toggle(
+                ui,
+                &mut config.block_ads,
+                "Block ads and trackers",
+                "Uses the StevenBlack ad and tracker list (refreshed with Update signatures) in Browser Guard, inside pages too, and in the DNS filter. Ad blocks are counted, not logged or notified.",
+            );
+            if config.block_ads {
+                let mut line = match self.web.counts.ads {
+                    0 => "The ad list is not downloaded yet. Run Update signatures.".to_string(),
+                    n => format!("{n} ad and tracker names"),
+                };
+                if let Some(n) = ads_blocked {
+                    line.push_str(&format!(" · {n} blocked by the DNS filter since it started"));
+                }
+                small(ui, line);
+            }
         });
     }
 

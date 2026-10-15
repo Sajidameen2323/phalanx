@@ -5,7 +5,10 @@
 //! rolling window of recent samples, so new hashes are merged into a local
 //! list that grows with every update (oldest entries are dropped past a cap).
 //! Web feeds (malicious domains, URLs and C2 addresses) are merged the same
-//! way into `feed-web.txt`, which web protection loads.
+//! way into `feed-web.txt`, which web protection loads. The ad and tracker
+//! list is a full snapshot instead (entries its maintainers drop are usually
+//! false positives), saved as `feed-ads.txt` and only loaded when ad blocking
+//! is switched on.
 
 use crate::engine::{encode_rules, parse_digest};
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,6 +27,8 @@ const FEED_HASH_FILE: &str = "feed-hashes.txt";
 /// Upper bound on merged web rules.
 pub const MAX_FEED_WEB: usize = 500_000;
 const MANIFEST_FILE: &str = "manifest.json";
+/// Fewest names an ad list download must have to replace the current one.
+const MIN_ADS: usize = 1000;
 
 pub struct Source {
     pub name: &'static str,
@@ -40,6 +45,8 @@ pub enum SourceKind {
     WebHostfile { category: &'static str, threat: &'static str },
     /// abuse.ch-style quoted CSV of web indicators.
     WebCsv(WebCsv),
+    /// A hosts file of ad and tracker names; replaces the ad list each time.
+    AdsHostfile { threat: &'static str },
 }
 
 pub struct WebCsv {
@@ -136,6 +143,12 @@ pub const SOURCES: &[Source] = &[
             confidence: Some((9, 75)),
         }),
     },
+    Source {
+        // MIT licensed; adware and malware names merged from several lists.
+        name: "StevenBlack hosts (ads and trackers)",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        kind: SourceKind::AdsHostfile { threat: "StevenBlack.Ads" },
+    },
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,6 +210,7 @@ fn installed_file(sig_dir: &Path, source: &Source) -> PathBuf {
         SourceKind::YaraZip { file, .. } => sig_dir.join(file),
         SourceKind::HashCsv { .. } => sig_dir.join(FEED_HASH_FILE),
         SourceKind::WebHostfile { .. } | SourceKind::WebCsv(_) => sig_dir.join(crate::web::config::FEED_FILE),
+        SourceKind::AdsHostfile { .. } => sig_dir.join(crate::web::config::ADS_FILE),
     }
 }
 
@@ -319,6 +333,7 @@ pub fn update_all(sig_dir: &Path, force: bool, on_progress: &mut dyn FnMut(&str)
                     let (seen, added) = web.merge_csv(&String::from_utf8_lossy(&bytes), csv)?;
                     Ok(format!("{seen} indicators in feed, {added} new"))
                 }
+                SourceKind::AdsHostfile { threat } => install_ads(&bytes, threat, &sig_dir.join(crate::web::config::ADS_FILE)),
             }
         });
         statuses.push(match result {
@@ -434,6 +449,23 @@ fn install_yara_zip(bytes: &[u8], entry_suffix: &str, target: &Path) -> Result<S
     }
     write_atomic(target, &encode_rules(&text))?;
     Ok(format!("{count} rules"))
+}
+
+/// Replaces the ad list with the names in a downloaded hosts file.
+fn install_ads(bytes: &[u8], threat: &str, target: &Path) -> Result<String> {
+    let mut ads = FeedWeb { lines: Vec::new(), known: HashSet::new(), trimmed: false };
+    let (seen, _) = ads.merge_hostfile(&String::from_utf8_lossy(bytes), "ads", threat)?;
+    // A real ad list has tens of thousands of names; a tiny one is an error page.
+    if seen < MIN_ADS {
+        bail!("only {seen} names in the ad list, keeping the previous version");
+    }
+    let mut text = String::from("# Ad and tracker names from `phalanx-cli update`. Do not edit; it is rewritten.\n");
+    for line in &ads.lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    write_atomic(target, text.as_bytes())?;
+    Ok(format!("{} ad and tracker names", ads.len()))
 }
 
 /// The merged local hash list, kept in insertion order (oldest first).
@@ -567,7 +599,13 @@ impl FeedWeb {
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             let mut parts = line.split_whitespace();
             let (Some(_address), Some(name)) = (parts.next(), parts.next()) else { continue };
-            let Some(host) = crate::web::url::normalize_host(name).filter(|h| h.contains('.') && !h.contains(':')) else { continue };
+            // Hosts files start with entries for this PC (`localhost.localdomain`, `0.0.0.0`).
+            let Some(host) = crate::web::url::normalize_host(name)
+                .filter(|h| h.contains('.') && !h.contains(':') && h.parse::<std::net::IpAddr>().is_err())
+                .filter(|h| !h.starts_with("localhost.") && !h.ends_with(".localdomain"))
+            else {
+                continue;
+            };
             seen += 1;
             added += self.add("domain", &host, category, threat) as usize;
         }
@@ -741,6 +779,27 @@ mod tests {
         assert!(rules.classify_url("http://files.example/x.exe").blocks());
         assert!(rules.classify_domain("bad.example").blocks());
         assert_eq!(FeedWeb::load(&path).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn ad_list_replaces_itself_and_skips_local_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(crate::web::config::ADS_FILE);
+        let header = "127.0.0.1 localhost\n127.0.0.1 localhost.localdomain\n255.255.255.255 broadcasthost\n::1 ip6-localhost\n0.0.0.0 0.0.0.0\n";
+        let names: String = (0..MIN_ADS).map(|i| format!("0.0.0.0 ads{i}.example\n")).collect();
+        let first = format!("{header}0.0.0.0 doubleclick.net\n{names}");
+        assert_eq!(install_ads(first.as_bytes(), "StevenBlack.Ads", &target).unwrap(), format!("{} ad and tracker names", MIN_ADS + 1));
+        let saved = fs::read_to_string(&target).unwrap();
+        assert!(saved.lines().nth(1) == Some("domain doubleclick.net ads StevenBlack.Ads"), "list order is kept");
+        assert!(!saved.contains("localhost") && !saved.contains(" 0.0.0.0 "));
+        // A new download replaces the list: names it dropped are gone.
+        install_ads(format!("{header}{names}").as_bytes(), "StevenBlack.Ads", &target).unwrap();
+        assert!(!fs::read_to_string(&target).unwrap().contains("doubleclick"));
+        // A short or empty download keeps the previous list.
+        assert!(install_ads(b"0.0.0.0 one.example\n", "x", &target).is_err());
+        assert!(install_ads(b"<html>rate limited</html>", "x", &target).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap().lines().count(), MIN_ADS + 1);
+        assert!(installed_file(tmp.path(), SOURCES.last().unwrap()).ends_with(crate::web::config::ADS_FILE));
     }
 
     #[test]

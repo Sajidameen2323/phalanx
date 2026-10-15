@@ -100,6 +100,8 @@ enum WebCommand {
     },
     /// Block matches, only report them, or turn browser checks off.
     Mode { mode: ModeArg },
+    /// Turn ad and tracker blocking on or off (browser and DNS filter).
+    Ads { state: OnOff },
     /// Always allow a site (name, URL or CIDR range).
     Allow { site: String },
     /// Always block a site (name, URL or CIDR range).
@@ -162,6 +164,12 @@ enum WebCommand {
     /// Serve the browser connector on stdin/stdout (browsers start this).
     #[command(hide = true)]
     NativeHost,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -783,6 +791,14 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
                 counts.ports,
                 if config.use_feeds { "" } else { ", feeds off" }
             );
+            println!(
+                "Ad blocking:    {}",
+                match (config.block_ads, counts.ads) {
+                    (false, _) => "off".to_string(),
+                    (true, 0) => "on, but the ad list is not downloaded yet (run `phalanx-cli update`)".to_string(),
+                    (true, n) => format!("on ({n} ad and tracker names)"),
+                }
+            );
             println!("Browsers:");
             for b in &browsers {
                 let state = match (&b.manifest, b.current) {
@@ -825,6 +841,19 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
                 ModeArg::Off => "off in the browser",
             };
             println!("Web protection is now {state}.");
+            Ok(ExitCode::SUCCESS)
+        }
+        WebCommand::Ads { state } => {
+            let mut config = load_config()?;
+            config.block_ads = matches!(state, OnOff::On);
+            save(&config)?;
+            if !config.block_ads {
+                println!("Ad and tracker blocking is now off.");
+            } else if web::config::ads_file(dir).is_file() {
+                println!("Ad and tracker blocking is now on.");
+            } else {
+                println!("Ad and tracker blocking is now on. Run `phalanx-cli update` to download the ad list.");
+            }
             Ok(ExitCode::SUCCESS)
         }
         WebCommand::Allow { site } | WebCommand::Block { site } => {
@@ -1013,6 +1042,7 @@ fn web_serve(
         (
             modified(web::WebConfig::path(dir)),
             modified(update::signature_dir(dir).join(web::config::FEED_FILE)),
+            modified(web::config::ads_file(dir)),
         )
     };
     let mut seen = stamp();

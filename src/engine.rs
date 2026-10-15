@@ -83,7 +83,7 @@ impl Engine {
                 rule_files.push((format!("feed_{}", identifier(stem)), file));
             }
             // Web protection keeps its own lists here too; they are not hashes.
-            let not_hashes = [crate::web::config::FEED_FILE, crate::web::extensions::USER_BAD_EXTENSIONS];
+            let not_hashes = [crate::web::config::FEED_FILE, crate::web::config::ADS_FILE, crate::web::extensions::USER_BAD_EXTENSIONS];
             hash_files.extend(
                 files_with_extension(dir, &["txt"])?
                     .into_iter()
@@ -467,6 +467,7 @@ mod tests {
         // Web protection's lists share the folder and must not be read as hashes.
         fs::write(dir.join(crate::web::config::FEED_FILE), "domain bad.example malware X\n").unwrap();
         fs::write(dir.join(crate::web::extensions::USER_BAD_EXTENSIONS), "abcdefghijklmnopabcdefghijklmnop\n").unwrap();
+        fs::write(dir.join(crate::web::config::ADS_FILE), "domain doubleclick.net ads StevenBlack.Ads\n").unwrap();
 
         let engine = Engine::new(&EngineConfig {
             signature_dir: Some(dir.to_path_buf()),

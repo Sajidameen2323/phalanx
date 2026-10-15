@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 const FILE: &str = "web-protection.json";
 /// Downloaded web rules, inside the signature folder.
 pub const FEED_FILE: &str = "feed-web.txt";
+/// Downloaded ad and tracker domains, inside the signature folder.
+pub const ADS_FILE: &str = "feed-ads.txt";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +38,8 @@ pub struct WebConfig {
     pub extension_exclusions: Vec<String>,
     /// Use rules from downloaded feeds (not just built-in and your own).
     pub use_feeds: bool,
+    /// Also block ad and tracker domains (from the downloaded ad list).
+    pub block_ads: bool,
     /// Run the local DNS filter (the desktop app runs it while open).
     pub dns_filter: bool,
     /// Where the DNS filter listens. Point Windows' DNS server here.
@@ -60,6 +64,7 @@ impl Default for WebConfig {
             user_block: Vec::new(),
             extension_exclusions: Vec::new(),
             use_feeds: true,
+            block_ads: false,
             dns_filter: false,
             dns_listen: "127.0.0.1:53".into(),
             dns_upstream: Vec::new(),
@@ -104,7 +109,8 @@ impl WebConfig {
     /// Loads every rule these settings ask for.
     pub fn load_rules(&self, data_dir: &Path) -> Result<WebRules> {
         let feed = self.use_feeds.then(|| crate::update::signature_dir(data_dir).join(FEED_FILE));
-        WebRules::load(feed.as_deref(), &self.user_lists())
+        let ads = self.block_ads.then(|| ads_file(data_dir));
+        WebRules::load_with_ads(feed.as_deref(), ads.as_deref(), &self.user_lists())
     }
 
     /// Adds `site` to the allow list (removing it from the block list).
@@ -156,6 +162,11 @@ impl WebConfig {
             .collect();
         if system.is_empty() { vec!["1.1.1.1:53".parse().expect("valid"), "1.0.0.1:53".parse().expect("valid")] } else { system }
     }
+}
+
+/// The downloaded ad and tracker list.
+pub fn ads_file(data_dir: &Path) -> PathBuf {
+    crate::update::signature_dir(data_dir).join(ADS_FILE)
 }
 
 /// `1.1.1.1` or `1.1.1.1:53` or `[2606:4700::1111]:53`.
@@ -273,6 +284,23 @@ mod tests {
         assert_eq!(WebConfig::load(tmp.path()).unwrap(), c);
         std::fs::write(WebConfig::path(tmp.path()), "{ broken").unwrap();
         assert!(WebConfig::load(tmp.path()).is_err());
+        // Settings from before ad blocking existed load with it off.
+        std::fs::write(WebConfig::path(tmp.path()), r#"{"enabled": true}"#).unwrap();
+        assert!(!WebConfig::load(tmp.path()).unwrap().block_ads);
+        std::fs::write(WebConfig::path(tmp.path()), "{ broken").unwrap();
+        assert!(WebConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn ad_list_loads_only_when_switched_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::update::signature_dir(tmp.path())).unwrap();
+        std::fs::write(ads_file(tmp.path()), "domain doubleclick.net ads StevenBlack.Ads\n").unwrap();
+        let mut c = WebConfig::default();
+        assert!(!c.load_rules(tmp.path()).unwrap().classify_domain("doubleclick.net").blocks());
+        c.block_ads = true;
+        let v = c.load_rules(tmp.path()).unwrap().classify_domain("ad.doubleclick.net");
+        assert_eq!((v.blocks(), v.category.as_str(), v.list.as_str()), (true, "ads", "adsBlockList"));
     }
 
     #[test]

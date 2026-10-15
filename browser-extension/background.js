@@ -2,12 +2,22 @@
 // messaging host on this PC) about every page a tab opens, and replaces
 // blocked pages with a warning. If Phalanx is not reachable, browsing is
 // never blocked; the toolbar icon shows "!" instead.
+//
+// With ad blocking on in Phalanx, ad and tracker requests inside pages are
+// blocked too, by declarativeNetRequest rules built from the names the
+// connector hands out (rebuilt whenever its revision changes).
 
 const api = globalThis.browser ?? globalThis.chrome;
 const HOST = "com.phalanx.browser_guard";
 const CHECK_TIMEOUT_MS = 4000;
 const VERDICT_TTL_MS = 5 * 60 * 1000;
 const MAX_CACHE = 5000;
+const dnr = api.declarativeNetRequest;
+// Ad names per blocking rule; the browser caps the number of rules, not names.
+const ADS_PER_RULE = 1000;
+// How often navigation may trigger an ad-rule refresh or a blocked-ads tally.
+const ADS_SYNC_MS = 5 * 60 * 1000;
+const ADS_TALLY_MS = 60 * 1000;
 
 let port = null;
 let nextId = 1;
@@ -147,6 +157,102 @@ async function countBlock() {
   });
 }
 
+// Counted one after another, so matches arriving together are not lost.
+let adsCounting = Promise.resolve();
+function countAds(n) {
+  if (!n) return adsCounting;
+  adsCounting = adsCounting.then(async () => {
+    const s = await api.storage.local.get({ adsTotal: 0, adsDay: "", adsToday: 0 });
+    const sameDay = s.adsDay === today();
+    await api.storage.local.set({ adsTotal: s.adsTotal + n, adsDay: today(), adsToday: (sameDay ? s.adsToday : 0) + n });
+  }).catch(() => {});
+  return adsCounting;
+}
+
+// ---------- ad and tracker blocking ----------
+
+let adsSyncing = null;
+let adsCheckedAt = 0;
+let adsTalliedAt = 0;
+
+// The most dynamic rules this browser allows (older Chrome: 5000).
+function ruleBudget() {
+  return dnr.MAX_NUMBER_OF_DYNAMIC_RULES ?? dnr.MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES ?? 5000;
+}
+
+function adRules(domains, excluded) {
+  const rules = [];
+  for (let i = 0; i < domains.length; i += ADS_PER_RULE) {
+    const condition = { requestDomains: domains.slice(i, i + ADS_PER_RULE), excludedResourceTypes: ["main_frame"] };
+    if (excluded.length) condition.excludedRequestDomains = excluded;
+    rules.push({ id: rules.length + 1, priority: 1, action: { type: "block" }, condition });
+  }
+  return rules;
+}
+
+async function replaceAdRules(domains, excluded) {
+  const old = (await dnr.getDynamicRules()).map((r) => r.id);
+  // Names come in list order, so when the browser refuses (too many rules
+  // or too large), keep the first half and try again.
+  let keep = Math.min(domains.length, ruleBudget() * ADS_PER_RULE);
+  for (;;) {
+    try {
+      await dnr.updateDynamicRules({ removeRuleIds: old, addRules: adRules(domains.slice(0, keep), excluded) });
+      return keep;
+    } catch (e) {
+      if (keep === 0) throw e;
+      keep = Math.floor(keep / 2);
+    }
+  }
+}
+
+// Brings the blocking rules in line with Phalanx when its revision changed
+// (or always, with `force`). `revision` is from a status reply, if at hand.
+function syncAds(force = false, revision = null) {
+  if (!dnr) return Promise.resolve();
+  if (adsSyncing) return adsSyncing;
+  adsSyncing = (async () => {
+    adsCheckedAt = Date.now();
+    const stored = await api.storage.local.get({ adsRevision: "" });
+    if (!force && revision && revision === stored.adsRevision) return;
+    const first = await ask({ type: "ads_domains", offset: 0 });
+    if (!first || first.type !== "ads_domains") return;
+    if (!force && first.revision === stored.adsRevision) return;
+    let domains = first.domains || [];
+    while (domains.length < first.total) {
+      const page = await ask({ type: "ads_domains", offset: domains.length });
+      if (!page || page.revision !== first.revision || !page.domains || !page.domains.length) return; // retried next time
+      domains = domains.concat(page.domains);
+    }
+    const kept = await replaceAdRules(first.active ? domains : [], first.excluded || []);
+    await api.storage.local.set({ adsRevision: first.revision, adsActive: first.active, adsRules: kept });
+  })()
+    .catch(() => {})
+    .finally(() => {
+      adsSyncing = null;
+    });
+  return adsSyncing;
+}
+
+// Counts blocked ad requests. Unpacked extensions get every match as it
+// happens; otherwise recent matches are read at most once a minute.
+async function tallyAds() {
+  if (!dnr || dnr.onRuleMatchedDebug || !dnr.getMatchedRules || Date.now() - adsTalliedAt < ADS_TALLY_MS) return;
+  adsTalliedAt = Date.now();
+  try {
+    const s = await api.storage.local.get({ adsSeenAt: 0 });
+    const { rulesMatchedInfo = [] } = await dnr.getMatchedRules({ minTimeStamp: s.adsSeenAt + 1 });
+    const fresh = rulesMatchedInfo.filter((m) => m.timeStamp > s.adsSeenAt);
+    if (!fresh.length) return;
+    await api.storage.local.set({ adsSeenAt: Math.max(...fresh.map((m) => m.timeStamp)) });
+    await countAds(fresh.length);
+  } catch {
+    // Over the browser's call quota; try again later.
+  }
+}
+
+if (dnr && dnr.onRuleMatchedDebug) dnr.onRuleMatchedDebug.addListener(() => countAds(1));
+
 function blockPageUrl(url, v) {
   const params = new URLSearchParams({
     url,
@@ -163,10 +269,13 @@ function blockPageUrl(url, v) {
 
 async function guard(details) {
   if (details.frameId !== 0 || !/^https?:/i.test(details.url)) return;
+  if (Date.now() - adsCheckedAt > ADS_SYNC_MS) syncAds();
+  tallyAds();
   if (allowedOnce.has(hostOf(details.url))) return;
   const v = await check(details.url);
   if (!v || !v.block) return;
-  countBlock();
+  if (v.category === "ads") countAds(1);
+  else countBlock();
   try {
     await api.tabs.update(details.tabId, { url: blockPageUrl(details.url, v) });
   } catch {
@@ -186,14 +295,36 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg && msg.type) {
       case "status": {
         const status = await ask({ type: "status" });
-        const stats = await api.storage.local.get({ blockedTotal: 0, blockedDay: "", blockedToday: 0, markResults: true });
+        if (status) syncAds(false, status.ads_revision);
+        await tallyAds();
+        const stats = await api.storage.local.get({
+          blockedTotal: 0,
+          blockedDay: "",
+          blockedToday: 0,
+          markResults: true,
+          adsTotal: 0,
+          adsDay: "",
+          adsToday: 0,
+        });
         sendResponse({
           ...state,
           status,
           blockedTotal: stats.blockedTotal,
           blockedToday: stats.blockedDay === today() ? stats.blockedToday : 0,
           markResults: stats.markResults,
+          adsTotal: stats.adsTotal,
+          adsToday: stats.adsDay === today() ? stats.adsToday : 0,
+          adsSupported: Boolean(dnr),
         });
+        break;
+      }
+      case "setAds": {
+        const reply = await ask({ type: "set_ads", on: Boolean(msg.on) });
+        if (reply && reply.ok) {
+          verdicts.clear();
+          await syncAds(true);
+        }
+        sendResponse(reply);
         break;
       }
       case "check":
@@ -211,6 +342,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (reply && reply.ok) {
           verdicts.clear();
           allowedOnce.add(hostOf(msg.url));
+          syncAds();
         }
         sendResponse(reply);
         break;
@@ -226,3 +358,4 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 connect();
+syncAds();

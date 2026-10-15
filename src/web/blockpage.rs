@@ -155,6 +155,8 @@ pub fn respond(request: &str, addr: SocketAddr, cache: &RedirectionCache) -> Vec
     let original = format!("http://{host}{target}");
     let location = match cache.find(&name) {
         Some(entry) => block_page_url(addr, Some(&entry), &original),
+        // A blocked ad or tracker: answer with nothing.
+        None if cache.is_quiet(&name) => return http(204, "No Content", "text/plain; charset=utf-8", b""),
         None => block_page_url(addr, None, &original),
     };
     format!(
@@ -324,6 +326,14 @@ mod tests {
         assert!(text.contains("&url=http%3A%2F%2FBlockTest.phalanx.invalid%3A80%2Fsetup.exe%3Fx%3D1"));
         assert!(text.contains("&threat=Phalanx.TestBlock.Malware&code=2&domain=blocktest.phalanx.invalid"));
         assert!(text.contains("\r\nConnection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn blocked_ads_get_an_empty_answer() {
+        let (cache, _, addr) = setup();
+        cache.insert_quiet("ad.doubleclick.net");
+        let text = String::from_utf8(respond("GET /pixel.gif HTTP/1.1\r\nHost: ad.doubleclick.net\r\n\r\n", addr, &cache)).unwrap();
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n") && text.contains("Content-Length: 0\r\n"), "{text}");
     }
 
     #[test]

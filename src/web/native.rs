@@ -9,11 +9,15 @@
 //! * `{"type":"exclude","site":"…"}` → adds a browser exclusion (verdict 6)
 //! * `{"type":"check_many","urls":[…]}` → verdicts for search results (not logged)
 //! * `{"type":"open_app"}` → starts the Phalanx app
+//! * `{"type":"ads_domains","offset":n}` → one page of the ad and tracker
+//!   names to block inside pages, in list order, with a `revision` that
+//!   changes when they do (`active` is false while ad blocking is off)
+//! * `{"type":"set_ads","on":…}` → switches ad blocking on or off
 //!
 //! It reloads the settings and rules when their files change, so changes in
 //! the desktop app apply without restarting the browser.
 
-use super::config::{Mode, WebConfig, FEED_FILE};
+use super::config::{ads_file, Mode, WebConfig, FEED_FILE};
 use super::events::{self, WebEvent};
 use super::rules::WebRules;
 use anyhow::{bail, Context, Result};
@@ -34,6 +38,10 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 const RELOAD_CHECK: Duration = Duration::from_secs(3);
 /// Most addresses checked in one `check_many` request.
 const MAX_BATCH: usize = 200;
+/// Ad names per `ads_domains` reply (replies to the browser must stay under 1 MB).
+const ADS_PAGE: usize = 20_000;
+/// Most ad names handed to the browser; the first in list order are kept.
+pub const MAX_AD_DOMAINS: usize = 150_000;
 
 /// The extension's files, embedded so the app can write them out for
 /// "Load unpacked".
@@ -64,9 +72,11 @@ struct HostState {
     data_dir: PathBuf,
     config: WebConfig,
     rules: WebRules,
-    loaded_from: (Option<SystemTime>, Option<SystemTime>),
+    loaded_from: [Option<SystemTime>; 3],
     last_check: Instant,
     error: Option<String>,
+    /// Ad names for the browser, in list order; built on first request.
+    ad_domains: Option<Vec<String>>,
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -79,20 +89,26 @@ impl HostState {
             data_dir: data_dir.to_path_buf(),
             config: WebConfig::default(),
             rules: WebRules::default(),
-            loaded_from: (None, None),
+            loaded_from: [None; 3],
             last_check: Instant::now(),
             error: None,
+            ad_domains: None,
         };
         state.reload();
         state
     }
 
-    fn sources(&self) -> (Option<SystemTime>, Option<SystemTime>) {
-        (modified(&WebConfig::path(&self.data_dir)), modified(&crate::update::signature_dir(&self.data_dir).join(FEED_FILE)))
+    fn sources(&self) -> [Option<SystemTime>; 3] {
+        [
+            modified(&WebConfig::path(&self.data_dir)),
+            modified(&crate::update::signature_dir(&self.data_dir).join(FEED_FILE)),
+            modified(&ads_file(&self.data_dir)),
+        ]
     }
 
     fn reload(&mut self) {
         self.loaded_from = self.sources();
+        self.ad_domains = None;
         let loaded = WebConfig::load(&self.data_dir).and_then(|config| {
             let rules = config.load_rules(&self.data_dir)?;
             Ok((config, rules))
@@ -170,7 +186,40 @@ impl HostState {
                     "counts": counts,
                     "feeds_updated": manifest.last_success(),
                     "error": self.error,
+                    "block_ads": self.config.block_ads,
+                    "ads": counts.ads,
+                    "ads_revision": self.ads_revision(),
                 })
+            }
+            Some("ads_domains") => {
+                let offset = request.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let revision = self.ads_revision();
+                let active = self.ads_active();
+                let domains = if active { self.ad_domains() } else { &[] };
+                let page: Vec<&String> = domains.iter().skip(offset).take(ADS_PAGE).collect();
+                let mut reply = json!({
+                    "type": "ads_domains",
+                    "active": active,
+                    "revision": revision,
+                    "total": domains.len(),
+                    "offset": offset,
+                    "domains": page,
+                });
+                if offset == 0 && active {
+                    reply["excluded"] = json!(self.rules.ad_exclusions());
+                }
+                reply
+            }
+            Some("set_ads") => {
+                let mut config = self.config.clone();
+                config.block_ads = request.get("on").and_then(Value::as_bool).unwrap_or(false);
+                match config.save(&self.data_dir) {
+                    Ok(()) => {
+                        self.reload();
+                        json!({ "type": "ads_set", "ok": true, "block_ads": self.config.block_ads, "ads_revision": self.ads_revision() })
+                    }
+                    Err(e) => json!({ "type": "ads_set", "ok": false, "error": format!("{e:#}") }),
+                }
             }
             Some("exclude") => {
                 let mut config = self.config.clone();
@@ -197,11 +246,45 @@ impl HostState {
         reply
     }
 
+    /// Ad blocking applies in the browser: switched on, protecting and blocking.
+    fn ads_active(&self) -> bool {
+        self.config.block_ads && self.config.enabled && self.config.mode == Mode::Block
+    }
+
+    /// Changes whenever the ad names or their exclusions might have.
+    fn ads_revision(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.ads_active().hash(&mut h);
+        self.loaded_from.hash(&mut h);
+        self.rules.counts().ads.hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    /// The ad list's names in file order (most important first), without
+    /// names an exclusion allows, capped at [`MAX_AD_DOMAINS`].
+    fn ad_domains(&mut self) -> &[String] {
+        if self.ad_domains.is_none() {
+            let text = std::fs::read_to_string(ads_file(&self.data_dir)).unwrap_or_default();
+            let domains = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("domain "))
+                .filter_map(|l| l.split_whitespace().next())
+                .filter(|d| self.rules.classify_domain(d).blocks())
+                .take(MAX_AD_DOMAINS)
+                .map(str::to_string)
+                .collect();
+            self.ad_domains = Some(domains);
+        }
+        self.ad_domains.as_deref().unwrap_or_default()
+    }
+
     fn check(&self, url: &str) -> Value {
         let verdict = self.rules.classify_url(url);
         let matched = verdict.blocks();
         let block = matched && self.config.enabled && self.config.mode == Mode::Block;
-        if matched && self.config.enabled {
+        // Ads are not logged: far too many, and not threats.
+        if matched && self.config.enabled && verdict.category != "ads" {
             events::record(&self.data_dir, &WebEvent::new("browser", block, url, &verdict));
         }
         json!({
@@ -465,6 +548,35 @@ mod tests {
         assert_eq!(events::recent(tmp.path(), 1)[0].action, "reported");
         state.config.enabled = false;
         assert_eq!(state.handle(&json!({"type": "check", "url": "http://blocktest.phalanx.invalid/"}))["block"], false);
+    }
+
+    #[test]
+    fn hands_out_ad_names_in_pages_and_switches_ads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::update::signature_dir(tmp.path())).unwrap();
+        let mut list = String::from("# header\ndomain doubleclick.net ads StevenBlack.Ads\ndomain google.com ads StevenBlack.Ads\n");
+        list.extend((0..ADS_PAGE).map(|i| format!("domain t{i}.example ads StevenBlack.Ads\n")));
+        std::fs::write(ads_file(tmp.path()), list).unwrap();
+        let mut state = HostState::new(tmp.path());
+        let off = state.handle(&json!({"type": "ads_domains"}));
+        assert_eq!((off["active"].as_bool(), off["total"].as_u64()), (Some(false), Some(0)), "off by default");
+        assert!(!state.handle(&json!({"type": "check", "url": "https://doubleclick.net/"}))["block"].as_bool().unwrap());
+
+        let set = state.handle(&json!({"type": "set_ads", "on": true}));
+        assert_eq!((set["ok"].as_bool(), set["block_ads"].as_bool()), (Some(true), Some(true)));
+        assert!(WebConfig::load(tmp.path()).unwrap().block_ads);
+        assert_ne!(set["ads_revision"], off["revision"]);
+        let first = state.handle(&json!({"type": "ads_domains", "offset": 0}));
+        assert_eq!((first["active"].as_bool(), first["total"].as_u64()), (Some(true), Some(ADS_PAGE as u64 + 1)), "known-good google.com left out");
+        assert_eq!(first["domains"][0], "doubleclick.net", "list order kept");
+        assert_eq!(first["domains"].as_array().unwrap().len(), ADS_PAGE);
+        assert!(first["excluded"].as_array().unwrap().contains(&json!("google.com")));
+        assert_eq!(first["revision"], set["ads_revision"]);
+        let second = state.handle(&json!({"type": "ads_domains", "offset": ADS_PAGE}));
+        assert_eq!(second["domains"], json!([format!("t{}.example", ADS_PAGE - 1)]));
+        let v = state.handle(&json!({"type": "check", "url": "https://ad.doubleclick.net/x"}));
+        assert_eq!((v["block"].as_bool(), v["category"].as_str(), v["list"].as_str()), (Some(true), Some("ads"), Some("adsBlockList")));
+        assert_eq!(state.handle(&json!({"type": "status"}))["ads"].as_u64(), Some(ADS_PAGE as u64 + 2));
     }
 
     #[test]
