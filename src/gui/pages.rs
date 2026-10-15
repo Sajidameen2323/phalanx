@@ -191,7 +191,7 @@ impl App {
                         Err(_) => "failed to load".into(),
                     };
                     match self.manifest.last_success() {
-                        Some(t) => muted(ui, format!("Updated {} · {counts}", short_time(t))),
+                        Some(t) => muted(ui, format!("Updated {} · {counts} · {} web rules", short_time(t), self.web.counts.blocking())),
                         None => {
                             ui.label(RichText::new("Never updated: only the small built-in set is active.").color(AMBER));
                         }
@@ -199,13 +199,34 @@ impl App {
                 });
             });
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if let Some(job) = &self.updating {
                     ui.add(egui::Spinner::new().color(ACCENT));
                     truncated(ui, job.step.clone(), MUTED, 13.0);
-                } else {
-                    update_clicked = primary_button(ui, "Update now").clicked();
+                    return;
                 }
+                if self.update_check_rx.is_some() {
+                    ui.add(egui::Spinner::new().color(ACCENT));
+                    muted(ui, "Checking feeds for new data…");
+                    return;
+                }
+                let checked = self
+                    .settings
+                    .last_update_check
+                    .map(|t| format!(", last checked {} ago", fmt_duration(Duration::from_secs(unix_now().saturating_sub(t)))))
+                    .unwrap_or_default();
+                if self.settings.auto_update {
+                    status_dot(ui, GREEN, 4.0);
+                    let every = match self.settings.auto_update_hours {
+                        1 => "every hour".to_string(),
+                        h => format!("every {h} hours"),
+                    };
+                    muted(ui, format!("Updates automatically {every}{checked}"));
+                } else {
+                    status_dot(ui, AMBER, 4.0);
+                    muted(ui, format!("Automatic updates are off{checked}"));
+                }
+                update_clicked = small_button(ui, "Check now").clicked();
             });
         });
         if update_clicked {

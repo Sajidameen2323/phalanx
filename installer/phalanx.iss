@@ -12,7 +12,7 @@
 
 #define AppName "Phalanx"
 #ifndef AppVersion
-  #define AppVersion "0.2.0"
+  #define AppVersion "0.2.1"
 #endif
 #define AppExe "phalanx.exe"
 #define CliExe "phalanx-cli.exe"

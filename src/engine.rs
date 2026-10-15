@@ -82,7 +82,13 @@ impl Engine {
                 let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("feed");
                 rule_files.push((format!("feed_{}", identifier(stem)), file));
             }
-            hash_files.extend(files_with_extension(dir, &["txt"])?);
+            // Web protection keeps its own lists here too; they are not hashes.
+            let not_hashes = [crate::web::config::FEED_FILE, crate::web::extensions::USER_BAD_EXTENSIONS];
+            hash_files.extend(
+                files_with_extension(dir, &["txt"])?
+                    .into_iter()
+                    .filter(|p| !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| not_hashes.iter().any(|x| n.eq_ignore_ascii_case(x)))),
+            );
         }
         let mut user_rules = Vec::new();
         for path in &config.rule_paths {
@@ -458,6 +464,9 @@ mod tests {
         fs::write(dir.join("feed.rules"), &encoded).unwrap();
         let blob = b"some downloaded sample";
         fs::write(dir.join("hashes.txt"), hex::encode(Sha256::digest(blob))).unwrap();
+        // Web protection's lists share the folder and must not be read as hashes.
+        fs::write(dir.join(crate::web::config::FEED_FILE), "domain bad.example malware X\n").unwrap();
+        fs::write(dir.join(crate::web::extensions::USER_BAD_EXTENSIONS), "abcdefghijklmnopabcdefghijklmnop\n").unwrap();
 
         let engine = Engine::new(&EngineConfig {
             signature_dir: Some(dir.to_path_buf()),

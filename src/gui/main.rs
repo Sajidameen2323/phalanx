@@ -640,7 +640,9 @@ impl App {
                     let _ = tx.send(UpdateMsg::Step(step.to_string()));
                     ctx.request_repaint();
                 })?;
-                if !manifest.installed_anything() {
+                // A manual update always recompiles, so it also repairs an
+                // engine that failed to load after an earlier update.
+                if auto && !manifest.installed_anything() {
                     return Ok((manifest, None));
                 }
                 let _ = tx.send(UpdateMsg::Step("Compiling rules…".into()));
@@ -695,6 +697,10 @@ impl App {
                     (_, false) if !auto => self.notify(
                         format!("Some sources failed and kept their previous version: {}", failed.join(", ")),
                         false,
+                    ),
+                    (Some((rules, hashes)), _) if updated.is_empty() => self.notify(
+                        format!("Signatures are up to date: {rules} rules, {hashes} known-bad hashes, {} web rules", self.web.counts.blocking()),
+                        true,
                     ),
                     (Some((rules, hashes)), _) => self.notify(
                         format!(
