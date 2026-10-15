@@ -63,8 +63,10 @@ $("back").addEventListener("click", () => {
 });
 
 $("once").addEventListener("click", async () => {
-  await api.runtime.sendMessage({ type: "allowOnce", url: safeUrl });
-  location.replace(safeUrl);
+  // Allowed in this tab only, until it leaves the site.
+  const reply = await api.runtime.sendMessage({ type: "allowOnce", url: safeUrl });
+  if (reply && reply.ok) location.replace(safeUrl);
+  else $("message").textContent = "Could not continue to the site from here.";
 });
 
 $("always").addEventListener("click", async () => {

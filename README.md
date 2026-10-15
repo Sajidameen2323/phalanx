@@ -134,7 +134,8 @@ writes the extension to `<data folder>\browser-extension`. Load that folder once
 browser with **Load unpacked** (Developer mode). The extension asks Phalanx about
 every page a tab opens. A dangerous page is replaced by a warning page with **Go
 back to safety**. Under **Details and options** you can also **Continue this time**
-or **Always allow this site** (verdict 6). This works for `https://` sites too,
+(only in that tab, until it leaves the site or closes; the site is blocked again
+everywhere else) or **Always allow this site** (verdict 6). This works for `https://` sites too,
 without intercepting TLS or installing a certificate. If Phalanx is unreachable, the
 extension never blocks; its icon shows `!` instead.
 

@@ -23,7 +23,10 @@ let port = null;
 let nextId = 1;
 const pending = new Map();
 const verdicts = new Map(); // address -> { verdict, at }
-const allowedOnce = new Set(); // hosts the user chose to visit anyway, until the browser restarts
+// tab id -> host the user chose to visit anyway in that tab. It lasts until
+// the tab leaves that site or closes; other tabs and later visits are
+// blocked again.
+const allowedOnce = new Map();
 const state = { connected: false, error: "" };
 
 function connect() {
@@ -267,11 +270,20 @@ function blockPageUrl(url, v) {
   return api.runtime.getURL("blocked.html") + "?" + params.toString();
 }
 
+// The same host, or one a subdomain of the other (example.com and www.example.com).
+function sameSite(a, b) {
+  return a === b || a.endsWith("." + b) || b.endsWith("." + a);
+}
+
 async function guard(details) {
   if (details.frameId !== 0 || !/^https?:/i.test(details.url)) return;
   if (Date.now() - adsCheckedAt > ADS_SYNC_MS) syncAds();
   tallyAds();
-  if (allowedOnce.has(hostOf(details.url))) return;
+  const allowed = allowedOnce.get(details.tabId);
+  if (allowed !== undefined) {
+    if (sameSite(hostOf(details.url), allowed)) return;
+    allowedOnce.delete(details.tabId); // left the site: the allowance ends
+  }
   const v = await check(details.url);
   if (!v || !v.block) return;
   if (v.category === "ads") countAds(1);
@@ -287,6 +299,7 @@ async function guard(details) {
 // address after server-side redirects).
 api.webNavigation.onBeforeNavigate.addListener(guard);
 api.webNavigation.onCommitted.addListener(guard);
+api.tabs.onRemoved.addListener((tabId) => allowedOnce.delete(tabId));
 
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Only this extension's own pages and content scripts talk to the background.
@@ -334,14 +347,14 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(await checkMany((msg.urls || []).slice(0, 200)));
         break;
       case "allowOnce":
-        allowedOnce.add(hostOf(msg.url));
-        sendResponse({ ok: true });
+        if (sender.tab) allowedOnce.set(sender.tab.id, hostOf(msg.url));
+        sendResponse({ ok: Boolean(sender.tab) });
         break;
       case "exclude": {
         const reply = await ask({ type: "exclude", site: msg.url });
         if (reply && reply.ok) {
           verdicts.clear();
-          allowedOnce.add(hostOf(msg.url));
+          if (sender.tab) allowedOnce.set(sender.tab.id, hostOf(msg.url));
           syncAds();
         }
         sendResponse(reply);
