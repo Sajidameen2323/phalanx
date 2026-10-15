@@ -275,7 +275,32 @@ function sameSite(a, b) {
   return a === b || a.endsWith("." + b) || b.endsWith("." + a);
 }
 
-async function guard(details) {
+// Tabs a page opened (pop-ups, pop-unders, target=_blank links) that have not
+// shown a page yet.
+const pageOpened = new Set();
+
+// An ad or tracker opened as a whole page gets no warning: a tab a page opened
+// for it is closed ("closed"), and a tab that was showing a page goes back to
+// it ("back"; before the commit it is left to load first: "wait"). Only an ad
+// address typed into a blank tab shows the block page ("page").
+async function dismissAd(tabId, committed) {
+  if (pageOpened.has(tabId)) {
+    await api.tabs.remove(tabId);
+    return "closed";
+  }
+  if (!committed) {
+    const tab = await api.tabs.get(tabId);
+    return /^https?:/i.test(tab.url || "") ? "wait" : "page";
+  }
+  try {
+    await api.tabs.goBack(tabId);
+    return "back";
+  } catch {
+    return "page"; // nothing to go back to
+  }
+}
+
+async function guard(details, committed) {
   if (details.frameId !== 0 || !/^https?:/i.test(details.url)) return;
   if (Date.now() - adsCheckedAt > ADS_SYNC_MS) syncAds();
   tallyAds();
@@ -285,10 +310,16 @@ async function guard(details) {
     allowedOnce.delete(details.tabId); // left the site: the allowance ends
   }
   const v = await check(details.url);
-  if (!v || !v.block) return;
-  if (v.category === "ads") countAds(1);
-  else countBlock();
+  if (!v || !v.block) {
+    if (committed) pageOpened.delete(details.tabId); // now a tab with a page of its own
+    return;
+  }
   try {
+    if (v.category === "ads") {
+      const outcome = await dismissAd(details.tabId, committed);
+      if (outcome !== "wait") countAds(1);
+      if (outcome !== "page") return;
+    } else countBlock();
     await api.tabs.update(details.tabId, { url: blockPageUrl(details.url, v) });
   } catch {
     // The tab was closed meanwhile.
@@ -297,9 +328,13 @@ async function guard(details) {
 
 // Before the request goes out, and again once committed (catches the final
 // address after server-side redirects).
-api.webNavigation.onBeforeNavigate.addListener(guard);
-api.webNavigation.onCommitted.addListener(guard);
-api.tabs.onRemoved.addListener((tabId) => allowedOnce.delete(tabId));
+api.webNavigation.onCreatedNavigationTarget.addListener((d) => pageOpened.add(d.tabId));
+api.webNavigation.onBeforeNavigate.addListener((d) => guard(d, false));
+api.webNavigation.onCommitted.addListener((d) => guard(d, true));
+api.tabs.onRemoved.addListener((tabId) => {
+  allowedOnce.delete(tabId);
+  pageOpened.delete(tabId);
+});
 
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Only this extension's own pages and content scripts talk to the background.

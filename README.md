@@ -174,8 +174,10 @@ false-positive entries and the extension's exclusions still win.
   extension packs them 1,000 to a rule within the browser's dynamic-rule limit. If
   the browser refuses that many, the first half of the list is kept and the rest
   dropped. Allowed and excluded names are left out of the rules. The rules are
-  rebuilt only when the list or your settings change. Opening an ad address
-  directly shows the warning page with the reason "Ad or tracker blocked". The
+  rebuilt only when the list or your settings change. An ad address opened as a
+  whole page gets no warning: a tab a page opened for it (pop-ups, pop-unders) is
+  closed, and a tab that was showing a page goes back to it. Only an ad address
+  you type into a blank tab shows the warning page ("Ad or tracker blocked"). The
   popup counts blocked ad requests today and in total. This count is read from the
   browser at most once a minute, so it is approximate.
 * **In the DNS filter**, ad names get the sinkhole answer, and the block-page
