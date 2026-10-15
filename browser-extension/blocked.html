@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dangerous site blocked - Phalanx</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="blockpage">
+  <div class="topbar"><img src="icon.png" alt="">Phalanx Browser Guard</div>
+  <main>
+    <section class="warning" aria-labelledby="headline">
+      <svg class="icon" viewBox="0 0 64 64" aria-hidden="true">
+        <circle cx="32" cy="32" r="32" fill="var(--bad-soft)"/>
+        <path d="M32 12 16 18v10c0 10.2 6.8 18.3 16 20.6C41.2 46.3 48 38.2 48 28V18L32 12z" fill="var(--bad)"/>
+        <path d="M32 22v11" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/>
+        <circle cx="32" cy="39.5" r="2.3" fill="#fff"/>
+      </svg>
+      <h1 id="headline">This site was blocked</h1>
+      <p id="lead" class="lead">Phalanx stopped this page from opening to protect your PC and your data.</p>
+      <span id="site" class="chip"></span>
+
+      <div class="actions">
+        <button id="back" class="primary">Go back to safety</button>
+      </div>
+
+      <details>
+        <summary>Details and options</summary>
+        <dl id="details"></dl>
+        <div class="risk">
+          <strong>Only continue if you are sure this site is safe.</strong>
+          <div class="muted small">Dangerous sites can install malware or steal passwords as soon as they open. Sites you allow can be reviewed in the Phalanx app under Web protection.</div>
+          <div class="actions">
+            <button id="once">Continue this time</button>
+            <button id="always">Always allow this site</button>
+          </div>
+          <p id="message" class="muted small"></p>
+        </div>
+      </details>
+    </section>
+  </main>
+<script src="blocked.js"></script>
+</body>
+</html>

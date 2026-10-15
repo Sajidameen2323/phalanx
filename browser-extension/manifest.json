@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Phalanx Browser Guard",
+  "version": "1.1.0",
+  "description": "Blocks malware and phishing sites and marks search results, using Phalanx web protection on this PC.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzIpY4kPVJfIMsjZOtLAEWecnkIs75Cs/u5l77gVm2QlMTYkeOygB7F0lcqV755500ZTdC1ctGK5Z1eSYYYGPsR6g4AdvLT3/3u8TRzunyw3ze033QOJ5cOMUKBmy0mDdllXR21o/eGq5po177wiG63h6h6hSjOCS2ZUGbeT4k6mqh5wTsSvNkd06MkpsQXju866kqIFbuzWhdZOG3Ub/xeSUcJvlHNExXgtYlJT96aTiNb0FdvNASnli7tIHqF9ZDeIEdeMOA1q+JAYSmg3t+6QQ09pw128sGtzAVJhZwI5mF8UAuKKJIR3RNU8mFzXi5jAU8fHauDiqJ5YFcPYdVwIDAQAB",
+  "permissions": ["nativeMessaging", "webNavigation", "tabs", "storage"],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.google.com/search*",
+        "https://www.google.co.uk/search*",
+        "https://www.google.co.in/search*",
+        "https://www.google.lk/search*",
+        "https://www.google.ca/search*",
+        "https://www.google.com.au/search*",
+        "https://www.google.de/search*",
+        "https://www.google.fr/search*",
+        "https://www.google.es/search*",
+        "https://www.google.it/search*",
+        "https://www.google.nl/search*",
+        "https://www.google.com.br/search*",
+        "https://www.google.co.jp/search*",
+        "https://www.google.com.sg/search*",
+        "https://www.google.ae/search*",
+        "https://www.google.com.pk/search*",
+        "https://www.bing.com/search*",
+        "https://duckduckgo.com/*",
+        "https://html.duckduckgo.com/*",
+        "https://search.yahoo.com/search*",
+        "https://search.brave.com/search*"
+      ],
+      "js": ["search.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Phalanx Browser Guard",
+    "default_popup": "popup.html",
+    "default_icon": { "128": "icon.png" }
+  },
+  "icons": { "128": "icon.png" },
+  "browser_specific_settings": {
+    "gecko": { "id": "browser-guard@phalanx.local", "strict_min_version": "128.0" }
+  }
+}

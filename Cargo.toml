@@ -1,0 +1,41 @@
+[package]
+name = "threat-scanner"
+version = "0.2.0"
+edition = "2024"
+default-run = "phalanx"
+autobins = false
+
+[[bin]]
+name = "phalanx"
+path = "src/gui/main.rs"
+
+[[bin]]
+name = "phalanx-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+eframe = "0.36.2"
+goblin = "0.10.7"
+hex = "0.4.3"
+notify = "8.2.0"
+notify-rust = "4.18.2"
+rfd = "0.17.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tray-icon = "0.26.1"
+ureq = "3.4.2"
+walkdir = "2.5.0"
+yara-x = "1.21.0"
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_Storage_FileSystem"] }
+winreg = "0.56.0"

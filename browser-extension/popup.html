@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phalanx Browser Guard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="popup">
+  <header>
+    <img src="icon.png" alt="">
+    <div class="brand"><strong>Phalanx</strong><span>Browser Guard</span></div>
+    <span id="pill" class="pill warn">Checking…</span>
+  </header>
+  <main>
+    <section class="card hero">
+      <svg id="shield" class="shield" viewBox="0 0 48 48" aria-hidden="true">
+        <path id="shield-body" d="M24 3 6 10v12c0 11.5 7.7 20.6 18 23 10.3-2.4 18-11.5 18-23V10L24 3z" fill="var(--muted)"/>
+        <path id="shield-mark" d="M15.5 24.5l6 6 11-12" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <h1 id="headline">Connecting to Phalanx…</h1>
+        <p id="subline"></p>
+      </div>
+    </section>
+
+    <section id="problem" class="card hidden">
+      <p class="label">How to fix</p>
+      <ol class="steps">
+        <li>Open the Phalanx app.</li>
+        <li>Go to Web protection and choose <b>Connect browsers</b>.</li>
+        <li>Restart this browser.</li>
+      </ol>
+      <p id="error" class="muted small"></p>
+    </section>
+
+    <section id="site" class="card hidden">
+      <p class="label">This site</p>
+      <div id="site-host" class="site-host"></div>
+      <div id="site-verdict" class="verdict"></div>
+    </section>
+
+    <section id="stats" class="stats hidden">
+      <div class="stat"><b id="today">0</b><span>blocked today</span></div>
+      <div class="stat"><b id="total">0</b><span>blocked in total</span></div>
+      <div class="stat"><b id="rules">0</b><span>threat rules</span></div>
+    </section>
+
+    <section class="card setting">
+      <div>
+        <strong>Mark search results</strong>
+        <span>Green check: no known threats. Red: dangerous site. Works on Google, Bing, DuckDuckGo, Yahoo and Brave Search.</span>
+      </div>
+      <label class="switch"><input id="mark" type="checkbox" checked aria-label="Mark search results"><i></i></label>
+    </section>
+  </main>
+  <footer>
+    <span id="updated" class="muted small"></span>
+    <button id="open" class="primary">Open Phalanx</button>
+  </footer>
+<script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,297 @@
+//! Operating-system integration: low-impact threads, desktop notifications,
+//! starting with Windows and per-user secret storage.
+
+use anyhow::Result;
+
+/// Puts the calling thread into Windows "background mode": lower CPU, disk
+/// and memory priority, so foreground apps stay responsive while it scans.
+/// No-op elsewhere.
+pub fn enter_background_mode() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    }
+}
+
+/// Name shown in notifications, the Start menu and the window title.
+pub const APP_NAME: &str = "Phalanx";
+/// Identity Windows shows notifications under (System.AppUserModel.ID).
+pub const APP_USER_MODEL_ID: &str = "Phalanx.Desktop";
+#[cfg(windows)]
+const AUMID_KEY: &str = r"Software\Classes\AppUserModelId\Phalanx.Desktop";
+/// Registered by versions released as "Threat Scanner"; removed on upgrade.
+#[cfg(windows)]
+const LEGACY_AUMID_KEY: &str = r"Software\Classes\AppUserModelId\ThreatScanner.Desktop";
+
+/// The per-user Start-menu shortcut that carries the notification identity.
+pub fn start_menu_shortcut() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs").join(format!("{APP_NAME}.lnk")))
+}
+
+/// Registers this app's notification identity for the current user, so
+/// toasts pop up as "Phalanx" with its icon instead of "Windows PowerShell".
+///
+/// Writes `HKCU\Software\Classes\AppUserModelId\Phalanx.Desktop` (name and
+/// icon) and a Start-menu shortcut to `exe` carrying the same ID; Windows only
+/// shows pop-up banners for an unpackaged app that has such a shortcut. No
+/// administrator rights; only values that differ are written. Removes the
+/// identity registered under the app's former name.
+pub fn register_notification_identity(icon_png: &std::path::Path, exe: &std::path::Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu.create_subkey(AUMID_KEY)?;
+        let icon = icon_png.display().to_string();
+        for (name, value) in [("DisplayName", APP_NAME), ("IconUri", icon.as_str()), ("IconBackgroundColor", "FF0E131F")] {
+            if key.get_value::<String, _>(name).ok().as_deref() != Some(value) {
+                key.set_value(name, &value.to_string())?;
+            }
+        }
+        match hkcu.delete_subkey_all(LEGACY_AUMID_KEY) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let link = start_menu_shortcut().ok_or_else(|| anyhow::anyhow!("APPDATA is not set"))?;
+        crate::shortcut::ensure(&link, exe, APP_USER_MODEL_ID, "Malware scanner and folder protection")
+            .map_err(|e| anyhow::anyhow!("creating the Start-menu shortcut: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (icon_png, exe);
+        Ok(())
+    }
+}
+
+/// Whether toasts can use the app's own identity: both the registry entry and
+/// the Start-menu shortcut exist. Without the shortcut Windows would file the
+/// toasts silently, so callers fall back to PowerShell's identity.
+pub fn notification_identity_registered() -> bool {
+    #[cfg(windows)]
+    {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let registered = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(AUMID_KEY)
+            .and_then(|k| k.get_value::<String, _>("DisplayName"))
+            .is_ok();
+        registered && start_menu_shortcut().is_some_and(|l| l.is_file())
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Shows a desktop notification, under the app's own name once its identity
+/// is registered (otherwise Windows attributes it to PowerShell). Failures
+/// are ignored: a missing toast must never break scanning.
+pub fn notify(summary: &str, body: &str) {
+    let mut toast = notify_rust::Notification::new();
+    toast.summary(summary).body(body).appname(APP_NAME);
+    #[cfg(windows)]
+    {
+        if notification_identity_registered() {
+            let mut own = toast.clone();
+            if own.app_id(APP_USER_MODEL_ID).show().is_ok() {
+                return;
+            }
+        }
+    }
+    let _ = toast.show();
+}
+
+/// Encrypts a secret for the current Windows user (DPAPI), hex-encoded for
+/// storage in a settings file. Only this user on this PC can decrypt it.
+pub fn protect_secret(secret: &str) -> Result<String> {
+    #[cfg(windows)]
+    {
+        dpapi(secret.as_bytes(), true).map(hex::encode)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = secret;
+        anyhow::bail!("storing secrets is only supported on Windows")
+    }
+}
+
+/// Reverses [`protect_secret`].
+pub fn unprotect_secret(stored: &str) -> Result<String> {
+    #[cfg(windows)]
+    {
+        let bytes = hex::decode(stored.trim()).map_err(|e| anyhow::anyhow!("stored secret is damaged: {e}"))?;
+        let plain = dpapi(&bytes, false)?;
+        String::from_utf8(plain).map_err(|_| anyhow::anyhow!("stored secret is damaged"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = stored;
+        anyhow::bail!("storing secrets is only supported on Windows")
+    }
+}
+
+#[cfg(windows)]
+fn dpapi(input: &[u8], encrypt: bool) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    let data_in = CRYPT_INTEGER_BLOB { cbData: input.len() as u32, pbData: input.as_ptr() as *mut u8 };
+    let mut out = CRYPT_INTEGER_BLOB::default();
+    let null = std::ptr::null();
+    // SAFETY: `data_in` borrows `input` for the call; `out` is allocated by
+    // Windows and freed with LocalFree below.
+    let ok = unsafe {
+        if encrypt {
+            CryptProtectData(&data_in, null as _, null as _, null, null as _, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        } else {
+            CryptUnprotectData(&data_in, std::ptr::null_mut(), null as _, null, null as _, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        }
+    };
+    if ok == 0 || out.pbData.is_null() {
+        anyhow::bail!(
+            "Windows could not {} the secret: {}",
+            if encrypt { "protect" } else { "unprotect" },
+            std::io::Error::last_os_error()
+        );
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+    unsafe { LocalFree(out.pbData as _) };
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const RUN_VALUE: &str = "Phalanx";
+/// Entry written by versions released as "Threat Scanner".
+#[cfg(windows)]
+const LEGACY_RUN_VALUE: &str = "ThreatScanner";
+
+/// The command this user's "run at sign-in" entry starts, if there is one
+/// (under the current or the former name).
+pub fn autostart_command() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(RUN_KEY).ok()?;
+        key.get_value::<String, _>(RUN_VALUE).or_else(|_| key.get_value::<String, _>(LEGACY_RUN_VALUE)).ok()
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+/// Whether this user's "run at sign-in" entry exists.
+pub fn autostart_enabled() -> bool {
+    autostart_command().is_some()
+}
+
+/// Adds or removes a per-user (HKCU) "run at sign-in" entry for `command`,
+/// and removes any entry under the former name. No administrator rights are
+/// needed and nothing system-wide changes.
+pub fn set_autostart(enabled: bool, command: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(RUN_KEY)?;
+        let remove = |name: &str| match key.delete_value(name) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        if enabled {
+            key.set_value(RUN_VALUE, &command.to_string())?;
+        } else {
+            remove(RUN_VALUE)?;
+        }
+        remove(LEGACY_RUN_VALUE)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (enabled, command);
+        anyhow::bail!("starting automatically is only supported on Windows")
+    }
+}
+
+/// Roots of the fixed (internal) drives, for a full scan. Removable, network
+/// and optical drives are left out.
+pub fn fixed_drives() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+        const DRIVE_FIXED: u32 = 3;
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u8)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| format!("{}:\\", (b'A' + i) as char))
+            .filter(|root| {
+                let wide: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
+                unsafe { GetDriveTypeW(wide.as_ptr()) == DRIVE_FIXED }
+            })
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+    #[cfg(not(windows))]
+    vec![std::path::PathBuf::from("/")]
+}
+
+/// Number of scanning threads for each performance level.
+pub fn worker_threads(level: Performance) -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    match level {
+        Performance::LowImpact => (cores / 4).clamp(1, 2),
+        Performance::Balanced => (cores / 2).clamp(1, 8),
+        Performance::Fast => cores.clamp(1, 16),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Performance {
+    /// Few threads, background priority: the PC stays fully usable.
+    #[default]
+    LowImpact,
+    /// Half the cores, background priority.
+    Balanced,
+    /// All cores, normal priority.
+    Fast,
+}
+
+impl Performance {
+    pub fn background(self) -> bool {
+        self != Performance::Fast
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Performance::LowImpact => "Low impact",
+            Performance::Balanced => "Balanced",
+            Performance::Fast => "Fast",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn secrets_round_trip_through_dpapi() {
+        let stored = protect_secret("AIza-test-key").unwrap();
+        assert!(!stored.contains("AIza"));
+        assert_eq!(unprotect_secret(&stored).unwrap(), "AIza-test-key");
+        assert!(unprotect_secret("00ff").is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod drive_tests {
+    #[test]
+    fn the_system_drive_is_a_fixed_drive() {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let drives = super::fixed_drives();
+        assert!(drives.iter().any(|d| d.display().to_string().eq_ignore_ascii_case(&format!("{system}\\"))), "{drives:?}");
+    }
+}

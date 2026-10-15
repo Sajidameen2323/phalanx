@@ -1,0 +1,60 @@
+# Built-in web protection rules. Downloaded feeds and your own allow/block
+# lists are added on top of these.
+#
+# One rule per line:  <kind> <value> [category] [threat name]
+#
+#   domain  bad.example          blocks the name and every subdomain
+#   url     http://x.example/a   blocks exactly this address (query optional)
+#   ip      203.0.113.0/24       blocks an IPv4/IPv6 address or CIDR range
+#   port    4444                 blocks connections to this TCP port
+#   good    example.com          known-good name, never blocked by a domain or
+#                                IP rule (exact name and its www. form only)
+#   fp      example.org          false-positive reduction: a domain (with
+#                                subdomains) or CIDR range a feed must not block
+#
+# Categories are free text; the block page shows them. Common ones: malware,
+# phishing, scam, pup, compromised, riskware.
+
+# Harmless test entries: these names are reserved and never exist on the
+# internet, so blocking them only proves that protection works.
+domain  blocktest.phalanx.invalid      malware   Phalanx.TestBlock.Malware
+domain  phishtest.phalanx.invalid      phishing  Phalanx.TestBlock.Phishing
+url     http://urltest.phalanx.invalid/download.exe  malware  Phalanx.TestBlock.Url
+
+# Keep public feeds from ever blocking whole platforms that also host user
+# content. Individual malicious URLs on them are still blocked by url rules.
+good    google.com
+good    youtube.com
+good    microsoft.com
+good    live.com
+good    office.com
+good    windowsupdate.com
+good    apple.com
+good    icloud.com
+good    amazon.com
+good    github.com
+good    githubusercontent.com
+good    raw.githubusercontent.com
+good    gitlab.com
+good    bitbucket.org
+good    dropbox.com
+good    drive.google.com
+good    docs.google.com
+good    onedrive.live.com
+good    sharepoint.com
+good    discord.com
+good    cdn.discordapp.com
+good    mediafire.com
+good    mega.nz
+good    wikipedia.org
+good    cloudflare.com
+good    workers.dev
+good    pages.dev
+good    trycloudflare.com
+good    vercel.app
+good    netlify.app
+good    amazonaws.com
+good    googleusercontent.com
+good    blogspot.com
+good    duckduckgo.com
+good    bing.com

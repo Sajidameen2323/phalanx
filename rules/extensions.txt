@@ -1,0 +1,8 @@
+# Known-bad browser extension IDs (Chromium: 32 letters a-p).
+#
+# One per line:  <extension id> [category] [threat name]
+# Categories: malware, pup, hacktool, suspicious (default: malware).
+#
+# Add your own in <data folder>\signatures\bad-extensions.txt (same format).
+# Extensions are also rated without this list: the browser's own malware
+# flag, risky permissions, settings overrides and unusual install sources.
