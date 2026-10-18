@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phalanx Browser Guard settings</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="options">
+  <div class="topbar"><img src="icon48.png" alt="">Phalanx Browser Guard <span class="muted">· Settings</span></div>
+  <main>
+    <section id="connection" class="card notice hidden"></section>
+
+    <section class="card">
+      <h2>Blocking</h2>
+      <div class="setting">
+        <div>
+          <strong>Block ads and trackers</strong>
+          <span id="ads-note">Blocks ad and tracking requests inside pages, using the ad list Phalanx downloads. Applies to every browser connected to Phalanx.</span>
+        </div>
+        <label class="switch"><input id="ads" type="checkbox" aria-label="Block ads and trackers"><i></i></label>
+      </div>
+      <div class="setting">
+        <div>
+          <strong>Close ad pop-ups</strong>
+          <span>Closes tabs that a page opens to show an ad or tracker, and counts them as pop-ups closed.</span>
+        </div>
+        <label class="switch"><input id="popups" type="checkbox" aria-label="Close ad pop-ups"><i></i></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Display</h2>
+      <div class="setting">
+        <div>
+          <strong>Show the blocked count on the icon</strong>
+          <span>The number of ads, trackers, pop-ups and dangerous requests blocked on the current page.</span>
+        </div>
+        <label class="switch"><input id="count" type="checkbox" aria-label="Show the blocked count on the icon"><i></i></label>
+      </div>
+      <div class="setting">
+        <div>
+          <strong>Mark search results</strong>
+          <span>A green check for sites on no threat list, a red label for dangerous ones. Google, Bing, DuckDuckGo, Yahoo and Brave Search.</span>
+        </div>
+        <label class="switch"><input id="mark" type="checkbox" aria-label="Mark search results"><i></i></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Your blocked sites</h2>
+      <p class="muted small">Always blocked, including sites Phalanx otherwise trusts. Subdomains are included.</p>
+      <form id="add-block" class="add-row">
+        <input id="block-input" type="text" placeholder="example.com" aria-label="Site to block" autocomplete="off">
+        <button type="submit">Block</button>
+      </form>
+      <ul id="blocked" class="site-list"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Your allowed sites</h2>
+      <p class="muted small">Never blocked, and their ads are not blocked either. Only allow sites you trust.</p>
+      <ul id="allowed" class="site-list"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Protection in this browser</h2>
+      <dl class="facts">
+        <dt>Blocked before loading</dt><dd id="f-rules">–</dd>
+        <dt>Ad rules</dt><dd id="f-ads">–</dd>
+        <dt>Threat lists updated</dt><dd id="f-updated">–</dd>
+      </dl>
+      <p class="muted small">Dangerous sites are blocked by rules inside the browser, before any request is sent, and stay blocked while Phalanx is closed. Phalanx refreshes them when its lists change.</p>
+    </section>
+    <p id="message" class="muted small"></p>
+  </main>
+<script src="options.js"></script>
+</body>
+</html>

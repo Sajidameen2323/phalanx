@@ -124,10 +124,12 @@ impl WebConfig {
         Some(entry)
     }
 
-    /// Adds `site` to the block list (removing it from the allow list).
+    /// Adds `site` to the block list (removing it from the allow lists,
+    /// including the browser's, which would otherwise still let it through).
     pub fn block(&mut self, site: &str) -> Option<String> {
         let entry = list_entry(site)?;
         self.user_allow.retain(|e| !same_site(e, &entry));
+        self.extension_exclusions.retain(|e| !same_site(e, &entry));
         if !self.user_block.iter().any(|e| same_site(e, &entry)) {
             self.user_block.push(entry.clone());
         }
@@ -142,6 +144,57 @@ impl WebConfig {
         self.user_block.retain(|e| !same_site(e, &entry));
         self.extension_exclusions.retain(|e| !same_site(e, &entry));
         before != self.user_allow.len() + self.user_block.len() + self.extension_exclusions.len()
+    }
+
+    /// Stops blocking `site`: removes every block entry that covers it or
+    /// lies under it (unblocking `www.example.com` removes `example.com`).
+    /// Returns the entries removed.
+    pub fn unblock(&mut self, site: &str) -> Vec<String> {
+        take_related(&mut self.user_block, site)
+    }
+
+    /// Stops allowing `site`, in both allow lists, the same way.
+    pub fn unallow(&mut self, site: &str) -> Vec<String> {
+        let mut removed = take_related(&mut self.user_allow, site);
+        removed.extend(take_related(&mut self.extension_exclusions, site));
+        removed
+    }
+
+    /// Loads the current settings, changes them and saves, so a change made
+    /// elsewhere a moment ago is kept. Returns the saved settings.
+    pub fn update(data_dir: &Path, change: impl FnOnce(&mut WebConfig)) -> Result<WebConfig> {
+        let mut config = Self::load(data_dir)?;
+        change(&mut config);
+        config.save(data_dir)?;
+        Ok(config)
+    }
+
+    /// Three-way merge: `self` was edited from `base` while the file became
+    /// `theirs`. Fields only one side changed take that side; lists take both
+    /// sides' additions and removals; for anything else both changed, `self` wins.
+    pub fn merged(&self, base: &WebConfig, theirs: &WebConfig) -> Result<WebConfig> {
+        let (ours, base, mut out) = (serde_json::to_value(self)?, serde_json::to_value(base)?, serde_json::to_value(theirs)?);
+        let (Some(ours), Some(base), Some(merged)) = (ours.as_object(), base.as_object(), out.as_object_mut()) else {
+            return Ok(self.clone());
+        };
+        for (key, mine) in ours {
+            let before = base.get(key);
+            if before == Some(mine) {
+                continue; // we did not change it
+            }
+            let other = merged.get(key).and_then(|t| t.as_array()).cloned();
+            let value = match (mine.as_array(), before.and_then(|b| b.as_array()), other) {
+                (Some(mine), Some(before), Some(other)) => {
+                    let mut list: Vec<serde_json::Value> = other.iter().filter(|v| mine.contains(v) || !before.contains(v)).cloned().collect();
+                    let added: Vec<serde_json::Value> = mine.iter().filter(|v| !before.contains(v) && !list.contains(v)).cloned().collect();
+                    list.extend(added);
+                    serde_json::Value::Array(list)
+                }
+                _ => mine.clone(),
+            };
+            merged.insert(key.clone(), value);
+        }
+        Ok(serde_json::from_value(out)?)
     }
 
     pub fn dns_listen_addr(&self) -> Result<SocketAddr> {
@@ -185,6 +238,21 @@ fn list_entry(site: &str) -> Option<String> {
 
 fn same_site(a: &str, b: &str) -> bool {
     list_entry(a).is_some_and(|x| x == b)
+}
+
+/// Removes the entries of `list` that are `site`, a parent domain of it or
+/// under it; a CIDR range only when written the same. Returns them.
+fn take_related(list: &mut Vec<String>, site: &str) -> Vec<String> {
+    let Some(entry) = list_entry(site) else { return Vec::new() };
+    let related = |e: &String| match list_entry(e) {
+        Some(e) if e == entry => true,
+        Some(e) if Cidr::parse(&e).is_some() || Cidr::parse(&entry).is_some() => false,
+        Some(e) => entry.ends_with(&format!(".{e}")) || e.ends_with(&format!(".{entry}")),
+        None => false,
+    };
+    let (removed, kept): (Vec<String>, Vec<String>) = list.drain(..).partition(related);
+    *list = kept;
+    removed
 }
 
 /// DNS servers configured on this PC's network adapters (static or from
@@ -271,6 +339,56 @@ mod tests {
         assert!(c.forget("bad.example"));
         assert!(!c.forget("bad.example"));
         assert!(c.allow("not a site").is_none());
+    }
+
+    #[test]
+    fn blocking_drops_the_browser_exclusion_and_unblocking_covers_parents() {
+        let mut c = WebConfig::default();
+        c.extension_exclusions = vec!["spicett.com".into()];
+        c.block("https://spicett.com/");
+        assert!(c.extension_exclusions.is_empty(), "an exclusion would still let it through");
+        let rules = c.load_rules(tempfile::tempdir().unwrap().path()).unwrap();
+        assert!(rules.classify_domain("spicett.com").blocks());
+
+        c.user_block = vec!["spicett.com".into(), "cdn.other.example".into(), "203.0.113.0/24".into(), "notspicett.com".into()];
+        assert_eq!(c.unblock("https://www.spicett.com/page"), ["spicett.com"], "parent entry covering it");
+        assert_eq!(c.unblock("other.example"), ["cdn.other.example"], "entries under it");
+        assert!(c.unblock("203.0.113.9").is_empty(), "ranges only when written the same");
+        assert_eq!(c.unblock("203.0.113.0/24"), ["203.0.113.0/24"]);
+        assert_eq!(c.user_block, ["notspicett.com"]);
+        c.user_allow = vec!["a.example".into()];
+        c.extension_exclusions = vec!["www.a.example".into()];
+        assert_eq!(c.unallow("a.example").len(), 2);
+    }
+
+    #[test]
+    fn merge_keeps_both_sides_list_edits() {
+        let mut base = WebConfig::default();
+        base.user_block = vec!["one.example".into(), "two.example".into()];
+        // The app removed two.example and added three.example ...
+        let mut ours = base.clone();
+        ours.user_block = vec!["one.example".into(), "three.example".into()];
+        ours.block_ads = true;
+        // ... while the browser blocked four.example and allowed ok.example.
+        let mut theirs = base.clone();
+        theirs.user_block.push("four.example".into());
+        theirs.extension_exclusions = vec!["ok.example".into()];
+        theirs.dns_filter = true;
+        let m = ours.merged(&base, &theirs).unwrap();
+        assert_eq!(m.user_block, ["one.example", "four.example", "three.example"]);
+        assert_eq!(m.extension_exclusions, ["ok.example"]);
+        assert!(m.block_ads && m.dns_filter, "each side's own change kept");
+    }
+
+    #[test]
+    fn update_reads_the_file_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Saved by another program after this one last read the file.
+        let mut elsewhere = WebConfig::default();
+        elsewhere.block("x.example");
+        elsewhere.save(tmp.path()).unwrap();
+        let saved = WebConfig::update(tmp.path(), |c| c.extension_exclusions.push("y.example".into())).unwrap();
+        assert_eq!((saved.user_block.as_slice(), saved.extension_exclusions.as_slice()), (&["x.example".to_string()][..], &["y.example".to_string()][..]));
     }
 
     #[test]

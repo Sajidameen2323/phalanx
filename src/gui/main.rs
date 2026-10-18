@@ -3,6 +3,7 @@
 
 mod desktop;
 mod pages;
+mod audit_page;
 mod web_page;
 mod widgets;
 
@@ -76,6 +77,7 @@ enum Page {
     Web,
     Inspect,
     Privacy,
+    Audit,
     Quarantine,
     History,
     Settings,
@@ -433,6 +435,13 @@ struct App {
     privacy: Option<Vec<Check>>,
     posture_rx: Option<Receiver<(Vec<Check>, Vec<Check>)>>,
     posture_checked: Option<String>,
+    /// An administrator fix waiting for the user's confirmation, one running,
+    /// the last one applied (checked when the settings are re-read) and a
+    /// note about its outcome.
+    pending_fix: Option<posture::Fix>,
+    fix_rx: Option<Receiver<(posture::Fix, Result<system::Elevated, String>)>>,
+    applied_fix: Option<posture::Fix>,
+    fix_note: Option<String>,
     // Web protection
     web: web_page::WebState,
     // AI inspection
@@ -443,18 +452,51 @@ struct App {
     key_visible: bool,
     ai_models: Vec<String>,
     ai_models_rx: Option<Receiver<Result<Vec<String>, String>>>,
+    audit: audit_page::AuditState,
     logo: egui::TextureHandle,
 }
 
 /// Writes the notification icon and registers the app's notification name
 /// and Start-menu shortcut, so toasts pop up as Phalanx.
 fn register_notifications(data_dir: &Path) -> Result<(), String> {
-    let path = data_dir.join("notification-icon.png");
-    if std::fs::read(&path).ok().as_deref() != Some(widgets::ICON_PNG) {
-        std::fs::write(&path, widgets::ICON_PNG).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    }
+    // Windows caches icons by path, so each icon version gets its own file
+    // name; older versions are removed.
+    let png = write_versioned(data_dir, "notification-icon", "png", widgets::ICON_PNG)?;
+    let ico = write_versioned(data_dir, "app-icon", "ico", widgets::ICON_ICO)?;
     let exe = std::env::current_exe().map_err(|e| format!("finding this program: {e}"))?;
-    system::register_notification_identity(&path, &exe).map_err(|e| format!("{e:#}"))
+    system::register_notification_identity(&png, &ico, &exe).map_err(|e| format!("{e:#}"))
+}
+
+/// Writes `bytes` to `<stem>-<content hash>.<ext>` in `dir` and deletes
+/// other versions; returns the path.
+fn write_versioned(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    // FNV-1a: only needs to change when the bytes do.
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    let path = dir.join(format!("{stem}-{:08x}.{ext}", hash as u32));
+    if std::fs::read(&path).ok().as_deref() != Some(bytes) {
+        std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let old_version = name.starts_with(&format!("{stem}-")) && name.ends_with(&format!(".{ext}")) && entry.path() != path;
+            // The unversioned file earlier releases wrote.
+            if old_version || name == format!("{stem}.{ext}") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(path)
+}
+
+/// Whether the program a start-up command names (quoted first, as written
+/// by [`autostart_command`]) is still there.
+fn autostart_program_exists(command: &str) -> bool {
+    let program = match command.trim().strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(""),
+        None => command.split_whitespace().next().unwrap_or(""),
+    };
+    !program.is_empty() && Path::new(program).is_file()
 }
 
 /// The command the "start with Windows" entry should run.
@@ -474,10 +516,12 @@ impl App {
         let quitting = Arc::new(AtomicBool::new(false));
         let tray = desktop::Tray::create(ctx, quitting.clone()).ok();
         let notification_identity = register_notifications(&data_dir);
-        // Keep an existing "start with Windows" entry pointing at this program
-        // (it moves when the app is renamed or rebuilt elsewhere).
+        // An existing "start with Windows" entry whose program no longer
+        // exists (the app was renamed or moved) is pointed at this program.
+        // An entry that still names a working Phalanx is the user's choice and
+        // is left alone, even when another copy (a test build) starts.
         if let Some(command) = system::autostart_command() {
-            if command != autostart_command() {
+            if !autostart_program_exists(&command) {
                 let _ = system::set_autostart(true, &autostart_command());
             }
         }
@@ -520,6 +564,10 @@ impl App {
             privacy: None,
             posture_rx: None,
             posture_checked: None,
+            pending_fix: None,
+            fix_rx: None,
+            applied_fix: None,
+            fix_note: None,
             web,
             inspect: InspectState::default(),
             settings_tab: SettingsTab::General,
@@ -527,6 +575,7 @@ impl App {
             key_visible: false,
             ai_models: Vec::new(),
             ai_models_rx: None,
+            audit: audit_page::AuditState::default(),
             logo: widgets::logo_texture(ctx),
         };
         app.reload_signatures(ctx);
@@ -950,9 +999,56 @@ impl App {
         let Some(rx) = &self.posture_rx else { return };
         let Ok((security, privacy)) = rx.try_recv() else { return };
         self.posture_rx = None;
+        // Did the fix just applied take effect? Windows can accept a command
+        // without the setting changing (managed PCs, unsupported editions).
+        if let Some(fix) = self.applied_fix.take() {
+            let still_needed = security.iter().any(|c| c.fix == Some(fix));
+            self.fix_note = still_needed.then(|| {
+                if fix == posture::FIX_NETWORK_PROTECTION {
+                    "Windows accepted the command, but Network protection still reads as off. It may not be available on this edition of Windows (it is documented for Pro and Enterprise). Phalanx's browser and DNS blocking still protect you.".to_string()
+                } else {
+                    format!("Windows accepted `{}`, but the setting has not changed. Another policy or security product may control it.", fix.command)
+                }
+            });
+        }
         self.security = Some(security);
         self.privacy = Some(privacy);
         self.posture_checked = Some(chrono::Local::now().format("%H:%M").to_string());
+    }
+
+    /// Runs a fix as administrator in the background, then re-reads the settings.
+    fn apply_fix(&mut self, ctx: &egui::Context, fix: posture::Fix) {
+        if self.fix_rx.is_some() {
+            return;
+        }
+        self.fix_note = None;
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = fix.apply().map_err(|e| format!("{e:#}"));
+            let _ = tx.send((fix, result));
+            ctx.request_repaint();
+        });
+        self.fix_rx = Some(rx);
+    }
+
+    fn poll_fix(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.fix_rx else { return };
+        let Ok((fix, result)) = rx.try_recv() else { return };
+        self.fix_rx = None;
+        match result {
+            Ok(system::Elevated::Exited(0)) if fix == posture::OFFLINE_SCAN => {
+                self.notify("Offline scan scheduled: Windows restarts shortly", true)
+            }
+            Ok(system::Elevated::Exited(0)) => {
+                self.notify("Done. Checking the setting again…", true);
+                self.applied_fix = Some(fix);
+                self.refresh_posture(ctx);
+            }
+            Ok(system::Elevated::Exited(code)) => self.notify(format!("`{}` failed (exit code {code}); nothing was changed", fix.command), false),
+            Ok(system::Elevated::Declined) => self.notify("Cancelled at the Windows prompt; nothing was changed", false),
+            Err(e) => self.notify(e, false),
+        }
     }
 
     fn open_link(&mut self, link: posture::Link) {
@@ -1360,6 +1456,10 @@ impl eframe::App for App {
         self.poll_auto_update(ctx);
         self.poll_watch();
         self.poll_posture();
+        self.poll_fix(ctx);
+        self.poll_audit(ctx);
+        self.poll_hardening();
+        self.poll_dns_change();
         self.poll_inspect();
         self.poll_models();
         self.poll_web(ctx);
@@ -1368,6 +1468,8 @@ impl eframe::App for App {
         let busy = self.inspect.preparing.is_some()
             || self.inspect.running.is_some()
             || self.posture_rx.is_some()
+            || self.fix_rx.is_some()
+            || self.audit_busy()
             || self.ai_models_rx.is_some()
             || self.update_check_rx.is_some()
             || self.web_busy();

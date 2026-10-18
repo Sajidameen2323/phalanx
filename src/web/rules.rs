@@ -544,10 +544,43 @@ impl WebRules {
     /// (known-good, the user's allow list, false positives and browser
     /// exclusions), for blockers that cannot ask per request.
     pub fn ad_exclusions(&self) -> Vec<String> {
-        let mut out: Vec<String> = [&self.known_good, &self.user_allow, &self.fp_domains, &self.extension_exclusions]
+        Self::exclusions_under(&self.ads, [&self.known_good, &self.user_allow, &self.fp_domains, &self.extension_exclusions])
+    }
+
+    /// Threat-rule names that block after every allow list is applied,
+    /// sorted, for blockers that must decide before a request is sent (the
+    /// browser's declarativeNetRequest rules). Only plain ASCII host names:
+    /// those blockers reject anything else.
+    pub fn threat_domains(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .domains
+            .keys()
+            .filter(|name| is_plain_host(name) && self.classify_domain(name).blocks())
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Names under a threat rule that are allowed anyway (a subdomain of a
+    /// blocked domain on an allow list), for the same blockers. Known-good
+    /// and false-positive names do not override the user's own block rules,
+    /// so those are only exceptions under feed and built-in rules.
+    pub fn threat_exclusions(&self) -> Vec<String> {
+        let mut out = Self::exclusions_under(&self.domains, [&self.user_allow, &self.extension_exclusions]);
+        let not_user = |name: &&String| suffix_lookup(&self.domains, name).is_some_and(|(_, info)| info.origin != Origin::User);
+        out.extend([&self.known_good, &self.fp_domains].into_iter().flatten().filter(not_user).cloned());
+        out.retain(|name| is_plain_host(name));
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn exclusions_under<'a, V>(rules: &HashMap<String, V>, lists: impl IntoIterator<Item = &'a HashSet<String>>) -> Vec<String> {
+        let mut out: Vec<String> = lists
             .into_iter()
             .flatten()
-            .filter(|name| suffix_lookup(&self.ads, name).is_some())
+            .filter(|name| suffix_lookup(rules, name).is_some())
             .cloned()
             .collect();
         out.sort();
@@ -585,6 +618,15 @@ fn parents(name: &str) -> impl Iterator<Item = &str> {
 /// The host of a user-entered site: a bare name, an IP or a full URL.
 pub fn host_of(entry: &str) -> Option<String> {
     WebAddress::parse(entry).map(|a| a.host)
+}
+
+/// A lower-case ASCII host name (letters, digits, `-`, `.`), as browser
+/// rule engines require. IP literals and wildcard entries are not.
+fn is_plain_host(name: &str) -> bool {
+    !name.is_empty()
+        && name.contains('.')
+        && name.parse::<IpAddr>().is_err()
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
 }
 
 fn capitalize(text: &str) -> String {
@@ -675,6 +717,32 @@ mod tests {
         assert_eq!(ip.code, VerdictCode::BadIp);
         assert_eq!(r.classify_dns("fine.example", &[Answer::Address("192.0.2.1".parse().unwrap())]).code, VerdictCode::Clean);
         assert_eq!(r.classify_dns("google.com", &[Answer::Address("198.51.100.20".parse().unwrap())]).code, VerdictCode::KnownGood);
+    }
+
+    #[test]
+    fn threat_domains_for_pre_request_blocking_respect_allow_lists() {
+        let user = UserLists {
+            allow: vec!["safe.bad.example".into()],
+            block: vec!["mine.example".into()],
+            extension_exclusions: vec!["excluded.example".into()],
+        };
+        let r = rules(
+            "domain bad.example malware Stealer
+domain excluded.example phishing Fake
+domain google.com malware Wrong
+domain *.wild.example malware W
+",
+            user,
+        );
+        let domains = r.threat_domains();
+        assert!(domains.contains(&"bad.example".to_string()));
+        assert!(domains.contains(&"mine.example".to_string()), "the user's own block list");
+        assert!(!domains.contains(&"excluded.example".to_string()), "excluded entirely");
+        assert!(!domains.contains(&"google.com".to_string()), "known-good is never blocked");
+        assert!(domains.iter().all(|d| is_plain_host(d)), "{domains:?}");
+        assert!(domains.windows(2).all(|w| w[0] <= w[1]), "sorted");
+        // A subdomain allowed under a blocked domain becomes an exception.
+        assert!(r.threat_exclusions().contains(&"safe.bad.example".to_string()));
     }
 
     #[test]

@@ -65,20 +65,26 @@ pub fn apply_style(ctx: &egui::Context) {
     });
 }
 
-/// The Phalanx emblem as 128×128 RGBA, generated from `assets/phalanx.png`.
+/// The app icon: the emblem on a dark rounded tile (readable on light and
+/// dark taskbars), 128×128 RGBA, generated from the logo into `assets/`.
 const ICON_RGBA: &[u8] = include_bytes!("../../assets/phalanx-128.rgba");
+/// The emblem alone on transparency, for the (always dark) sidebar.
+const EMBLEM_RGBA: &[u8] = include_bytes!("../../assets/phalanx-emblem-128.rgba");
 const ICON_SIZE: u32 = 128;
-/// The emblem as PNG, for the notification icon.
+/// The tile as PNG, for the notification icon.
 pub const ICON_PNG: &[u8] = include_bytes!("../../assets/phalanx.png");
+/// The tile as a multi-size icon file, for the Start-menu shortcut (and so
+/// the taskbar).
+pub const ICON_ICO: &[u8] = include_bytes!("../../assets/phalanx.ico");
 
-/// The app icon: (RGBA pixels, width, height).
+/// The window and tray icon: (RGBA pixels, width, height).
 pub fn icon_rgba() -> (Vec<u8>, u32, u32) {
     (ICON_RGBA.to_vec(), ICON_SIZE, ICON_SIZE)
 }
 
 /// The emblem as an egui texture, for the sidebar.
 pub fn logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let image = egui::ColorImage::from_rgba_unmultiplied([ICON_SIZE as usize; 2], ICON_RGBA);
+    let image = egui::ColorImage::from_rgba_unmultiplied([ICON_SIZE as usize; 2], EMBLEM_RGBA);
     ctx.load_texture("phalanx-logo", image, egui::TextureOptions::LINEAR)
 }
 
@@ -422,10 +428,17 @@ pub fn check_label(status: Status, privacy: bool) -> &'static str {
     }
 }
 
-/// One check: status badge, title, what was read, why it matters and a link
-/// to the Windows page. Returns true when the link was clicked.
-pub fn check_row(ui: &mut Ui, check: &Check, privacy: bool) -> bool {
-    let mut open = false;
+/// What the user clicked on a check row.
+#[derive(Clone, Copy, PartialEq)]
+pub enum CheckAction {
+    OpenSettings,
+    ApplyFix,
+}
+
+/// One check: status badge, title, what was read, why it matters, a link to
+/// the Windows page and, when the check offers one, a fix button.
+pub fn check_row(ui: &mut Ui, check: &Check, privacy: bool) -> Option<CheckAction> {
+    let mut action = None;
     ui.horizontal(|ui| {
         let width = ui.available_width();
         ui.allocate_ui_with_layout(Vec2::new(78.0, 0.0), Layout::top_down(Align::Min), |ui| {
@@ -436,12 +449,21 @@ pub fn check_row(ui: &mut Ui, check: &Check, privacy: bool) -> bool {
             ui.add(egui::Label::new(RichText::new(check.title).strong().color(TEXT)).wrap());
             ui.add(egui::Label::new(RichText::new(&check.detail).size(13.0).color(check_color(check.status).lerp_to_gamma(TEXT, 0.35))).wrap());
             ui.add(egui::Label::new(RichText::new(check.why).size(12.0).color(MUTED)).wrap());
-            if check.status != Status::Good || privacy {
-                open = ui.add(egui::Link::new(RichText::new(check.link.label).size(12.5).color(ACCENT))).clicked();
-            }
+            ui.horizontal_wrapped(|ui| {
+                if let Some(fix) = &check.fix {
+                    if small_button(ui, fix.label).clicked() {
+                        action = Some(CheckAction::ApplyFix);
+                    }
+                }
+                if (check.status != Status::Good || privacy)
+                    && ui.add(egui::Link::new(RichText::new(check.link.label).size(12.5).color(ACCENT))).clicked()
+                {
+                    action = Some(CheckAction::OpenSettings);
+                }
+            });
         });
     });
-    open
+    action
 }
 
 /// Score ring: percentage and level in a coloured circle.

@@ -2,6 +2,7 @@
 //! with a local SQLite history and reversible quarantine.
 
 pub mod ai;
+pub mod audit;
 pub mod engine;
 pub mod heuristics;
 pub mod posture;

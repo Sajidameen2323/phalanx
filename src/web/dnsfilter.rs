@@ -66,14 +66,23 @@ struct FilterContext {
 pub struct DnsFilter {
     stop: Arc<AtomicBool>,
     ads_blocked: Arc<AtomicU64>,
-    tcp_addr: SocketAddr,
+    /// TCP listeners to wake on shutdown.
+    tcp_addrs: Vec<SocketAddr>,
     threads: Vec<JoinHandle<()>>,
     udp_addr: SocketAddr,
+    /// The IPv6 loopback address also served, when `listen` is 127.0.0.1.
+    v6_addr: Option<SocketAddr>,
 }
 
 impl DnsFilter {
     /// Binds the UDP and TCP listeners and starts serving. `on_event` is
     /// called for each logged block (for notifications).
+    ///
+    /// When listening on 127.0.0.1, the same port on the IPv6 loopback
+    /// (`[::1]`) is served too, so Windows can be pointed at the filter for
+    /// IPv6 lookups as well: otherwise IPv6 DNS servers from the router
+    /// would answer some lookups and bypass it. If `[::1]` cannot be bound
+    /// (IPv6 disabled), only IPv4 is served.
     pub fn start(config: FilterConfig, rules: SharedRules, cache: Arc<RedirectionCache>, on_event: Option<OnEvent>) -> Result<Self> {
         if config.upstreams.is_empty() {
             anyhow::bail!("no upstream DNS resolver configured");
@@ -85,6 +94,15 @@ impl DnsFilter {
         let tcp = TcpListener::bind(tcp_listen).with_context(|| format!("starting the DNS filter on TCP {tcp_listen}"))?;
         let tcp_addr = tcp.local_addr()?;
         udp.set_read_timeout(Some(Duration::from_millis(400)))?;
+        let v6 = (config.listen.ip() == std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .then(|| {
+                let addr = SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), udp_addr.port());
+                let udp = UdpSocket::bind(addr).ok()?;
+                let tcp = TcpListener::bind(addr).ok()?;
+                udp.set_read_timeout(Some(Duration::from_millis(400))).ok()?;
+                Some((addr, udp, tcp))
+            })
+            .flatten();
 
         let stop = Arc::new(AtomicBool::new(false));
         let ads_blocked = Arc::new(AtomicU64::new(0));
@@ -106,11 +124,25 @@ impl DnsFilter {
             let (ctx, stop) = (ctx.clone(), stop.clone());
             threads.push(std::thread::Builder::new().name("dns-filter-tcp".into()).spawn(move || serve_tcp(tcp, ctx, stop))?);
         }
-        Ok(Self { stop, ads_blocked, tcp_addr, threads, udp_addr })
+        let mut tcp_addrs = vec![tcp_addr];
+        let v6_addr = v6.as_ref().map(|(addr, _, _)| *addr);
+        if let Some((addr, udp6, tcp6)) = v6 {
+            tcp_addrs.push(addr);
+            let (ctx6, stop6) = (ctx.clone(), stop.clone());
+            threads.push(std::thread::Builder::new().name("dns-filter-udp6".into()).spawn(move || serve_udp(udp6, ctx6, stop6))?);
+            let (ctx6, stop6) = (ctx.clone(), stop.clone());
+            threads.push(std::thread::Builder::new().name("dns-filter-tcp6".into()).spawn(move || serve_tcp(tcp6, ctx6, stop6))?);
+        }
+        Ok(Self { stop, ads_blocked, tcp_addrs, threads, udp_addr, v6_addr })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.udp_addr
+    }
+
+    /// The IPv6 loopback address also served, if any.
+    pub fn local_addr_v6(&self) -> Option<SocketAddr> {
+        self.v6_addr
     }
 
     /// Ad and tracker lookups answered with the sinkhole since it started.
@@ -124,7 +156,9 @@ impl DnsFilter {
 
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect_timeout(&self.tcp_addr, Duration::from_millis(500));
+        for addr in &self.tcp_addrs {
+            let _ = TcpStream::connect_timeout(addr, Duration::from_millis(500));
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -324,7 +358,7 @@ mod tests {
     }
 
     fn lookup(server: SocketAddr, name: &str, qtype: u16) -> dns::Message {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = UdpSocket::bind(if server.is_ipv4() { "127.0.0.1:0" } else { "[::1]:0" }).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         socket.send_to(&build_query(42, name, qtype), server).unwrap();
         let mut buf = [0u8; 1500];
@@ -400,6 +434,12 @@ mod tests {
         lookup(server, "ad.doubleclick.net", TYPE_AAAA);
         assert_eq!(lookup(server, "fine.example", TYPE_A).answers, [Answer::Address("192.0.2.1".parse().unwrap())]);
         assert_eq!(filter.ads_blocked(), 2);
+        // The IPv6 loopback serves the same filter (when IPv6 is available).
+        if let Some(v6) = filter.local_addr_v6() {
+            assert_eq!(v6.port(), server.port());
+            assert_eq!(lookup(v6, "ad.doubleclick.net", TYPE_A).answers, [Answer::Address(sinkhole.into())]);
+            assert_eq!(filter.ads_blocked(), 3);
+        }
         assert_eq!(notified.load(Ordering::SeqCst), 0, "not notified");
         assert!(events::recent(tmp.path(), 10).is_empty(), "not logged");
         assert!(cache.find("ad.doubleclick.net").is_none() && cache.is_quiet("ad.doubleclick.net"));

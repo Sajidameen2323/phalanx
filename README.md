@@ -27,7 +27,11 @@ cargo build --release
 This produces `target\release\phalanx.exe` (the app) and `phalanx-cli.exe`. With the
 GNU toolchain, `build.rs` embeds the Phalanx icon and version information using
 `windres` (set `WINDRES` to use another one); without it the build still succeeds,
-without the icon. The icon assets in `assets/` come from the Phalanx logo.
+without the icon. The icon assets in `assets/` come from the Phalanx logo: `phalanx-logo.png`
+and `phalanx-wordmark.png` (transparent, for dark backgrounds), their `-dark`
+versions (for light backgrounds), `phalanx-emblem.png` (the shield alone), and the
+app icon `phalanx.ico` / `phalanx.png` with the emblem on a dark tile so it stays
+readable on light taskbars and toolbars.
 
 The first build takes several minutes, mostly compiling YARA-X's WebAssembly JIT.
 
@@ -131,11 +135,25 @@ logged) or **Off**.
 native-messaging connector (`phalanx-cli`) for Chrome, Edge, Brave, Chromium/Vivaldi
 and Firefox, per user under `HKCU`, so no administrator rights are needed. It also
 writes the extension to `<data folder>\browser-extension`. Load that folder once per
-browser with **Load unpacked** (Developer mode). The extension asks Phalanx about
-every page a tab opens. A dangerous page is replaced by a warning page with **Go
-back to safety**. Under **Details and options** you can also **Continue this time**
-(only in that tab, until it leaves the site or closes; the site is blocked again
-everywhere else) or **Always allow this site** (verdict 6). This works for `https://` sites too,
+browser with **Load unpacked** (Developer mode).
+
+Malicious sites are blocked **before the browser sends any request** to them. The
+connector hands the malicious names (after allow lists) to the extension, which
+installs them as `declarativeNetRequest` block rules, 1,000 names to a rule, for
+every resource type: the page itself and anything a legitimate page loads from a
+malicious name. The browser applies these rules itself, synchronously, so a blocked
+site receives no request, not even for a moment, and no page content loads. The
+rules persist across browser restarts and keep protecting while the connector is
+unavailable; they are refreshed when the rules or your allow lists change, retried
+within 15 seconds when a sync fails. (This was verified in Edge with a test server:
+the blocked host logged no request at all.) Asking Phalanx per page remains as a
+second layer for rules a browser rule cannot express (exact URLs, IP ranges); that
+check runs alongside the navigation, which is why it is not the first line.
+
+A blocked page is replaced by a warning page with **Go back to safety**. Under **Details and options** you can also **Continue this time**
+(only in that tab, until it leaves the site or closes; a session rule lets that tab
+through while the site stays blocked everywhere else) or **Always allow this site**
+(verdict 6). This works for `https://` sites too,
 without intercepting TLS or installing a certificate. If Phalanx is unreachable, the
 extension never blocks; its icon shows `!` instead.
 
@@ -149,14 +167,21 @@ Bing, DuckDuckGo, Yahoo and Brave Search:
 It unwraps the engines' redirect links (Google `/url?q=`, Bing `/ck/a`, DuckDuckGo
 `/l/`, Yahoo `RU=`) to check the real address. All checks happen in Phalanx on this
 PC, and search-result checks are not logged. Turn marking off in the extension's
-popup. The popup also shows:
+settings.
 
-* whether protection is on
-* the verdict for the current site
-* sites blocked today and in total
-* the number of threat rules and when they were last updated
+The popup shows whether protection is on, the verdict for the current site, when the
+threat lists were last updated, and a button that opens Phalanx.
 
-It also has a button that opens Phalanx.
+The popup shows, for the current page, how many ads and trackers were blocked, how
+many ad pop-ups were closed and how many requests to dangerous sites the page made
+(counted afresh for each new page; the toolbar icon shows the same total), plus
+today's blocked sites and ads. **Block this site** adds it to your blocked sites
+(blocked before loading, even if Phalanx otherwise trusts it); **Allow this site**
+stops Phalanx blocking it and its ads, while dangerous third-party requests from it
+stay blocked. Both can be undone from the popup or the extension's **Settings**
+page, which also holds ad blocking, closing ad pop-ups, the icon count, search-result
+marking, and your blocked and allowed sites (shared with the app and every connected
+browser).
 
 **Ad and tracker blocking (optional, off by default).** Turn on **Block ads and
 trackers** on the Web protection page, in the extension's popup, or with
@@ -195,10 +220,29 @@ inside a bad IP range is also caught. A blocked name resolves to the loopback
 sinkhole `127.66.0.1`. A small server there answers `http://` requests with
 `303 See Other` to its own block page. The redirection cache (1,000 entries, oldest
 dropped first) records why each name was blocked. Blocked `https://` sites just fail
-to load. To use the filter, set your network adapter's DNS server to `127.0.0.1`
-yourself; Phalanx never changes network settings. Add your router as the alternate
-DNS server so lookups still work when Phalanx is closed. Browsers with "secure DNS"
-(DNS over HTTPS) turned on bypass the filter, but Browser Guard still covers them.
+to load. The filter also answers on the IPv6 loopback `[::1]:53`.
+
+To use it, choose **Set up…** under **Use the filter for Windows DNS** (administrator,
+after a confirmation that says exactly what changes). It first saves every connected
+adapter's DNS settings to `web\windows-dns-backup.json`, then points each adapter's
+IPv4 *and* IPv6 DNS at the filter. Both matter: many routers also hand out IPv6 DNS
+servers, which Windows would otherwise ask directly. **Keep a fallback DNS server**
+(on by default) leaves the adapter's previous first server second in line, so the
+internet still works when Phalanx is closed; turning it off means nothing resolves
+without Phalanx, but no lookup can slip past it. **Restore previous DNS…** puts back
+exactly what was saved (automatic from the router, or the servers you had).
+Browsers with "secure DNS" (DNS over HTTPS) turned on bypass the filter, but Browser
+Guard still covers them.
+
+**Browser hardening.** The Web protection page also checks each Chromium browser
+and profile, read-only: whether an update is downloaded but waiting for a restart
+(the browser keeps `new_chrome.exe` until then) and whether a newer stable release
+exists (from Google's and Microsoft's public version feeds; nothing about the PC is
+sent), Safe Browsing (standard or enhanced), the JavaScript optimizer (turning it off
+removes the part of the browser most zero-day exploits target), secure DNS, whether
+Browser Guard is installed, and how many passwords the profile stores (rows are
+counted from a copy of the database; nothing is read or decrypted). Each item links
+to the browser's own setting. `phalanx-cli browsers` prints the same.
 
 **Browser extensions.** **Check browsers** reads every Chrome, Edge, Brave and
 Vivaldi profile. It reports an extension as:
@@ -217,6 +261,32 @@ while the browser is closed. It backs up both preference files (and the registry
 Chromium keeps), moves the extension's folder into `browser-backups`, and deletes
 its entries. Undo it with `phalanx-cli web restore-extension <backup folder>`.
 
+### Stealer check
+
+The **Stealer check** page (and `phalanx-cli audit`) looks for what infostealers and
+the loaders that install them leave behind. It is read-only and takes about 20
+seconds:
+
+* start-up entries (Run keys, Startup folders), scheduled tasks (outside
+  `\Microsoft\`) and services, with each program's digital signature. Flagged:
+  unsigned programs in folders any program can write to, signatures that do not
+  verify, programs started from temporary folders, missing programs, and script
+  hosts (PowerShell, `mshta`, `wscript`…) running encoded, hidden or downloaded code.
+* browser shortcuts and launch commands with `--remote-debugging-port`,
+  `--remote-debugging-pipe` or `--load-extension`, which let another program read the
+  browser's cookies.
+* browser policies that force-install extensions (`ExtensionInstallForcelist`).
+* a proxy or proxy script, and hosts-file entries that redirect or block account and
+  security sites.
+* Microsoft Defender's exclusions, on request (they can only be read as
+  administrator; malware often adds them).
+
+Programs that are not validly signed are also scanned with the local engine. Each
+finding shows where it is, with **Open folder**, **Scan file** and **Inspect with
+AI**. Nothing is removed: after a real infection, the safe order is an offline scan,
+then signing out of every session and changing passwords from another device, and
+resetting Windows if malware is confirmed.
+
 ### Windows protection status
 
 The Protection page checks, without changing anything: real-time antivirus
@@ -225,7 +295,15 @@ cloud-delivered protection, potentially unwanted app blocking, SmartScreen (Chec
 apps and files), Smart App Control, memory integrity, firewall profiles, controlled
 folder access, User Account Control and whether file extensions are shown. Each
 check says what it read and links to the Windows Security or Settings page where you
-can change it. Values that cannot be read are shown as *Unknown*, never as off.
+can change it. **Network protection** (Microsoft Defender blocking connections to
+malicious sites for every program, inside Windows' network stack) is checked too.
+Network protection, potentially unwanted app blocking and cloud-delivered protection
+have a **Turn on** button when they are off: it shows the exact `Set-MpPreference`
+command and runs it as administrator only after you confirm and approve Windows'
+prompt, then reads the setting again (some Windows editions accept the command
+without the setting changing; the page says so). **Run offline scan** starts a
+Microsoft Defender Offline scan, which restarts the PC and scans before Windows
+starts. Values that cannot be read are shown as *Unknown*, never as off.
 Defender settings are marked not applicable when another antivirus is active.
 Reading Defender's state runs a short PowerShell query in the background (a few
 seconds).
@@ -304,6 +382,8 @@ phalanx-cli quarantine delete <ID>
 phalanx-cli update [--check|--force]  # download feeds that changed
 phalanx-cli info             # rule/hash counts, last update, data folder
 phalanx-cli status [--json]  # Windows protection status and privacy checklist
+phalanx-cli audit [--exclusions]       # stealer and persistence check (read-only)
+phalanx-cli browsers [--offline]       # browser updates and hardening (read-only)
 phalanx-cli inspect FILE --dry-run   # show what AI inspection would send
 phalanx-cli inspect FILE             # ask Gemini (needs GEMINI_API_KEY)
 

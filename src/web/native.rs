@@ -13,6 +13,11 @@
 //!   names to block inside pages, in list order, with a `revision` that
 //!   changes when they do (`active` is false while ad blocking is off)
 //! * `{"type":"set_ads","on":…}` → switches ad blocking on or off
+//! * `{"type":"threat_domains","offset":n}` → one page of the malicious
+//!   names (after allow lists), with exceptions and a `revision`. The
+//!   extension turns them into declarativeNetRequest block rules, which the
+//!   browser applies *before* a request is sent; asking per page cannot,
+//!   because the navigation is already under way while the reply travels.
 //!
 //! It reloads the settings and rules when their files change, so changes in
 //! the desktop app apply without restarting the browser.
@@ -24,7 +29,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 /// Registered host name (what the extension passes to `connectNative`).
 pub const HOST_NAME: &str = "com.phalanx.browser_guard";
@@ -34,12 +39,12 @@ pub const CHROMIUM_EXTENSION_ID: &str = "pbmiomloikaabmjoklgindgdhelghecp";
 pub const FIREFOX_EXTENSION_ID: &str = "browser-guard@phalanx.local";
 /// Largest message accepted from the browser.
 const MAX_MESSAGE: usize = 1024 * 1024;
-/// How often file changes are looked for.
-const RELOAD_CHECK: Duration = Duration::from_secs(3);
 /// Most addresses checked in one `check_many` request.
 const MAX_BATCH: usize = 200;
 /// Ad names per `ads_domains` reply (replies to the browser must stay under 1 MB).
 const ADS_PAGE: usize = 20_000;
+/// Threat names per `threat_domains` reply (replies must stay under 1 MB).
+const THREAT_PAGE: usize = 20_000;
 /// Most ad names handed to the browser; the first in list order are kept.
 pub const MAX_AD_DOMAINS: usize = 150_000;
 
@@ -54,7 +59,12 @@ pub const EXTENSION_FILES: &[(&str, &[u8])] = &[
     ("popup.js", include_bytes!("../../browser-extension/popup.js")),
     ("search.js", include_bytes!("../../browser-extension/search.js")),
     ("style.css", include_bytes!("../../browser-extension/style.css")),
-    ("icon.png", include_bytes!("../../browser-extension/icon.png")),
+    ("options.html", include_bytes!("../../browser-extension/options.html")),
+    ("options.js", include_bytes!("../../browser-extension/options.js")),
+    ("icon16.png", include_bytes!("../../browser-extension/icon16.png")),
+    ("icon32.png", include_bytes!("../../browser-extension/icon32.png")),
+    ("icon48.png", include_bytes!("../../browser-extension/icon48.png")),
+    ("icon128.png", include_bytes!("../../browser-extension/icon128.png")),
 ];
 
 /// Whether this process was started by a browser as the connector:
@@ -73,10 +83,17 @@ struct HostState {
     config: WebConfig,
     rules: WebRules,
     loaded_from: [Option<SystemTime>; 3],
-    last_check: Instant,
     error: Option<String>,
     /// Ad names for the browser, in list order; built on first request.
     ad_domains: Option<Vec<String>>,
+    /// Threat names for the browser's pre-request rules; built on first request.
+    threat_domains: Option<Vec<String>>,
+}
+
+fn add(list: &mut Vec<String>, host: &str) {
+    if !list.iter().any(|h| h == host) {
+        list.push(host.to_string());
+    }
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -90,9 +107,9 @@ impl HostState {
             config: WebConfig::default(),
             rules: WebRules::default(),
             loaded_from: [None; 3],
-            last_check: Instant::now(),
             error: None,
             ad_domains: None,
+            threat_domains: None,
         };
         state.reload();
         state
@@ -109,6 +126,7 @@ impl HostState {
     fn reload(&mut self) {
         self.loaded_from = self.sources();
         self.ad_domains = None;
+        self.threat_domains = None;
         let loaded = WebConfig::load(&self.data_dir).and_then(|config| {
             let rules = config.load_rules(&self.data_dir)?;
             Ok((config, rules))
@@ -129,11 +147,9 @@ impl HostState {
         }
     }
 
+    /// Picks up changes from the app or the command line at once (three file
+    /// times per request), so the browser never acts on old lists.
     fn reload_if_changed(&mut self) {
-        if self.last_check.elapsed() < RELOAD_CHECK {
-            return;
-        }
-        self.last_check = Instant::now();
         if self.sources() != self.loaded_from {
             self.reload();
         }
@@ -189,7 +205,30 @@ impl HostState {
                     "block_ads": self.config.block_ads,
                     "ads": counts.ads,
                     "ads_revision": self.ads_revision(),
+                    "threats_revision": self.threats_revision(),
                 })
+            }
+            Some("threat_domains") => {
+                let offset = request.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let revision = self.threats_revision();
+                let active = self.blocking();
+                if active && self.threat_domains.is_none() {
+                    self.threat_domains = Some(self.rules.threat_domains());
+                }
+                let domains: &[String] = if active { self.threat_domains.as_deref().unwrap_or_default() } else { &[] };
+                let page: Vec<&String> = domains.iter().skip(offset).take(THREAT_PAGE).collect();
+                let mut reply = json!({
+                    "type": "threat_domains",
+                    "active": active,
+                    "revision": revision,
+                    "total": domains.len(),
+                    "offset": offset,
+                    "domains": page,
+                });
+                if offset == 0 && active {
+                    reply["excluded"] = json!(self.rules.threat_exclusions());
+                }
+                reply
             }
             Some("ads_domains") => {
                 let offset = request.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -207,48 +246,134 @@ impl HostState {
                 });
                 if offset == 0 && active {
                     reply["excluded"] = json!(self.rules.ad_exclusions());
+                    // Pages on sites the user allowed show their ads.
+                    reply["allowed_sites"] = json!(self.allowed_sites());
                 }
                 reply
             }
+            // Cheap enough to ask on every page: whether the rules changed.
+            Some("revisions") => json!({
+                "type": "revisions",
+                "threats_revision": self.threats_revision(),
+                "ads_revision": self.ads_revision(),
+            }),
             Some("set_ads") => {
-                let mut config = self.config.clone();
-                config.block_ads = request.get("on").and_then(Value::as_bool).unwrap_or(false);
-                match config.save(&self.data_dir) {
-                    Ok(()) => {
+                let on = request.get("on").and_then(Value::as_bool).unwrap_or(false);
+                match WebConfig::update(&self.data_dir, |c| c.block_ads = on) {
+                    Ok(_) => {
                         self.reload();
                         json!({ "type": "ads_set", "ok": true, "block_ads": self.config.block_ads, "ads_revision": self.ads_revision() })
                     }
                     Err(e) => json!({ "type": "ads_set", "ok": false, "error": format!("{e:#}") }),
                 }
             }
-            Some("exclude") => {
-                let mut config = self.config.clone();
-                let site = text("site");
-                match super::rules::host_of(&site) {
-                    Some(host) => {
-                        if !config.extension_exclusions.contains(&host) {
-                            config.extension_exclusions.push(host.clone());
-                        }
-                        match config.save(&self.data_dir) {
-                            Ok(()) => {
-                                self.reload();
-                                json!({ "type": "excluded", "ok": true, "site": host })
-                            }
-                            Err(e) => json!({ "type": "excluded", "ok": false, "error": format!("{e:#}") }),
-                        }
-                    }
-                    None => json!({ "type": "excluded", "ok": false, "error": "not a web address" }),
-                }
-            }
+            // Allow a site: no threat or ad blocking on it (verdict 6). It
+            // leaves the user's block list, so the two never disagree.
+            Some("exclude") => self.edit_site("excluded", &text("site"), |c, host| {
+                c.unblock(host);
+                add(&mut c.extension_exclusions, host);
+                true
+            }),
+            // Block a site the rules do not know: the user's block list,
+            // which known-good lists do not override. It stops being allowed.
+            Some("block_site") => self.edit_site("site_blocked", &text("site"), |c, host| {
+                c.unallow(host);
+                add(&mut c.user_block, host);
+                true
+            }),
+            // Removing covers the entry that applies: unblocking
+            // www.example.com removes an `example.com` entry.
+            Some("unblock_site") => self.edit_site("site_unblocked", &text("site"), |c, host| !c.unblock(host).is_empty()),
+            Some("unallow_site") => self.edit_site("site_unallowed", &text("site"), |c, host| !c.unallow(host).is_empty()),
+            Some("lists") => self.lists(),
             other => json!({ "type": "error", "error": format!("unknown request {other:?}") }),
         };
         reply["id"] = id;
         reply
     }
 
+    /// Changes one site in the user's lists, saves and reloads. `kind` is the
+    /// reply type; the reply carries the updated lists. The change applies to
+    /// the settings file as it is now (the app may have changed it since this
+    /// connector last read it); `change` returns false when the site was not
+    /// on the list it should leave.
+    fn edit_site(&mut self, kind: &str, site: &str, change: impl FnOnce(&mut WebConfig, &str) -> bool) -> Value {
+        // Only websites: `chrome://settings` must not become a site called "settings".
+        let lower = site.trim().to_ascii_lowercase();
+        let web_scheme = !lower.contains("://") || lower.starts_with("http://") || lower.starts_with("https://");
+        let Some(host) = super::rules::host_of(site).filter(|h| web_scheme && (h.contains('.') || h.parse::<std::net::IpAddr>().is_ok())) else {
+            return json!({ "type": kind, "ok": false, "error": "not a web address" });
+        };
+        let mut config = match WebConfig::load(&self.data_dir) {
+            Ok(c) => c,
+            Err(e) => return json!({ "type": kind, "ok": false, "error": format!("{e:#}") }),
+        };
+        if !change(&mut config, &host) {
+            self.reload(); // the lists shown may have been out of date
+            let mut reply = self.lists();
+            reply["type"] = json!(kind);
+            reply["ok"] = json!(false);
+            reply["error"] = json!(format!("{host} is not on that list (it may have been changed in the Phalanx app)"));
+            return reply;
+        }
+        match config.save(&self.data_dir) {
+            Ok(()) => {
+                self.reload();
+                let mut reply = self.lists();
+                reply["type"] = json!(kind);
+                reply["ok"] = json!(true);
+                reply["site"] = json!(host);
+                reply
+            }
+            Err(e) => json!({ "type": kind, "ok": false, "error": format!("{e:#}") }),
+        }
+    }
+
+    /// Sites the user allowed, as plain host names (for browser rules).
+    fn allowed_sites(&self) -> Vec<String> {
+        let mut sites: Vec<String> = self
+            .config
+            .extension_exclusions
+            .iter()
+            .chain(&self.config.user_allow)
+            .filter(|s| s.contains('.') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'))
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        sites.sort();
+        sites.dedup();
+        sites
+    }
+
+    /// The sites the user blocked and allowed, for the extension's settings.
+    fn lists(&self) -> Value {
+        let mut allowed: Vec<&String> = self.config.extension_exclusions.iter().chain(&self.config.user_allow).collect();
+        allowed.sort();
+        allowed.dedup();
+        let mut blocked: Vec<&String> = self.config.user_block.iter().collect();
+        blocked.sort();
+        json!({ "type": "lists", "blocked": blocked, "allowed": allowed, "threats_revision": self.threats_revision() })
+    }
+
+    /// Web protection is on and blocking (not report-only).
+    fn blocking(&self) -> bool {
+        self.config.enabled && self.config.mode == Mode::Block
+    }
+
     /// Ad blocking applies in the browser: switched on, protecting and blocking.
     fn ads_active(&self) -> bool {
-        self.config.block_ads && self.config.enabled && self.config.mode == Mode::Block
+        self.config.block_ads && self.blocking()
+    }
+
+    /// Changes whenever the threat names or their exceptions might have: the
+    /// settings (allow lists, exclusions, mode) and the feed are among the
+    /// watched files.
+    fn threats_revision(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.blocking().hash(&mut h);
+        self.loaded_from.hash(&mut h);
+        self.rules.counts().domains.hash(&mut h);
+        format!("{:016x}", h.finish())
     }
 
     /// Changes whenever the ad names or their exclusions might have.
@@ -400,6 +525,10 @@ pub fn host_exe() -> Result<PathBuf> {
 /// Writes the extension's files to `dir` (replacing older copies).
 pub fn write_extension(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Files earlier versions wrote that this one no longer uses.
+    for retired in ["icon.png"] {
+        let _ = std::fs::remove_file(dir.join(retired));
+    }
     for (name, bytes) in EXTENSION_FILES {
         let path = dir.join(name);
         if std::fs::read(&path).ok().as_deref() != Some(*bytes) {
@@ -551,6 +680,60 @@ mod tests {
     }
 
     #[test]
+    fn sites_can_be_blocked_allowed_and_undone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = HostState::new(tmp.path());
+        let blocked = state.handle(&json!({"type": "block_site", "site": "https://shady.example/page"}));
+        assert_eq!((blocked["ok"].as_bool(), blocked["site"].as_str()), (Some(true), Some("shady.example")));
+        assert_eq!(blocked["blocked"], json!(["shady.example"]));
+        let v = state.handle(&json!({"type": "check", "url": "https://www.shady.example/"}));
+        assert_eq!((v["block"].as_bool(), v["list"].as_str()), (Some(true), Some("userBlockList")));
+        let names = state.handle(&json!({"type": "threat_domains"}));
+        assert!(names["domains"].as_array().unwrap().contains(&json!("shady.example")), "blocked before any request");
+
+        // Allowing it takes it off the block list.
+        let allowed = state.handle(&json!({"type": "exclude", "site": "https://shady.example/"}));
+        assert_eq!((allowed["blocked"].as_array().unwrap().len(), allowed["allowed"].clone()), (0, json!(["shady.example"])));
+        assert_eq!(state.handle(&json!({"type": "check", "url": "https://shady.example/"}))["block"], false);
+
+        let undone = state.handle(&json!({"type": "unallow_site", "site": "shady.example"}));
+        assert_eq!(undone["allowed"], json!([]));
+        state.handle(&json!({"type": "block_site", "site": "shady.example"}));
+        let unblocked = state.handle(&json!({"type": "unblock_site", "site": "shady.example"}));
+        assert_eq!(unblocked["blocked"], json!([]));
+        assert_eq!(state.handle(&json!({"type": "block_site", "site": "chrome://settings"}))["ok"], false);
+        let config = WebConfig::load(tmp.path()).unwrap();
+        assert!(config.user_block.is_empty() && config.extension_exclusions.is_empty());
+    }
+
+    #[test]
+    fn hands_out_threat_names_for_pre_request_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = HostState::new(tmp.path());
+        let first = state.handle(&json!({"type": "threat_domains", "offset": 0}));
+        assert_eq!(first["active"], true);
+        let domains = first["domains"].as_array().unwrap();
+        assert!(domains.contains(&json!("blocktest.phalanx.invalid")), "{domains:?}");
+        assert_eq!(first["total"].as_u64(), Some(domains.len() as u64));
+        assert!(first["excluded"].is_array());
+
+        // An exclusion changes the revision and drops the name.
+        state.handle(&json!({"type": "exclude", "site": "https://blocktest.phalanx.invalid/"}));
+        let after = state.handle(&json!({"type": "threat_domains", "offset": 0}));
+        assert_ne!(after["revision"], first["revision"]);
+        assert!(!after["domains"].as_array().unwrap().contains(&json!("blocktest.phalanx.invalid")));
+
+        // Report-only mode hands out nothing to block.
+        let mut config = WebConfig::load(tmp.path()).unwrap();
+        config.mode = Mode::ReportOnly;
+        config.save(tmp.path()).unwrap();
+        state.reload();
+        let report = state.handle(&json!({"type": "threat_domains"}));
+        assert_eq!((report["active"].as_bool(), report["total"].as_u64()), (Some(false), Some(0)));
+        assert_ne!(report["revision"], after["revision"]);
+    }
+
+    #[test]
     fn hands_out_ad_names_in_pages_and_switches_ads() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(crate::update::signature_dir(tmp.path())).unwrap();
@@ -577,6 +760,57 @@ mod tests {
         let v = state.handle(&json!({"type": "check", "url": "https://ad.doubleclick.net/x"}));
         assert_eq!((v["block"].as_bool(), v["category"].as_str(), v["list"].as_str()), (Some(true), Some("ads"), Some("adsBlockList")));
         assert_eq!(state.handle(&json!({"type": "status"}))["ads"].as_u64(), Some(ADS_PAGE as u64 + 2));
+    }
+
+    #[test]
+    fn app_and_browser_list_edits_stay_in_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = |change: &dyn Fn(&mut WebConfig)| {
+            WebConfig::update(tmp.path(), |c| change(c)).unwrap();
+            // File times can be coarse; make sure the edit is seen as new.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut state = HostState::new(tmp.path());
+        let blocked = |state: &mut HostState, url: &str| state.handle(&json!({"type": "check", "url": url}))["block"].as_bool().unwrap();
+        let revision = |state: &mut HostState| state.handle(&json!({"type": "revisions"}))["threats_revision"].clone();
+
+        // Blocked in the app: the browser sees it on its very next request.
+        let before = revision(&mut state);
+        app(&|c| drop(c.block("spicett.com")));
+        assert_ne!(revision(&mut state), before, "revision changes at once");
+        assert!(blocked(&mut state, "https://www.spicett.com/"));
+        assert_eq!(state.handle(&json!({"type": "lists"}))["blocked"], json!(["spicett.com"]));
+
+        // Removed in the app: no longer blocked in the browser.
+        app(&|c| {
+            c.forget("spicett.com");
+        });
+        assert!(!blocked(&mut state, "https://spicett.com/"));
+        assert!(!state.handle(&json!({"type": "threat_domains"}))["domains"].as_array().unwrap().contains(&json!("spicett.com")));
+
+        // Blocked in the browser while the app added another site: both kept.
+        app(&|c| drop(c.block("other.example")));
+        state.handle(&json!({"type": "block_site", "site": "https://spicett.com/"}));
+        assert_eq!(WebConfig::load(tmp.path()).unwrap().user_block, ["other.example", "spicett.com"]);
+
+        // Unblocking from a subdomain page removes the entry that applies.
+        let r = state.handle(&json!({"type": "unblock_site", "site": "https://www.spicett.com/x"}));
+        assert_eq!((r["ok"].as_bool(), r["blocked"].clone()), (Some(true), json!(["other.example"])));
+        assert!(!blocked(&mut state, "https://www.spicett.com/"));
+        // Removing what is no longer there says so, with the current lists.
+        let gone = state.handle(&json!({"type": "unblock_site", "site": "spicett.com"}));
+        assert_eq!((gone["ok"].as_bool(), gone["blocked"].clone()), (Some(false), json!(["other.example"])));
+
+        // Allowed from the warning page, then blocked in the app: blocked.
+        state.handle(&json!({"type": "exclude", "site": "https://blocktest.phalanx.invalid/"}));
+        assert!(!blocked(&mut state, "https://blocktest.phalanx.invalid/"));
+        app(&|c| drop(c.block("blocktest.phalanx.invalid")));
+        assert!(blocked(&mut state, "https://blocktest.phalanx.invalid/"), "the app's block wins over the old exclusion");
+        // And allowed again from the browser, then un-allowed: the feed rule applies.
+        state.handle(&json!({"type": "exclude", "site": "https://blocktest.phalanx.invalid/"}));
+        assert!(!blocked(&mut state, "https://blocktest.phalanx.invalid/"));
+        assert_eq!(state.handle(&json!({"type": "unallow_site", "site": "blocktest.phalanx.invalid"}))["ok"], true);
+        assert!(blocked(&mut state, "https://blocktest.phalanx.invalid/"));
     }
 
     #[test]

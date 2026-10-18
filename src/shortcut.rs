@@ -41,6 +41,7 @@ const VT_LPWSTR: u16 = 31;
 const QUERY_INTERFACE: usize = 0;
 const RELEASE: usize = 2;
 const LINK_GET_PATH: usize = 3;
+const LINK_GET_ICON_LOCATION: usize = 16;
 const LINK_SET_DESCRIPTION: usize = 7;
 const LINK_SET_ARGUMENTS: usize = 11;
 const LINK_SET_ICON_LOCATION: usize = 17;
@@ -93,15 +94,22 @@ fn check(hr: HRESULT, what: &str) -> Result<(), String> {
 
 type SetText = unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT;
 
-/// Creates or updates `link` to start `exe` with `aumid`. Returns false when
-/// the shortcut already points at `exe` (nothing written). Runs COM on its
-/// own thread so it never disturbs the caller's apartment.
-pub fn ensure(link: &Path, exe: &Path, aumid: &str, description: &str) -> Result<bool, String> {
-    let (link, exe, aumid, description) =
-        (link.to_path_buf(), exe.to_path_buf(), aumid.to_string(), description.to_string());
+/// Creates `link` to start `exe` with `aumid` and the icon file `icon`.
+///
+/// An existing shortcut keeps its program while that program exists, so
+/// starting another copy (a test build) does not take it over; it is only
+/// re-pointed at `exe` when its program is gone (the app moved or was
+/// renamed). Its icon is updated whenever `icon` differs: Windows caches a
+/// shortcut's icon by path, so callers give a changed icon a new file name.
+/// The shell is then told icons changed, so the taskbar and Start menu
+/// redraw. Returns whether it wrote the shortcut. Runs COM on its own thread
+/// so it never disturbs the caller's apartment.
+pub fn ensure(link: &Path, exe: &Path, icon: &Path, aumid: &str, description: &str) -> Result<bool, String> {
+    let (link, exe, icon, aumid, description) =
+        (link.to_path_buf(), exe.to_path_buf(), icon.to_path_buf(), aumid.to_string(), description.to_string());
     std::thread::spawn(move || {
         let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
-        let result = write(&link, &exe, &aumid, &description);
+        let result = write(&link, &exe, &icon, &aumid, &description);
         if hr >= 0 {
             unsafe { CoUninitialize() };
         }
@@ -120,8 +128,8 @@ fn new_shell_link() -> Result<Com, String> {
     Ok(Com(raw))
 }
 
-/// The target of an existing shortcut, or `None` if it cannot be read.
-fn current_target(link_w: &[u16]) -> Option<String> {
+/// The target and icon file of an existing shortcut, or `None` if it cannot be read.
+fn current(link_w: &[u16]) -> Option<(String, String)> {
     let shell_link = new_shell_link().ok()?;
     let file = shell_link.query(&IID_PERSIST_FILE).ok()?;
     let load: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> HRESULT = unsafe { file.slot(FILE_LOAD) };
@@ -134,14 +142,32 @@ fn current_target(link_w: &[u16]) -> Option<String> {
     if unsafe { get_path(shell_link.0, buf.as_mut_ptr(), buf.len() as i32, std::ptr::null_mut(), 0) } < 0 {
         return None;
     }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(String::from_utf16_lossy(&buf[..len]))
+    let text = |buf: &[u16]| String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]);
+    let target = text(&buf);
+    let mut icon = [0u16; 1024];
+    let mut index = 0i32;
+    let get_icon: unsafe extern "system" fn(*mut c_void, *mut u16, i32, *mut i32) -> HRESULT =
+        unsafe { shell_link.slot(LINK_GET_ICON_LOCATION) };
+    let icon = if unsafe { get_icon(shell_link.0, icon.as_mut_ptr(), icon.len() as i32, &mut index) } >= 0 { text(&icon) } else { String::new() };
+    Some((target, icon))
 }
 
-fn write(link: &Path, exe: &Path, aumid: &str, description: &str) -> Result<bool, String> {
+/// Tells Explorer that icons may have changed, so cached ones are redrawn.
+fn notify_icons_changed() {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+    unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST, std::ptr::null(), std::ptr::null()) };
+}
+
+fn write(link: &Path, exe: &Path, icon: &Path, aumid: &str, description: &str) -> Result<bool, String> {
     let link_w = wide(&link.display().to_string());
-    let exe_text = exe.display().to_string();
-    if link.exists() && current_target(&link_w).is_some_and(|t| t.eq_ignore_ascii_case(&exe_text)) {
+    let icon_text = icon.display().to_string();
+    let existing = if link.exists() { current(&link_w) } else { None };
+    // Keep a working program; replace a missing one.
+    let exe_text = match &existing {
+        Some((target, _)) if Path::new(target).is_file() => target.clone(),
+        _ => exe.display().to_string(),
+    };
+    if existing.as_ref().is_some_and(|(target, current_icon)| *target == exe_text && current_icon.eq_ignore_ascii_case(&icon_text)) {
         return Ok(false);
     }
 
@@ -158,7 +184,7 @@ fn write(link: &Path, exe: &Path, aumid: &str, description: &str) -> Result<bool
         check(set_desc(shell_link.0, wide(description).as_ptr()), "setting the shortcut description")?;
         let set_icon: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT =
             shell_link.slot(LINK_SET_ICON_LOCATION);
-        check(set_icon(shell_link.0, exe_w.as_ptr(), 0), "setting the shortcut icon")?;
+        check(set_icon(shell_link.0, wide(&icon_text).as_ptr(), 0), "setting the shortcut icon")?;
     }
 
     let store = shell_link.query(&IID_PROPERTY_STORE)?;
@@ -177,6 +203,7 @@ fn write(link: &Path, exe: &Path, aumid: &str, description: &str) -> Result<bool
     }
     let save: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT = unsafe { file.slot(FILE_SAVE) };
     check(unsafe { save(file.0, link_w.as_ptr(), 1) }, "saving the shortcut")?;
+    notify_icons_changed();
     Ok(true)
 }
 
@@ -185,14 +212,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shortcut_is_written_once_and_rewritten_when_the_target_moves() {
+    fn shortcut_keeps_a_working_program_and_follows_icon_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let link = tmp.path().join("Programs").join("Test App.lnk");
-        let exe = std::env::current_exe().unwrap();
-        assert!(ensure(&link, &exe, "Test.App.Id", "test").unwrap());
-        assert!(link.is_file());
-        assert!(!ensure(&link, &exe, "Test.App.Id", "test").unwrap(), "unchanged target: nothing written");
-        let other = std::env::temp_dir();
-        assert!(ensure(&link, &other, "Test.App.Id", "test").unwrap());
+        let (first, second) = (tmp.path().join("first.exe"), tmp.path().join("second.exe"));
+        let (icon_a, icon_b) = (tmp.path().join("app-1.ico"), tmp.path().join("app-2.ico"));
+        for f in [&first, &second, &icon_a, &icon_b] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let link_w = wide(&link.display().to_string());
+        let read = || std::thread::spawn({
+            let link_w = link_w.clone();
+            move || {
+                unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+                current(&link_w).unwrap()
+            }
+        }).join().unwrap();
+
+        assert!(ensure(&link, &first, &icon_a, "Test.App.Id", "test").unwrap());
+        assert!(!ensure(&link, &first, &icon_a, "Test.App.Id", "test").unwrap(), "unchanged: nothing written");
+        assert!(!ensure(&link, &second, &icon_a, "Test.App.Id", "test").unwrap(), "another copy does not take it over");
+
+        // A new icon file: rewritten, same program.
+        assert!(ensure(&link, &second, &icon_b, "Test.App.Id", "test").unwrap());
+        let (target, icon) = read();
+        assert_eq!((Path::new(&target), Path::new(&icon)), (first.as_path(), icon_b.as_path()));
+
+        std::fs::remove_file(&first).unwrap();
+        assert!(ensure(&link, &second, &icon_b, "Test.App.Id", "test").unwrap(), "re-pointed once the old program is gone");
+        assert_eq!(Path::new(&read().0), second.as_path());
     }
 }

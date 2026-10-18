@@ -40,7 +40,7 @@ pub fn start_menu_shortcut() -> Option<std::path::PathBuf> {
 /// shows pop-up banners for an unpackaged app that has such a shortcut. No
 /// administrator rights; only values that differ are written. Removes the
 /// identity registered under the app's former name.
-pub fn register_notification_identity(icon_png: &std::path::Path, exe: &std::path::Path) -> Result<()> {
+pub fn register_notification_identity(icon_png: &std::path::Path, icon_ico: &std::path::Path, exe: &std::path::Path) -> Result<()> {
     #[cfg(windows)]
     {
         use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -57,13 +57,13 @@ pub fn register_notification_identity(icon_png: &std::path::Path, exe: &std::pat
             _ => {}
         }
         let link = start_menu_shortcut().ok_or_else(|| anyhow::anyhow!("APPDATA is not set"))?;
-        crate::shortcut::ensure(&link, exe, APP_USER_MODEL_ID, "Malware scanner and folder protection")
+        crate::shortcut::ensure(&link, exe, icon_ico, APP_USER_MODEL_ID, "Malware scanner and folder protection")
             .map_err(|e| anyhow::anyhow!("creating the Start-menu shortcut: {e}"))?;
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        let _ = (icon_png, exe);
+        let _ = (icon_png, icon_ico, exe);
         Ok(())
     }
 }
@@ -215,6 +215,120 @@ pub fn set_autostart(enabled: bool, command: &str) -> Result<()> {
     }
 }
 
+/// How an administrator command ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Elevated {
+    /// It ran; the process exit code (0 is success).
+    Exited(u32),
+    /// The user said no to the administrator (UAC) prompt; nothing ran.
+    Declined,
+}
+
+/// Runs a PowerShell script as administrator, after Windows' own consent
+/// prompt, and waits for it. The script travels as `-EncodedCommand`, so no
+/// quoting can change what runs. Callers pass fixed scripts, never input.
+pub fn run_elevated_powershell(script: &str) -> Result<Elevated> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+        use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let encoded = encode_powershell(script);
+        let params = wide(&format!("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}"));
+        let (verb, file) = (wide("runas"), wide("powershell.exe"));
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            lpVerb: verb.as_ptr(),
+            lpFile: file.as_ptr(),
+            lpParameters: params.as_ptr(),
+            nShow: 0, // SW_HIDE
+            ..Default::default()
+        };
+        // SAFETY: every pointer in `info` outlives the call; the process
+        // handle it returns is closed below.
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            if unsafe { GetLastError() } == ERROR_CANCELLED {
+                return Ok(Elevated::Declined);
+            }
+            anyhow::bail!("could not start PowerShell as administrator: {}", std::io::Error::last_os_error());
+        }
+        if info.hProcess.is_null() {
+            anyhow::bail!("PowerShell started without a process handle");
+        }
+        let mut code = 0u32;
+        unsafe {
+            WaitForSingleObject(info.hProcess, INFINITE);
+            GetExitCodeProcess(info.hProcess, &mut code);
+            CloseHandle(info.hProcess);
+        }
+        Ok(Elevated::Exited(code))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = script;
+        anyhow::bail!("only supported on Windows")
+    }
+}
+
+/// Runs a read-only PowerShell script (no window, no profile) and parses
+/// what it prints as JSON. The script travels as `-EncodedCommand`.
+pub fn powershell_json<T: serde::de::DeserializeOwned>(script: &str, timeout: std::time::Duration) -> std::result::Result<T, String> {
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"])
+        .arg(encode_powershell(script))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let child = command.spawn().map_err(|e| format!("could not run PowerShell: {e}"))?;
+    // Waited for on a thread, so a hung script cannot block the caller forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx
+        .recv_timeout(timeout)
+        .map_err(|_| format!("PowerShell did not finish within {} s", timeout.as_secs()))?
+        .map_err(|e| format!("PowerShell failed: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let json = text.trim().trim_start_matches('\u{feff}');
+    if json.is_empty() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("PowerShell returned nothing: {}", err.trim()));
+    }
+    serde_json::from_str(json).map_err(|e| format!("unexpected PowerShell output: {e}"))
+}
+
+/// A script as PowerShell's `-EncodedCommand` expects: UTF-16LE, base64.
+fn encode_powershell(script: &str) -> String {
+    base64(&script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>())
+}
+
+/// Standard base64 (RFC 4648) with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// Roots of the fixed (internal) drives, for a full scan. Removable, network
 /// and optical drives are left out.
 pub fn fixed_drives() -> Vec<std::path::PathBuf> {
@@ -276,6 +390,13 @@ impl Performance {
 mod tests {
     use super::*;
 
+    #[test]
+    fn base64_matches_rfc_4648_vectors() {
+        for (input, expected) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64(input.as_bytes()), expected);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn secrets_round_trip_through_dpapi() {
@@ -294,4 +415,15 @@ mod drive_tests {
         let drives = super::fixed_drives();
         assert!(drives.iter().any(|d| d.display().to_string().eq_ignore_ascii_case(&format!("{system}\\"))), "{drives:?}");
     }
+}
+
+/// PowerShell's own parser on a script, without running it: the syntax
+/// errors it reports (empty when the script is valid). For tests.
+#[cfg(all(test, windows))]
+pub(crate) fn powershell_syntax_errors(script: &str) -> Vec<String> {
+    let wrapper = format!(
+        "$s = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}')); $t = $null; $e = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($s, [ref]$t, [ref]$e); ConvertTo-Json -InputObject @($e | ForEach-Object {{ $_.Message + ' (line ' + $_.Extent.StartLineNumber + ')' }})",
+        encode_powershell(script)
+    );
+    powershell_json::<Vec<String>>(&wrapper, std::time::Duration::from_secs(60)).expect("PowerShell runs")
 }

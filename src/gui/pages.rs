@@ -29,6 +29,7 @@ impl App {
                         Page::Web => self.web_page(ui, ctx),
                         Page::Inspect => self.inspect_page(ui, ctx),
                         Page::Privacy => self.privacy_page(ui, ctx),
+                        Page::Audit => self.audit_page(ui, ctx),
                         Page::Quarantine => self.quarantine_page(ui),
                         Page::History => self.history_page(ui),
                         Page::Settings => self.settings_page(ui, ctx),
@@ -60,6 +61,7 @@ impl App {
             (Page::Web, "Web protection", self.web.running().then(|| ("on".to_string(), GREEN))),
             (Page::Inspect, "AI Inspect", inspecting.then(|| ("working".to_string(), ACCENT))),
             (Page::Privacy, "Privacy", privacy),
+            (Page::Audit, "Stealer check", self.audit_busy().then(|| ("checking".to_string(), ACCENT))),
             (Page::Quarantine, "Quarantine", (quarantined > 0).then(|| (quarantined.to_string(), ACCENT))),
             (Page::History, "History", None),
             (Page::Settings, "Settings", None),
@@ -1210,8 +1212,10 @@ impl App {
 
     /// Windows Security settings that block threats as they run (read-only).
     fn security_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        self.fix_confirmation(ui, ctx);
         let mut recheck = false;
         let mut open = None;
+        let mut confirm = None;
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 section_title(ui, "Windows protection status");
@@ -1228,7 +1232,7 @@ impl App {
             });
             ui.add(
                 egui::Label::new(
-                    RichText::new(format!("{APP_TITLE} checks files; these Windows features block threats while programs run. This only reads your settings: use the links to change them in Windows."))
+                    RichText::new(format!("{APP_TITLE} checks files; these Windows features block threats while programs run. Reading them changes nothing. A Turn on button changes one setting, only after you confirm and approve Windows' administrator prompt."))
                         .color(MUTED),
                 )
                 .wrap(),
@@ -1269,16 +1273,76 @@ impl App {
             sorted.sort_by_key(|c| (rank(c.status), std::cmp::Reverse(c.weight)));
             for check in sorted {
                 row_divider(ui);
-                if check_row(ui, check, false) {
-                    open = Some(check.link);
+                match check_row(ui, check, false) {
+                    Some(CheckAction::OpenSettings) => open = Some(check.link),
+                    Some(CheckAction::ApplyFix) => confirm = check.fix,
+                    None => {}
                 }
             }
+            row_divider(ui);
+            let idle = self.fix_rx.is_none();
+            setting_row(
+                ui,
+                "Microsoft Defender Offline scan",
+                "Restarts the PC and scans before Windows starts, reaching malware that hides while Windows runs. Recommended after an account takeover or an infostealer infection.",
+                |ui| {
+                    if ui.add_enabled_ui(idle, |ui| small_button(ui, "Run offline scan…").clicked()).inner {
+                        confirm = Some(posture::OFFLINE_SCAN);
+                    }
+                },
+            );
         });
         if recheck {
             self.refresh_posture(ctx);
         }
         if let Some(link) = open {
             self.open_link(link);
+        }
+        if confirm.is_some() {
+            self.pending_fix = confirm;
+        }
+    }
+
+    /// Confirmation for an administrator fix: shows the exact command first.
+    fn fix_confirmation(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        if let Some(note) = &self.fix_note {
+            notice(ui, AMBER, note);
+            ui.add_space(10.0);
+        }
+        if self.fix_rx.is_some() {
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().color(ACCENT));
+                    muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
+                });
+            });
+            ui.add_space(14.0);
+            return;
+        }
+        let Some(fix) = self.pending_fix else { return };
+        let restarts = fix == posture::OFFLINE_SCAN;
+        let (mut run, mut cancel) = (false, false);
+        card(ui, |ui| {
+            section_title(ui, if restarts { "Run Microsoft Defender Offline scan?" } else { "Change this Windows setting?" });
+            ui.add(egui::Label::new(RichText::new(fix.effect).color(TEXT)).wrap());
+            ui.add_space(4.0);
+            muted(ui, "Phalanx runs exactly this command as administrator. Windows asks for your permission first:");
+            egui::Frame::new().fill(BG).corner_radius(6.0).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+                ui.label(RichText::new(fix.command).monospace().color(TEXT));
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                run = if restarts { ui.add(danger_button("Restart and scan")).clicked() } else { primary_button(ui, "Run as administrator").clicked() };
+                cancel = secondary_button(ui, "Cancel").clicked();
+            });
+        });
+        ui.add_space(14.0);
+        if cancel {
+            self.pending_fix = None;
+        }
+        if run {
+            self.pending_fix = None;
+            self.apply_fix(ctx, fix);
         }
     }
 
@@ -1352,7 +1416,7 @@ impl App {
                     if i > 0 {
                         row_divider(ui);
                     }
-                    if check_row(ui, check, true) {
+                    if check_row(ui, check, true) == Some(CheckAction::OpenSettings) {
                         open = Some(check.link);
                     }
                 }

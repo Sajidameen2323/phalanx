@@ -18,9 +18,11 @@ pub mod dns;
 pub mod dnsfilter;
 pub mod events;
 pub mod extensions;
+pub mod hardening;
 pub mod native;
 pub mod rules;
 pub mod url;
+pub mod windows_dns;
 
 pub use config::{Mode, WebConfig};
 pub use rules::{Verdict, VerdictCode, WebRules};

@@ -33,23 +33,95 @@ pub struct Check {
     /// Relative importance in the score.
     pub weight: u32,
     pub link: Link,
+    /// A one-step fix Phalanx can apply (as administrator, after the user
+    /// confirms), when the setting is not already as it should be.
+    pub fix: Option<Fix>,
 }
+
+/// A fixed administrator command that switches one protection on. Shown to
+/// the user word for word before it runs; never built from input.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Fix {
+    /// Button text, e.g. "Turn on".
+    pub label: &'static str,
+    /// The PowerShell command, as shown and as run.
+    pub command: &'static str,
+    /// What changes, in one sentence.
+    pub effect: &'static str,
+}
+
+impl Fix {
+    /// Runs the command as administrator after Windows' consent prompt.
+    pub fn apply(&self) -> anyhow::Result<crate::system::Elevated> {
+        crate::system::run_elevated_powershell(&format!(
+            "$ErrorActionPreference = 'Stop'; try {{ {}; exit 0 }} catch {{ exit 1 }}",
+            self.command
+        ))
+    }
+}
+
+pub const FIX_NETWORK_PROTECTION: Fix = Fix {
+    label: "Turn on",
+    command: "Set-MpPreference -EnableNetworkProtection Enabled",
+    effect: "Microsoft Defender blocks connections to malicious and scam sites for every program.",
+};
+pub const FIX_PUA: Fix = Fix {
+    label: "Turn on",
+    command: "Set-MpPreference -PUAProtection Enabled",
+    effect: "Microsoft Defender blocks potentially unwanted apps instead of letting them install.",
+};
+pub const FIX_CLOUD: Fix = Fix {
+    label: "Turn on",
+    command: "Set-MpPreference -MAPSReporting Advanced",
+    effect: "Microsoft Defender checks unknown files with Microsoft's cloud, catching brand-new threats.",
+};
+
+/// Scans from outside Windows after a restart: reaches malware that hides
+/// from scans while Windows runs. Not a check, so it has no status.
+pub const OFFLINE_SCAN: Fix = Fix {
+    label: "Run offline scan",
+    command: "Start-MpWDOScan",
+    effect: "Windows restarts within about a minute and Microsoft Defender scans the PC before Windows starts (about 15 minutes). Save your work first.",
+};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Link {
     pub label: &'static str,
-    /// A `windowsdefender:` or `ms-settings:` URI, or a program in System32.
+    /// A `windowsdefender:` or `ms-settings:` URI, a program in System32,
+    /// `start:<browser> <settings page>`, or empty for a page inside Phalanx.
     pub target: &'static str,
 }
 
 impl Link {
     /// Opens the Windows page. Targets are fixed constants, never user input.
     pub fn open(&self) -> std::io::Result<()> {
+        // `start:<program> <page>`: a browser's own settings page, which only
+        // that browser can open (found through Windows' App Paths).
+        if let Some(rest) = self.target.strip_prefix("start:") {
+            let (program, page) = rest.split_once(' ').unwrap_or((rest, ""));
+            return std::process::Command::new("cmd").args(["/c", "start", "", program, &browser_page_address(page)]).spawn().map(drop);
+        }
         if self.target.ends_with(".exe") {
             std::process::Command::new(self.target).spawn().map(drop)
         } else {
             std::process::Command::new("explorer.exe").arg(self.target).spawn().map(drop)
         }
+    }
+}
+
+/// Host Browser Guard watches for to open a browser page Phalanx linked to.
+/// It never resolves (`.invalid`); the extension acts before any request.
+pub const BROWSER_PAGE_HOST: &str = "open.phalanx.invalid";
+
+/// The address to hand a browser for `page`. Chromium browsers drop
+/// `chrome://`, `brave://` and `edge://` pages given on the command line (only
+/// a new tab opens), so those go through Browser Guard, which opens them:
+/// `brave://settings/security` → `http://open.phalanx.invalid/brave/settings/security`
+/// (no `%` or `&`, which `cmd /c start` would mangle).
+pub fn browser_page_address(page: &str) -> String {
+    match page.split_once("://") {
+        Some((scheme @ ("chrome" | "brave" | "edge"), path)) => format!("http://{BROWSER_PAGE_HOST}/{scheme}/{path}"),
+        _ => page.to_string(),
     }
 }
 
@@ -181,6 +253,7 @@ pub struct MpStatus {
 pub struct MpPreference {
     #[serde(rename = "PUAProtection")]
     pub pua_protection: Option<i64>,
+    pub enable_network_protection: Option<i64>,
     pub enable_controlled_folder_access: Option<i64>,
     #[serde(rename = "MAPSReporting")]
     pub maps_reporting: Option<i64>,
@@ -215,36 +288,20 @@ pub struct FirewallProfile {
     pub enabled: String,
 }
 
-/// Single quotes only, one statement per line: passed as one `-Command` argument.
+/// Read-only; passed to PowerShell as `-EncodedCommand`.
 const DEFENDER_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'; $r = @{}
 try { $s = Get-MpComputerStatus; $r.mp = @{ AntivirusEnabled = $s.AntivirusEnabled; RealTimeProtectionEnabled = $s.RealTimeProtectionEnabled; IsTamperProtected = $s.IsTamperProtected; AMRunningMode = [string]$s.AMRunningMode; AntivirusSignatureAge = [int64]$s.AntivirusSignatureAge } } catch { $r.mpError = $_.Exception.Message }
-try { $p = Get-MpPreference; $r.pref = @{ PUAProtection = [int64]$p.PUAProtection; EnableControlledFolderAccess = [int64]$p.EnableControlledFolderAccess; MAPSReporting = [int64]$p.MAPSReporting } } catch { $r.prefError = $_.Exception.Message }
+try { $p = Get-MpPreference; $r.pref = @{ PUAProtection = [int64]$p.PUAProtection; EnableControlledFolderAccess = [int64]$p.EnableControlledFolderAccess; MAPSReporting = [int64]$p.MAPSReporting; EnableNetworkProtection = [int64]$p.EnableNetworkProtection } } catch { $r.prefError = $_.Exception.Message }
 try { $r.av = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct | ForEach-Object { @{ name = [string]$_.displayName; state = [int64]$_.productState } }) } catch { $r.avError = $_.Exception.Message }
 try { $r.fw = @(Get-NetFirewallProfile | ForEach-Object { @{ name = [string]$_.Name; enabled = [string]$_.Enabled } }) } catch { $r.fwError = $_.Exception.Message }
 $r | ConvertTo-Json -Depth 4 -Compress"#;
 
 /// Runs the read-only PowerShell query (about 1 to 3 seconds).
 pub fn read_defender_state() -> Result<DefenderState, String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let output = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
-            .arg(DEFENDER_SCRIPT.replace('\n', "; "))
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("could not run PowerShell: {e}"))?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let json = text.trim().trim_start_matches('\u{feff}');
-        if json.is_empty() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("PowerShell returned nothing: {}", err.trim()));
-        }
-        parse_defender_state(json)
+    if !cfg!(windows) {
+        return Err("only available on Windows".into());
     }
-    #[cfg(not(windows))]
-    Err("only available on Windows".into())
+    crate::system::powershell_json(DEFENDER_SCRIPT, std::time::Duration::from_secs(60))
 }
 
 pub fn parse_defender_state(json: &str) -> Result<DefenderState, String> {
@@ -382,6 +439,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 5,
         link: VIRUS_SETTINGS,
+        fix: None,
     });
 
     let (status, detail) = if replaced {
@@ -401,6 +459,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 3,
         link: VIRUS_SETTINGS,
+        fix: None,
     });
 
     let (status, detail) = if replaced {
@@ -420,6 +479,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 2,
         link: VIRUS_SETTINGS,
+        fix: (status == Status::Risk).then_some(FIX_CLOUD),
     });
 
     let (status, detail) = if replaced {
@@ -440,6 +500,28 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 2,
         link: APP_BROWSER,
+        fix: matches!(status, Status::Risk | Status::Attention).then_some(FIX_PUA),
+    });
+
+    let (status, detail) = if replaced {
+        (Status::Info, "Not applicable: another antivirus is active".to_string())
+    } else {
+        match pref.and_then(|p| p.enable_network_protection) {
+            Some(1) => (Status::Good, "Blocking".to_string()),
+            Some(2) => (Status::Attention, "Audit only: dangerous connections are logged but not blocked".to_string()),
+            Some(_) => (Status::Risk, "Off".to_string()),
+            None => unknown(pref_reason()),
+        }
+    };
+    checks.push(Check {
+        id: "network_protection",
+        title: "Network protection",
+        why: "Microsoft Defender blocks connections to malicious and scam sites for every program, inside Windows' network stack, before a page can load. Phalanx's browser and DNS blocking add to it.",
+        status,
+        detail,
+        weight: 4,
+        link: VIRUS_SETTINGS,
+        fix: matches!(status, Status::Risk | Status::Attention).then_some(FIX_NETWORK_PROTECTION),
     });
 
     let (status, detail) = match (&reg.smartscreen_policy, &reg.smartscreen) {
@@ -462,6 +544,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 3,
         link: APP_BROWSER,
+        fix: None,
     });
 
     let (status, detail) = match &reg.smart_app_control {
@@ -480,6 +563,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 0,
         link: APP_BROWSER,
+        fix: None,
     });
 
     let (status, detail) = match &reg.memory_integrity {
@@ -495,6 +579,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 2,
         link: DEVICE_SECURITY,
+        fix: None,
     });
 
     let profiles = state.and_then(|s| s.fw.as_ref());
@@ -528,6 +613,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 4,
         link: FIREWALL,
+        fix: None,
     });
 
     let (status, detail) = if replaced {
@@ -548,6 +634,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 0,
         link: RANSOMWARE,
+        fix: None,
     });
 
     let (status, detail) = match (&reg.uac_enabled, &reg.uac_admin_prompt) {
@@ -565,6 +652,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 3,
         link: UAC,
+        fix: None,
     });
 
     let (status, detail) = match &reg.hide_file_ext {
@@ -580,6 +668,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 2,
         link: FILE_EXTENSIONS,
+        fix: None,
     });
 
     checks
@@ -723,7 +812,7 @@ fn access_status(r: &Reg<String>, sensitive: bool) -> (Status, String) {
 pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut add = |id, title, why, (status, detail): (Status, String), weight, link| {
-        checks.push(Check { id, title, why, status, detail, weight, link });
+        checks.push(Check { id, title, why, status, detail, weight, link, fix: None });
     };
 
     let ad = if reg.advertising_policy.value() == Some(1) {
@@ -914,6 +1003,30 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn browser_pages_go_through_browser_guard() {
+        assert_eq!(browser_page_address("brave://settings/security"), "http://open.phalanx.invalid/brave/settings/security");
+        assert_eq!(browser_page_address("edge://wallet/passwords"), "http://open.phalanx.invalid/edge/wallet/passwords");
+        assert_eq!(browser_page_address("https://example.org/"), "https://example.org/");
+        // Every browser page Phalanx links to is one Browser Guard will open.
+        let pages = include_str!("../browser-extension/background.js");
+        for target in crate::web::hardening::browser_links() {
+            let (_, page) = target.strip_prefix("start:").and_then(|t| t.split_once(' ')).expect("start:<browser> <page>");
+            let path = page.split_once("://").unwrap().1;
+            assert!(pages.contains(&format!("\"{path}\"")), "{page} is not in Browser Guard's list of pages it opens");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scripts_are_valid_powershell() {
+        assert!(!crate::system::powershell_syntax_errors("if ($x { 1").is_empty(), "the checker reports errors");
+        assert_eq!(crate::system::powershell_syntax_errors(DEFENDER_SCRIPT), Vec::<String>::new());
+        for fix in [FIX_NETWORK_PROTECTION, FIX_PUA, FIX_CLOUD, OFFLINE_SCAN] {
+            assert_eq!(crate::system::powershell_syntax_errors(fix.command), Vec::<String>::new(), "{}", fix.command);
+        }
+    }
+
     fn registry_all_missing() -> SecurityRegistry {
         SecurityRegistry {
             smartscreen: Reg::Missing,
@@ -943,7 +1056,7 @@ mod tests {
     #[test]
     fn defender_output_is_parsed_and_scored() {
         let json = r#"{"mp":{"AntivirusEnabled":true,"RealTimeProtectionEnabled":true,"IsTamperProtected":false,"AMRunningMode":"Normal","AntivirusSignatureAge":0},
-            "pref":{"PUAProtection":2,"EnableControlledFolderAccess":0,"MAPSReporting":2},
+            "pref":{"PUAProtection":2,"EnableControlledFolderAccess":0,"MAPSReporting":2,"EnableNetworkProtection":0},
             "av":[{"name":"Windows Defender","state":397568}],
             "fw":[{"name":"Domain","enabled":"True"},{"name":"Private","enabled":"True"},{"name":"Public","enabled":"False"}]}"#;
         let state = parse_defender_state(json);
@@ -951,6 +1064,10 @@ mod tests {
         assert_eq!(find(&checks, "realtime").status, Status::Good);
         assert_eq!(find(&checks, "tamper").status, Status::Risk);
         assert_eq!(find(&checks, "pua").status, Status::Attention);
+        assert_eq!(find(&checks, "pua").fix, Some(FIX_PUA));
+        assert_eq!(find(&checks, "network_protection").status, Status::Risk);
+        assert_eq!(find(&checks, "network_protection").fix, Some(FIX_NETWORK_PROTECTION));
+        assert_eq!(find(&checks, "cloud").fix, None, "already on: nothing to fix");
         assert_eq!(find(&checks, "firewall").status, Status::Risk);
         assert!(find(&checks, "firewall").detail.contains("Public"));
         assert_eq!(find(&checks, "smartscreen").status, Status::Good, "missing means the Windows default");
@@ -1010,6 +1127,7 @@ mod tests {
             detail: String::new(),
             weight,
             link: PRIVACY_GENERAL,
+            fix: None,
         };
         let s = score(&[c(Status::Good, 3), c(Status::Risk, 1), c(Status::Info, 5)]).unwrap();
         assert_eq!(s.percent, 75);

@@ -47,6 +47,19 @@ pub(super) struct WebState {
     upstream_input: String,
     scan_rx: Option<Receiver<BrowserScan>>,
     scan: Option<BrowserScan>,
+    hardening: Option<threat_scanner::web::hardening::HardeningReport>,
+    hardening_rx: Option<Receiver<threat_scanner::web::hardening::HardeningReport>>,
+    /// Pointing Windows' DNS at the filter: keep a fallback server, the
+    /// change waiting for confirmation, and the one running.
+    dns_fallback: bool,
+    dns_confirm: Option<DnsChange>,
+    dns_rx: Option<Receiver<(DnsChange, Result<threat_scanner::system::Elevated, String>)>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum DnsChange {
+    Apply,
+    Restore,
 }
 
 /// The settings that decide which rules are loaded.
@@ -89,6 +102,11 @@ impl WebState {
             site_input: String::new(),
             scan_rx: None,
             scan: None,
+            hardening: None,
+            hardening_rx: None,
+            dns_fallback: true,
+            dns_confirm: None,
+            dns_rx: None,
         };
         state.reload_rules(data_dir);
         // After an upgrade, the browsers load the new extension files from
@@ -179,6 +197,15 @@ impl App {
     pub(super) fn poll_web(&mut self, ctx: &egui::Context) {
         let path = WebConfig::path(&self.data_dir);
         if self.web.config != self.web.saved {
+            // The browser connector or the command line may have saved since
+            // this page last read the file: merge, so neither side's edit is lost.
+            if modified(&path) != self.web.config_stamp {
+                if let Ok(theirs) = WebConfig::load(&self.data_dir) {
+                    if let Ok(merged) = self.web.config.merged(&self.web.saved, &theirs) {
+                        self.web.config = merged;
+                    }
+                }
+            }
             match self.web.config.save(&self.data_dir) {
                 Ok(()) => {
                     let lists_changed = rule_inputs(&self.web.config) != rule_inputs(&self.web.saved);
@@ -237,7 +264,7 @@ impl App {
     }
 
     pub(super) fn web_busy(&self) -> bool {
-        self.web.scan_rx.is_some()
+        self.web.scan_rx.is_some() || self.web.dns_rx.is_some() || self.web.hardening_rx.is_some()
     }
 
     fn start_browser_scan(&mut self, ctx: &egui::Context) {
@@ -288,6 +315,8 @@ impl App {
         self.web_status_card(ui);
         ui.add_space(14.0);
         self.web_browser_card(ui);
+        ui.add_space(14.0);
+        self.web_hardening_card(ui, ctx);
         ui.add_space(14.0);
         self.web_check_card(ui);
         ui.add_space(14.0);
@@ -591,7 +620,111 @@ impl App {
         }
     }
 
+    /// Browser hardening: updates and the settings that matter against
+    /// exploits and stealers, per browser profile (read-only).
+    fn web_hardening_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        if self.web.hardening.is_none() && self.web.hardening_rx.is_none() {
+            self.start_hardening_check(ctx);
+        }
+        let mut recheck = false;
+        let mut open = None;
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                section_title(ui, "Browser hardening");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.web.hardening_rx.is_some() {
+                        ui.add(egui::Spinner::new().color(ACCENT));
+                    } else {
+                        recheck = small_button(ui, "Check again").clicked();
+                    }
+                });
+            });
+            muted(ui, "Updates and the settings that matter most against exploits from a just-opened page and against stealers copying saved data. Read-only: each item links to the browser's own setting.");
+            let Some(report) = &self.web.hardening else { return };
+            for v in &report.versions {
+                row_divider(ui);
+                ui.label(RichText::new(&v.browser).strong().color(TEXT));
+                if check_row(ui, &v.check, false) == Some(CheckAction::OpenSettings) {
+                    open = Some(v.check.link);
+                }
+            }
+            for p in &report.profiles {
+                row_divider(ui);
+                ui.label(RichText::new(format!("{} · {}", p.browser, p.profile)).strong().color(TEXT));
+                for c in p.checks.iter().filter(|c| c.status != threat_scanner::posture::Status::Info || c.id == "secure_dns") {
+                    if check_row(ui, c, false) == Some(CheckAction::OpenSettings) {
+                        open = Some(c.link);
+                    }
+                }
+            }
+            if report.versions.is_empty() && report.profiles.is_empty() {
+                small(ui, "No Chromium browser (Chrome, Edge, Brave, Vivaldi) found for this user.");
+            }
+        });
+        if recheck {
+            self.start_hardening_check(ctx);
+        }
+        match open {
+            Some(link) if link.target.is_empty() => {} // already on this page (Browser Guard card above)
+            Some(link) => self.open_link(link),
+            None => {}
+        }
+    }
+
+    fn start_hardening_check(&mut self, ctx: &egui::Context) {
+        if self.web.hardening_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(threat_scanner::web::hardening::check(true));
+            ctx.request_repaint();
+        });
+        self.web.hardening_rx = Some(rx);
+    }
+
+    pub(super) fn poll_hardening(&mut self) {
+        let Some(rx) = &self.web.hardening_rx else { return };
+        if let Ok(report) = rx.try_recv() {
+            self.web.hardening_rx = None;
+            self.web.hardening = Some(report);
+        }
+    }
+
+    fn start_dns_change(&mut self, change: DnsChange) {
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let listen = self.web.config.dns_listen_addr();
+        let fallback = self.web.dns_fallback;
+        std::thread::spawn(move || {
+            let result = match change {
+                DnsChange::Apply => listen.and_then(|l| threat_scanner::web::windows_dns::apply(&data_dir, &l, fallback)),
+                DnsChange::Restore => threat_scanner::web::windows_dns::restore(&data_dir),
+            };
+            let _ = tx.send((change, result.map_err(|e| format!("{e:#}"))));
+        });
+        self.web.dns_rx = Some(rx);
+    }
+
+    pub(super) fn poll_dns_change(&mut self) {
+        let Some(rx) = &self.web.dns_rx else { return };
+        let Ok((change, result)) = rx.try_recv() else { return };
+        self.web.dns_rx = None;
+        self.web.windows_dns = self.web.config.dns_listen_addr().is_ok_and(|a| web_config::windows_uses_filter(&a));
+        use threat_scanner::system::Elevated;
+        match (change, result) {
+            (DnsChange::Apply, Ok(Elevated::Exited(0))) if self.web.windows_dns => self.notify("Windows now sends DNS lookups to the Phalanx filter", true),
+            (DnsChange::Apply, Ok(Elevated::Exited(0))) => self.notify("The command ran, but Windows does not report the filter as its DNS server yet", false),
+            (DnsChange::Restore, Ok(Elevated::Exited(0))) => self.notify("Previous DNS settings restored", true),
+            (_, Ok(Elevated::Exited(code))) => self.notify(format!("The DNS change failed (exit code {code}); check your network settings"), false),
+            (_, Ok(Elevated::Declined)) => self.notify("Cancelled at the Windows prompt; nothing was changed", false),
+            (_, Err(e)) => self.notify(e, false),
+        }
+    }
+
     fn web_dns_card(&mut self, ui: &mut Ui) {
+        let mut start_dns_change = None;
         let running = self.web.filter.is_some();
         let upstreams: Vec<String> = self.web.config.upstreams().iter().map(ToString::to_string).collect();
         let mut apply_upstream = false;
@@ -629,7 +762,81 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.web.upstream_input).hint_text(upstreams.join(", ")).desired_width(200.0));
             });
             small(ui, "Browsers' own \"secure DNS\" (DNS over HTTPS) bypasses this filter; Browser Guard still protects them. https:// sites blocked here fail to load instead of showing the warning page.");
+
+            // One-step Windows DNS setup (administrator), with a restore.
+            ui.add_space(6.0);
+            row_divider(ui);
+            let listen = self.web.config.dns_listen_addr().ok();
+            let usable = listen.as_ref().map(threat_scanner::web::windows_dns::usable_listen);
+            let backup = threat_scanner::web::windows_dns::has_backup(&self.data_dir);
+            let busy = self.web.dns_rx.is_some();
+            setting_row(
+                ui,
+                "Use the filter for Windows DNS",
+                "Points every connected network adapter's DNS (IPv4 and IPv6) at the filter, after saving the current settings so they can be restored. Needs administrator.",
+                |ui| {
+                    ui.add_enabled_ui(!busy && running && matches!(usable, Some(Ok(()))), |ui| {
+                        if small_button(ui, if self.web.windows_dns { "Apply again…" } else { "Set up…" }).clicked() {
+                            self.web.dns_confirm = Some(DnsChange::Apply);
+                        }
+                    });
+                    if backup {
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if small_button(ui, "Restore previous DNS…").clicked() {
+                                self.web.dns_confirm = Some(DnsChange::Restore);
+                            }
+                        });
+                    }
+                },
+            );
+            if let Some(Err(e)) = &usable {
+                small(ui, format!("{e:#}"));
+            } else if !running {
+                small(ui, "Turn the filter on first.");
+            }
+            setting_toggle(
+                ui,
+                &mut self.web.dns_fallback,
+                "Keep a fallback DNS server",
+                "Recommended. Your previous DNS server stays second in line, so the internet keeps working when Phalanx is closed. Without it, nothing resolves unless Phalanx runs, but no lookup can slip past the filter.",
+            );
+            match self.web.dns_confirm {
+                Some(change) if !busy => {
+                    let (title, text) = match change {
+                        DnsChange::Apply => (
+                            "Point Windows' DNS at the Phalanx filter?",
+                            if self.web.dns_fallback {
+                                "Every connected adapter will use 127.0.0.1 and ::1 (Phalanx), with its current first server as a fallback. The current settings are saved first. Windows asks for administrator permission."
+                            } else {
+                                "Every connected adapter will use only 127.0.0.1 and ::1 (Phalanx). If Phalanx is not running, websites will not load until you restore. The current settings are saved first. Windows asks for administrator permission."
+                            },
+                        ),
+                        DnsChange::Restore => ("Restore the DNS settings saved before?", "Each adapter goes back to exactly what it used before (automatic from the router, or the servers it had). Windows asks for administrator permission."),
+                    };
+                    ui.add_space(6.0);
+                    notice(ui, if change == DnsChange::Apply && !self.web.dns_fallback { RED } else { AMBER }, &format!("{title} {text}"));
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "Run as administrator").clicked() {
+                            self.web.dns_confirm = None;
+                            start_dns_change = Some(change);
+                        }
+                        if secondary_button(ui, "Cancel").clicked() {
+                            self.web.dns_confirm = None;
+                        }
+                    });
+                }
+                _ if busy => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().color(ACCENT));
+                        muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
+                    });
+                }
+                _ => {}
+            }
         });
+        if let Some(change) = start_dns_change {
+            self.start_dns_change(change);
+        }
         if apply_upstream {
             let entries: Vec<String> = self.web.upstream_input.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
             let bad: Vec<&String> = entries.iter().filter(|s| web_config::parse_resolver(s).is_none()).collect();

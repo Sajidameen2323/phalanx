@@ -67,6 +67,30 @@ enum Command {
         #[arg(long, conflicts_with = "force")]
         check: bool,
     },
+    /// Look for what infostealers and their loaders leave behind: start-up
+    /// entries, tasks, services, browser shortcuts and policies, proxy and
+    /// hosts-file changes (read-only).
+    Audit {
+        /// Also read Microsoft Defender's exclusions (asks for administrator).
+        #[arg(long)]
+        exclusions: bool,
+        /// List entries with nothing wrong too.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        signatures: SignatureArgs,
+    },
+    /// Check each browser profile's hardening: updates, Safe Browsing, the
+    /// JavaScript optimizer, secure DNS, Browser Guard, saved passwords (read-only).
+    Browsers {
+        /// Do not ask the public version feeds for the newest versions.
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Check Windows security and privacy settings (read-only).
     Status {
         #[arg(long)]
@@ -478,6 +502,72 @@ fn run() -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Command::Audit { exclusions, all, json, signatures } => {
+            let engine = engine(signatures, &dir)?;
+            let work = dir.join("audit");
+            let ex = if *exclusions {
+                match threat_scanner::audit::read_defender_exclusions(&work)? {
+                    Some(ex) => Some(ex),
+                    None => {
+                        eprintln!("Administrator prompt declined: Defender exclusions were not checked.");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let report = threat_scanner::audit::run(Some(&engine), ex.as_ref(), &work);
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                use threat_scanner::audit::Severity;
+                for it in report.items.iter().filter(|i| *all || i.severity > Severity::Info) {
+                    println!("[{}] {}: {}", it.severity.label(), it.kind.label(), it.title);
+                    println!("    where:   {}", it.location);
+                    if !it.command.is_empty() {
+                        println!("    runs:    {}", it.command);
+                    }
+                    match &it.signature {
+                        threat_scanner::audit::Signature::Signed { signer } => println!("    signed:  {signer}"),
+                        threat_scanner::audit::Signature::Unsigned => println!("    signed:  no"),
+                        threat_scanner::audit::Signature::Invalid { status } => println!("    signed:  INVALID ({status})"),
+                        threat_scanner::audit::Signature::Unknown => {}
+                    }
+                    for r in &it.reasons {
+                        println!("    why:     {r}");
+                    }
+                }
+                for e in &report.errors {
+                    eprintln!("warning: {e}");
+                }
+                println!(
+                    "\n{} high, {} to review, {} low, {} fine ({} items, {:.1}s){}",
+                    report.count(Severity::High),
+                    report.count(Severity::Medium),
+                    report.count(Severity::Low),
+                    report.count(Severity::Info),
+                    report.items.len(),
+                    report.elapsed_ms as f64 / 1000.0,
+                    if *exclusions { "" } else { ". Add --exclusions to also check Defender's exclusions (needs administrator)." }
+                );
+            }
+            Ok(if report.count(threat_scanner::audit::Severity::High) > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+        }
+        Command::Browsers { offline, json } => {
+            let report = web::hardening::check(!offline);
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for v in &report.versions {
+                    print_checks(&format!("{} {}", v.browser, v.installed.as_deref().unwrap_or("")), std::slice::from_ref(&v.check), false);
+                }
+                for p in &report.profiles {
+                    println!();
+                    print_checks(&format!("{} / {}", p.browser, p.profile), &p.checks, false);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Status { json } => {
             let defender = posture::read_defender_state();
             let security = posture::security_checks(&defender);
@@ -669,6 +759,9 @@ fn print_checks(title: &str, checks: &[Check], privacy: bool) {
             (Status::Unknown, _) => "unknown",
         };
         println!("  {state}  {}: {}", c.title, c.detail);
+        if let Some(fix) = &c.fix {
+            println!("           fix (as administrator): {}", fix.command);
+        }
     }
 }
 
@@ -1031,6 +1124,9 @@ fn web_serve(
         upstreams.join(", "),
         page.local_addr()
     );
+    if let Some(v6) = filter.local_addr_v6() {
+        println!("Also serving IPv6 lookups on {v6}.");
+    }
     if !web::config::windows_uses_filter(&filter.local_addr()) {
         println!("Windows does not use it yet: set your network adapter's DNS server to {}.", filter.local_addr().ip());
     }

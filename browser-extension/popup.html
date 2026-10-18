@@ -7,24 +7,17 @@
 </head>
 <body class="popup">
   <header>
-    <img src="icon.png" alt="">
+    <img src="icon48.png" alt="">
     <div class="brand"><strong>Phalanx</strong><span>Browser Guard</span></div>
     <span id="pill" class="pill warn">Checking…</span>
+    <button id="settings" class="icon-button" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7zm7.4-2.5a7.6 7.6 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.5 7.5 0 0 0-1.7-1L14.9 3.5h-4L10.6 6a7.5 7.5 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.5 7.5 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7.5 7.5 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6z" fill="currentColor"/></svg>
+    </button>
   </header>
   <main>
-    <section class="card hero">
-      <svg id="shield" class="shield" viewBox="0 0 48 48" aria-hidden="true">
-        <path id="shield-body" d="M24 3 6 10v12c0 11.5 7.7 20.6 18 23 10.3-2.4 18-11.5 18-23V10L24 3z" fill="var(--muted)"/>
-        <path id="shield-mark" d="M15.5 24.5l6 6 11-12" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      <div>
-        <h1 id="headline">Connecting to Phalanx…</h1>
-        <p id="subline"></p>
-      </div>
-    </section>
-
-    <section id="problem" class="card hidden">
-      <p class="label">How to fix</p>
+    <section id="problem" class="card notice bad hidden">
+      <strong id="problem-title">Not connected to Phalanx</strong>
+      <p id="problem-text">Known dangerous sites are still blocked, but new rules and site checks are paused.</p>
       <ol class="steps">
         <li>Open the Phalanx app.</li>
         <li>Go to Web protection and choose <b>Connect browsers</b>.</li>
@@ -34,32 +27,31 @@
     </section>
 
     <section id="site" class="card hidden">
-      <p class="label">This site</p>
-      <div id="site-host" class="site-host"></div>
-      <div id="site-verdict" class="verdict"></div>
-    </section>
-
-    <section id="stats" class="stats hidden">
-      <div class="stat"><b id="today">0</b><span>blocked today</span></div>
-      <div class="stat"><b id="total">0</b><span>blocked in total</span></div>
-      <div class="stat"><b id="rules">0</b><span>threat rules</span></div>
-    </section>
-
-    <section id="ads" class="card setting hidden">
-      <div>
-        <strong>Block ads and trackers</strong>
-        <span id="ads-note">Stops ad and tracking requests inside pages, using the ad list Phalanx downloads.</span>
-        <span id="ads-count" class="ads-count"></span>
+      <div class="site-head">
+        <span id="site-icon" class="site-icon"></span>
+        <div class="site-text">
+          <div id="site-host" class="site-host"></div>
+          <div id="site-verdict" class="site-verdict"></div>
+        </div>
       </div>
-      <label class="switch"><input id="ads-toggle" type="checkbox" aria-label="Block ads and trackers"><i></i></label>
+      <div id="page-stats" class="page-stats hidden">
+        <div class="pstat"><b id="p-ads">0</b><span>ads &amp; trackers</span></div>
+        <div class="pstat"><b id="p-popups">0</b><span>pop-ups closed</span></div>
+        <div class="pstat"><b id="p-threats">0</b><span>dangerous requests</span></div>
+      </div>
+      <p id="page-note" class="muted small hidden"></p>
+      <div id="site-actions" class="site-actions hidden">
+        <button id="block" class="danger-outline">Block this site</button>
+        <button id="allow">Allow this site</button>
+        <button id="unblock" class="hidden">Unblock this site</button>
+        <button id="unallow" class="hidden">Stop allowing</button>
+      </div>
+      <p id="action-note" class="muted small hidden"></p>
     </section>
 
-    <section class="card setting">
-      <div>
-        <strong>Mark search results</strong>
-        <span>Green check: no known threats. Red: dangerous site. Works on Google, Bing, DuckDuckGo, Yahoo and Brave Search.</span>
-      </div>
-      <label class="switch"><input id="mark" type="checkbox" checked aria-label="Mark search results"><i></i></label>
+    <section id="today" class="today hidden">
+      <div><b id="t-threats">0</b><span>dangerous sites blocked today</span></div>
+      <div><b id="t-ads">0</b><span>ads &amp; trackers blocked today</span></div>
     </section>
   </main>
   <footer>
