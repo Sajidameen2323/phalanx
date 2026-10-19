@@ -894,12 +894,7 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
             );
             println!("Browsers:");
             for b in &browsers {
-                let state = match (&b.manifest, b.current) {
-                    (_, true) => "connected".to_string(),
-                    (Some(m), false) => format!("registered elsewhere ({m})"),
-                    (None, _) => "not connected".to_string(),
-                };
-                println!("    {:<22} {state}", b.browser);
+                println!("    {:<22} {}", b.browser, b.describe());
             }
             println!(
                 "DNS filter:     {} on {}; Windows DNS {} it",

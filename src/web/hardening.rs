@@ -129,9 +129,12 @@ pub fn latest_versions(timeout: Duration) -> Vec<(&'static str, String)> {
         serde_json::from_str(&text).ok()
     };
     let mut out = Vec::new();
-    if let Some(v) = get("https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions?pageSize=1") {
-        if let Some(version) = v.pointer("/versions/0/version").and_then(Value::as_str) {
-            out.push(("Google Chrome", version.to_string()));
+    // Releases currently being served, with the share of users each is
+    // offered to. A new version is listed at 0% before its rollout starts,
+    // so the newest *offered* version is the highest one above 0%.
+    if let Some(v) = get("https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases?filter=endtime=none") {
+        if let Some(version) = newest_offered(&v) {
+            out.push(("Google Chrome", version));
         }
     }
     if let Some(v) = get("https://edgeupdates.microsoft.com/api/products") {
@@ -150,6 +153,18 @@ pub fn latest_versions(timeout: Duration) -> Vec<(&'static str, String)> {
     out
 }
 
+/// The highest version in a VersionHistory `releases` reply that is offered
+/// to some users (rollout fraction above 0).
+fn newest_offered(releases: &Value) -> Option<String> {
+    releases["releases"]
+        .as_array()?
+        .iter()
+        .filter(|r| r["fraction"].as_f64().is_some_and(|f| f > 0.0))
+        .filter_map(|r| r["version"].as_str())
+        .max_by_key(|v| parse_version(v))
+        .map(str::to_string)
+}
+
 /// The version check for one browser.
 pub fn version_check(name: &str, installed: Option<&str>, latest: Option<&str>, restart_pending: bool) -> Check {
     let behind = match (installed.and_then(parse_version), latest.and_then(parse_version)) {
@@ -161,7 +176,7 @@ pub fn version_check(name: &str, installed: Option<&str>, latest: Option<&str>, 
         (false, Some(true)) => (
             Status::Attention,
             format!(
-                "Version {} is installed; the newest stable release is {}. Open About to update (a staged rollout may not offer it to you yet).",
+                "Version {} is installed; version {} is being rolled out. Open About to update (a gradual rollout may not offer it to you yet).",
                 installed.unwrap_or("?"),
                 latest.unwrap_or("?")
             ),
@@ -359,6 +374,22 @@ mod tests {
         assert_eq!(version_check("Google Chrome", Some("146.0.1.1"), Some("146.0.2.0"), false).status, Status::Attention);
         assert_eq!(version_check("Google Chrome", Some("146.0.2.0"), Some("146.0.2.0"), false).status, Status::Good);
         assert_eq!(version_check("Google Chrome", Some("146.0.2.0"), None, false).status, Status::Info);
+    }
+
+    #[test]
+    fn versions_listed_before_their_rollout_are_ignored() {
+        // Shape of Google's VersionHistory reply on 2026-10-19: 156 is listed
+        // but offered to no one yet; 155.0.8059.85 is fully rolled out.
+        let releases = json!({"releases": [
+            {"version": "155.0.8059.80", "fraction": 0.5},
+            {"version": "156.0.8078.35", "fraction": 0},
+            {"version": "155.0.8059.85", "fraction": 1},
+            {"version": "156.0.8078.36", "fraction": 0},
+        ]});
+        let offered = newest_offered(&releases);
+        assert_eq!(offered.as_deref(), Some("155.0.8059.85"));
+        assert_eq!(version_check("Google Chrome", Some("155.0.8059.85"), offered.as_deref(), false).status, Status::Good);
+        assert_eq!(newest_offered(&json!({"releases": []})), None);
     }
 
     #[test]

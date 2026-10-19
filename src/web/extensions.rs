@@ -215,6 +215,15 @@ fn read_json(path: &Path) -> Option<Value> {
 
 /// `extensions.settings`, merged from both preference files (the secure one
 /// wins, as in the browser).
+/// Display names of the profiles that have extension `id` installed.
+pub fn profiles_with_extension(user_data: &Path, id: &str) -> Vec<String> {
+    profiles(user_data)
+        .into_iter()
+        .filter(|(dir, _)| extension_settings(&user_data.join(dir)).is_ok_and(|s| s.contains_key(id)))
+        .map(|(_, name)| name)
+        .collect()
+}
+
 fn extension_settings(profile_dir: &Path) -> Result<Map<String, Value>> {
     let prefs = read_json(&profile_dir.join("Preferences")).with_context(|| format!("reading {}", profile_dir.join("Preferences").display()))?;
     let secure = read_json(&profile_dir.join("Secure Preferences")).unwrap_or(Value::Null);

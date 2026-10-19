@@ -498,6 +498,93 @@ async function endAllowance(tabId) {
   if (dnr) await dnr.updateSessionRules({ removeRuleIds: [ALLOW_BASE + tabId] }).catch(() => {});
 }
 
+// ---------- ad blocking paused on a site ----------
+
+// One "allow all requests" rule per kind of pause covers the paused sites'
+// own pages and frames, so their ads load. It has the ad rules' priority
+// (an allow wins a tie), but the threat rules rank higher, so dangerous
+// requests on a paused site are still blocked.
+const PAUSE_ALWAYS_ID = 3_000_000; // dynamic: paused until resumed
+const PAUSE_TEMP_ID = 3_000_001; // session: for a while, or until the browser closes
+// Temporary pauses live in session storage, which the browser clears when it
+// closes, like the session rule. { site: until (ms), 0 = until it closes }
+let tempPauses = null;
+
+function pauseKey(host) {
+  return (host || "").toLowerCase().replace(/^www\./, "");
+}
+
+function pauseRule(id, sites) {
+  return { id, priority: 1, action: { type: "allowAllRequests" }, condition: { requestDomains: sites, resourceTypes: ["main_frame", "sub_frame"] } };
+}
+
+async function applyPauseRules(always, temp) {
+  if (!dnr) return;
+  const sites = Object.keys(temp);
+  await dnr.updateDynamicRules({ removeRuleIds: [PAUSE_ALWAYS_ID], addRules: always.length ? [pauseRule(PAUSE_ALWAYS_ID, always)] : [] });
+  await dnr.updateSessionRules({ removeRuleIds: [PAUSE_TEMP_ID], addRules: sites.length ? [pauseRule(PAUSE_TEMP_ID, sites)] : [] });
+}
+
+// The current pauses; expired ones are dropped (and their rule updated).
+async function adPauses() {
+  const { adPausedSites: always } = await api.storage.local.get({ adPausedSites: [] });
+  const stored = api.storage.session ? (await api.storage.session.get({ adPausedTemp: {} })).adPausedTemp : {};
+  const now = Date.now();
+  const temp = Object.fromEntries(Object.entries(stored).filter(([, until]) => !until || until > now));
+  if (Object.keys(temp).length !== Object.keys(stored).length) {
+    await api.storage.session.set({ adPausedTemp: temp });
+    await applyPauseRules(always, temp).catch(() => {});
+  }
+  tempPauses = temp;
+  return { always, temp };
+}
+
+// How ad blocking is paused for `host`: { kind: "always" | "until", until }, or null.
+function pauseFor(host, pauses) {
+  const covers = (site) => host === site || host.endsWith("." + site);
+  const always = pauses.always.find(covers);
+  if (always) return { site: always, kind: "always", until: 0 };
+  const temp = Object.keys(pauses.temp).find(covers);
+  return temp ? { site: temp, kind: "until", until: pauses.temp[temp] } : null;
+}
+
+// minutes > 0: pause for that long; 0: until the browser closes; "always":
+// until resumed; null: resume.
+async function setAdPause(host, minutes) {
+  const site = pauseKey(host);
+  if (!site) return { ok: false, error: "not a web page" };
+  const pauses = await adPauses();
+  let always = pauses.always.filter((s) => s !== site);
+  const temp = { ...pauses.temp };
+  delete temp[site];
+  if (minutes === "always") always = [...always, site].sort();
+  else if (typeof minutes === "number") {
+    if (!api.storage.session) return { ok: false, error: "this browser cannot pause for a while; use Always" };
+    temp[site] = minutes > 0 ? Date.now() + minutes * 60_000 : 0;
+  }
+  await applyPauseRules(always, temp);
+  await api.storage.local.set({ adPausedSites: always });
+  if (api.storage.session) await api.storage.session.set({ adPausedTemp: temp });
+  tempPauses = temp;
+  return { ok: true, pause: pauseFor(site, { always, temp }) };
+}
+
+// Ends timed pauses on the next navigation after they expire (the worker
+// may be asleep at the exact moment).
+function expirePauses() {
+  if (tempPauses === null || Object.values(tempPauses).some((until) => until && until <= Date.now())) return adPauses();
+  return Promise.resolve();
+}
+
+// Whether ads are paused on the page a tab shows (or, for a pop-up, on the
+// page that opened it).
+async function adsPausedForTab(tabId) {
+  const source = openerOf.get(tabId) ?? tabId;
+  const tab = await api.tabs.get(source).catch(() => null);
+  const host = tab ? hostOf(tab.url || "") : "";
+  return Boolean(host && pauseFor(host, await adPauses()));
+}
+
 // Counts blocked ad requests. Unpacked extensions get every match as it
 // happens; otherwise recent matches are read at most once a minute.
 async function tallyAds() {
@@ -645,6 +732,7 @@ async function guard(details, committed) {
   if (!committed) await followAppChanges();
   if (!threatsSynced || Date.now() - adsCheckedAt > ADS_SYNC_MS) syncAll();
   tallyAds();
+  await expirePauses().catch(() => {});
   const allowed = allowedOnce.get(details.tabId);
   if (allowed !== undefined) {
     if (sameSite(hostOf(details.url), allowed)) return;
@@ -657,6 +745,8 @@ async function guard(details, committed) {
   }
   try {
     if (v.category === "ads") {
+      // Ad blocking is paused on the page this came from: let it open.
+      if (await adsPausedForTab(details.tabId)) return;
       const outcome = await dismissAd(details.tabId, committed);
       if (outcome !== "wait") countAds(1);
       if (outcome !== "page") return;
@@ -781,6 +871,15 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await syncThreats(true);
           await syncAds(true);
         }
+        sendResponse(reply);
+        break;
+      }
+      case "adPauses":
+        sendResponse(await adPauses());
+        break;
+      case "adPause": {
+        // `minutes`: a number, 0 (until the browser closes), "always", or null to resume.
+        const reply = await setAdPause(msg.site, msg.minutes ?? null).catch((e) => ({ ok: false, error: String(e && e.message ? e.message : e) }));
         sendResponse(reply);
         break;
       }

@@ -100,7 +100,57 @@ async function showPage(status, connected) {
   show("allow", place === "");
   show("unblock", place === "blocked");
   show("unallow", place === "allowed");
+
+  // Pausing ads only makes sense where ads are being blocked.
+  if (status && status.block_ads && place === "" && !(v && v.matched)) await showAdPause();
 }
+
+// "Ad blocking here": on, or paused for a while / until the browser closes / always.
+async function showAdPause() {
+  const pauses = await api.runtime.sendMessage({ type: "adPauses" });
+  if (!pauses) return;
+  const covers = (site) => host === site || host.endsWith("." + site);
+  const always = pauses.always.find(covers);
+  const tempSite = Object.keys(pauses.temp).find(covers);
+  const until = tempSite !== undefined ? pauses.temp[tempSite] : null;
+  const state = $("ad-pause-state");
+  if (always) {
+    state.textContent = "Paused on this site";
+    state.className = "pill warn";
+  } else if (until !== null) {
+    const minutes = Math.max(1, Math.round((until - Date.now()) / 60000));
+    state.textContent = until ? `Paused for ${minutes} more min` : "Paused until the browser closes";
+    state.className = "pill warn";
+  } else {
+    state.textContent = "On";
+    state.className = "pill good";
+  }
+  const paused = Boolean(always) || until !== null;
+  show("ad-pause");
+  show("ad-pause-actions", !paused);
+  show("ad-resume", paused);
+}
+
+async function pauseAds(minutes) {
+  const buttons = document.querySelectorAll("#ad-pause button");
+  for (const b of buttons) b.disabled = true;
+  const reply = await api.runtime.sendMessage({ type: "adPause", site: host, minutes });
+  if (!reply || !reply.ok) {
+    $("action-note").textContent = "Could not change it: " + ((reply && reply.error) || "the extension is not responding");
+    show("action-note");
+    for (const b of buttons) b.disabled = false;
+    return;
+  }
+  $("action-note").textContent = minutes === null ? `Ad blocking is back on for ${host}. Reloading…` : `Ads are allowed on ${host}. Reloading…`;
+  show("action-note");
+  await api.tabs.reload(tab.id);
+  setTimeout(() => window.close(), 900);
+}
+
+for (const b of document.querySelectorAll("#ad-pause-actions button")) {
+  b.addEventListener("click", () => pauseAds(b.dataset.pause === "always" ? "always" : Number(b.dataset.pause)));
+}
+$("ad-resume").addEventListener("click", () => pauseAds(null));
 
 async function decide(type, note) {
   const buttons = document.querySelectorAll(".site-actions button");

@@ -40,6 +40,19 @@
         <div class="pstat"><b id="p-threats">0</b><span>dangerous requests</span></div>
       </div>
       <p id="page-note" class="muted small hidden"></p>
+      <div id="ad-pause" class="ad-pause hidden">
+        <div class="ad-pause-head">
+          <strong>Ad blocking here</strong>
+          <span id="ad-pause-state" class="pill good">On</span>
+        </div>
+        <div id="ad-pause-actions" class="pause-actions">
+          <button data-pause="60">Pause 1 hour</button>
+          <button data-pause="0">Until I close the browser</button>
+          <button data-pause="always">Always on this site</button>
+        </div>
+        <button id="ad-resume" class="primary hidden">Resume ad blocking</button>
+        <p class="muted small">Dangerous sites stay blocked while ads are paused.</p>
+      </div>
       <div id="site-actions" class="site-actions hidden">
         <button id="block" class="danger-outline">Block this site</button>
         <button id="allow">Allow this site</button>

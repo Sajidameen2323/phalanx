@@ -80,6 +80,14 @@ button.link { background: none; border: none; padding: 0; color: var(--accent); 
 .site-actions { display: flex; gap: 8px; margin-top: 12px; }
 .site-actions button { flex: 1; padding: 8px 10px; font-size: 13px; }
 button.danger-outline { color: var(--bad); border-color: var(--bad); background: transparent; }
+.ad-pause { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.ad-pause-head { display: flex; align-items: center; gap: 8px; }
+.ad-pause-head strong { font-size: 13.5px; }
+.pause-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+.pause-actions button { padding: 7px 8px; font-size: 12.5px; }
+.pause-actions button:last-child { grid-column: 1 / -1; }
+#ad-resume { width: 100%; margin-top: 10px; }
+.ad-pause p { margin: 8px 0 0; }
 button:disabled { opacity: .55; cursor: default; }
 #page-note, #action-note { margin: 8px 0 0; }
 .today { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }

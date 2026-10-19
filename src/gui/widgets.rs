@@ -65,16 +65,15 @@ pub fn apply_style(ctx: &egui::Context) {
     });
 }
 
-/// The app icon: the emblem on a dark rounded tile (readable on light and
-/// dark taskbars), 128×128 RGBA, generated from the logo into `assets/`.
+/// The app icon: the emblem on transparency (its dark outline and visor keep
+/// it readable on light and dark taskbars), 128×128 RGBA, rendered from
+/// `assets/phalanx-emblem.svg`. Also the sidebar logo.
 const ICON_RGBA: &[u8] = include_bytes!("../../assets/phalanx-128.rgba");
-/// The emblem alone on transparency, for the (always dark) sidebar.
-const EMBLEM_RGBA: &[u8] = include_bytes!("../../assets/phalanx-emblem-128.rgba");
 const ICON_SIZE: u32 = 128;
-/// The tile as PNG, for the notification icon.
+/// The emblem as PNG, for the notification icon.
 pub const ICON_PNG: &[u8] = include_bytes!("../../assets/phalanx.png");
-/// The tile as a multi-size icon file, for the Start-menu shortcut (and so
-/// the taskbar).
+/// The emblem as a multi-size icon file (small sizes from the heavier
+/// `phalanx-emblem-small.svg`), for the Start-menu shortcut and taskbar.
 pub const ICON_ICO: &[u8] = include_bytes!("../../assets/phalanx.ico");
 
 /// The window and tray icon: (RGBA pixels, width, height).
@@ -84,7 +83,7 @@ pub fn icon_rgba() -> (Vec<u8>, u32, u32) {
 
 /// The emblem as an egui texture, for the sidebar.
 pub fn logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let image = egui::ColorImage::from_rgba_unmultiplied([ICON_SIZE as usize; 2], EMBLEM_RGBA);
+    let image = egui::ColorImage::from_rgba_unmultiplied([ICON_SIZE as usize; 2], ICON_RGBA);
     ctx.load_texture("phalanx-logo", image, egui::TextureOptions::LINEAR)
 }
 

@@ -12,7 +12,7 @@ use threat_scanner::web::config::{self as web_config, Mode};
 use threat_scanner::web::dnsfilter::{DnsFilter, FilterConfig};
 use threat_scanner::web::events::{self as web_events, WebEvent};
 use threat_scanner::web::extensions::{self, BrowserScan, KnownBad};
-use threat_scanner::web::native::{self, BrowserRegistration};
+use threat_scanner::web::native::{self, BrowserRegistration, GuardState};
 use threat_scanner::web::rules::RuleCounts;
 use threat_scanner::web::{SharedRules, Verdict, WebConfig, WebRules};
 use widgets::*;
@@ -54,7 +54,23 @@ pub(super) struct WebState {
     dns_fallback: bool,
     dns_confirm: Option<DnsChange>,
     dns_rx: Option<Receiver<(DnsChange, Result<threat_scanner::system::Elevated, String>)>>,
+    tab: WebTab,
+    /// When the browser rows were last re-read (extensions and contact).
+    browsers_checked: Instant,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum WebTab {
+    Overview,
+    Browsers,
+    Sites,
+    Extensions,
+    Dns,
+    Activity,
+}
+
+/// How often the browser rows are re-read while the page is open.
+const BROWSER_REFRESH: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum DnsChange {
@@ -107,6 +123,8 @@ impl WebState {
             dns_fallback: true,
             dns_confirm: None,
             dns_rx: None,
+            tab: WebTab::Overview,
+            browsers_checked: Instant::now(),
         };
         state.reload_rules(data_dir);
         // After an upgrade, the browsers load the new extension files from
@@ -132,7 +150,16 @@ impl WebState {
     }
 
     pub(super) fn running(&self) -> bool {
-        self.config.enabled && (self.browsers.iter().any(|b| b.current) || self.filter.is_some())
+        self.config.enabled && (self.protected_browsers() > 0 || self.filter.is_some())
+    }
+
+    /// Browsers whose extension is added and linked to this copy.
+    fn protected_browsers(&self) -> usize {
+        self.browsers.iter().filter(|b| matches!(b.state(), GuardState::Protecting | GuardState::Waiting)).count()
+    }
+
+    fn installed_browsers(&self) -> usize {
+        self.browsers.iter().filter(|b| b.state() != GuardState::NotInstalled).count()
     }
 
     fn filter_key(&self) -> String {
@@ -312,25 +339,117 @@ impl App {
             "Web protection",
             "Blocks malware and phishing sites in your browsers and for the whole PC, and finds dangerous browser extensions.",
         );
-        self.web_status_card(ui);
+        // Extensions get added and browsers report in while the page is open.
+        if self.web.browsers_checked.elapsed() >= BROWSER_REFRESH {
+            self.web.browsers = native::status(&self.data_dir);
+            self.web.browsers_checked = Instant::now();
+        }
+        let sites = self.web.config.user_allow.len() + self.web.config.user_block.len() + self.web.config.extension_exclusions.len();
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [
+                (WebTab::Overview, "Overview".to_string()),
+                (WebTab::Browsers, "Browsers".to_string()),
+                (WebTab::Sites, if sites == 0 { "Your sites".to_string() } else { format!("Your sites ({sites})") }),
+                (WebTab::Extensions, "Extensions".to_string()),
+                (WebTab::Dns, "DNS filter".to_string()),
+                (WebTab::Activity, "Activity".to_string()),
+            ] {
+                if chip(ui, &label, self.web.tab == tab) {
+                    self.web.tab = tab;
+                }
+            }
+        });
         ui.add_space(14.0);
-        self.web_browser_card(ui);
-        ui.add_space(14.0);
-        self.web_hardening_card(ui, ctx);
-        ui.add_space(14.0);
-        self.web_check_card(ui);
-        ui.add_space(14.0);
-        self.web_lists_card(ui);
-        ui.add_space(14.0);
-        self.web_extensions_card(ui, ctx);
-        ui.add_space(14.0);
-        self.web_dns_card(ui);
-        ui.add_space(14.0);
-        self.web_events_card(ui);
+        match self.web.tab {
+            WebTab::Overview => {
+                self.web_status_card(ui);
+                ui.add_space(14.0);
+                self.web_summary_card(ui);
+                ui.add_space(14.0);
+                self.web_check_card(ui);
+            }
+            WebTab::Browsers => {
+                self.web_browser_card(ui);
+                ui.add_space(14.0);
+                self.web_hardening_card(ui, ctx);
+            }
+            WebTab::Sites => self.web_lists_card(ui),
+            WebTab::Extensions => self.web_extensions_card(ui, ctx),
+            WebTab::Dns => self.web_dns_card(ui),
+            WebTab::Activity => self.web_events_card(ui),
+        }
+    }
+
+    /// One line per area, each leading to its tab.
+    fn web_summary_card(&mut self, ui: &mut Ui) {
+        let web = &self.web;
+        let (protected, installed) = (web.protected_browsers(), web.installed_browsers());
+        let browsers = match (protected, installed) {
+            (_, 0) => (MUTED, "No supported browser found".to_string()),
+            (0, _) => (AMBER, "No browser is protected yet: connect browsers and add the extension".to_string()),
+            (p, i) if p < i => (AMBER, format!("{p} of {i} browsers protected")),
+            (p, _) => (GREEN, format!("All {p} browsers protected")),
+        };
+        let hardening = match &web.hardening {
+            None => (MUTED, "Not checked yet".to_string()),
+            Some(report) => {
+                use threat_scanner::posture::Status;
+                let issues = report
+                    .versions
+                    .iter()
+                    .map(|v| &v.check)
+                    .chain(report.profiles.iter().flat_map(|p| p.checks.iter()))
+                    .filter(|c| matches!(c.status, Status::Risk | Status::Attention))
+                    .count();
+                if issues == 0 { (GREEN, "Browsers up to date, no settings to review".to_string()) } else { (AMBER, format!("{issues} item(s) to review")) }
+            }
+        };
+        let extensions = match &web.scan {
+            None => (MUTED, "Not checked yet".to_string()),
+            Some(scan) => match (scan.flagged().filter(|e| e.category.is_some()).count(), scan.flagged().count()) {
+                (0, 0) => (GREEN, "Nothing needs your attention".to_string()),
+                (0, n) => (AMBER, format!("{n} worth reviewing")),
+                (t, _) => (RED, format!("{t} dangerous extension(s)")),
+            },
+        };
+        let dns = match (&web.filter, &web.filter_error) {
+            (_, Some(_)) => (RED, "Could not start".to_string()),
+            (Some(_), None) if web.windows_dns => (GREEN, "Running, and Windows uses it".to_string()),
+            (Some(_), None) => (AMBER, "Running, but Windows does not use it yet".to_string()),
+            (None, None) => (MUTED, "Off (optional: protects every program, not just browsers)".to_string()),
+        };
+        let day_ago = (chrono::Local::now() - chrono::Duration::days(1)).to_rfc3339();
+        let recent = web.events.iter().filter(|e| e.time >= day_ago && e.action == "blocked").count();
+        let activity = (if recent == 0 { MUTED } else { RED }, format!("{recent} dangerous site(s) blocked in the last 24 hours"));
+        let rows = [
+            ("Browser Guard", browsers, WebTab::Browsers),
+            ("Browser hardening", hardening, WebTab::Browsers),
+            ("Browser extensions", extensions, WebTab::Extensions),
+            ("DNS filter", dns, WebTab::Dns),
+            ("Activity", activity, WebTab::Activity),
+        ];
+        let mut go = None;
+        card(ui, |ui| {
+            for (i, (label, (color, text), tab)) in rows.into_iter().enumerate() {
+                if i > 0 {
+                    row_divider(ui);
+                }
+                setting_row(ui, label, &text, |ui| {
+                    if small_button(ui, "Open").clicked() {
+                        go = Some(tab);
+                    }
+                    status_dot(ui, color, 5.0);
+                });
+            }
+        });
+        if let Some(tab) = go {
+            self.web.tab = tab;
+        }
     }
 
     fn web_status_card(&mut self, ui: &mut Ui) {
-        let connected = self.web.browsers.iter().filter(|b| b.current).count();
+        let connected = self.web.protected_browsers();
+        let installed = self.web.installed_browsers();
         let ads_blocked = self.web.filter.as_ref().map(|(f, _)| f.ads_blocked());
         let config = &mut self.web.config;
         card(ui, |ui| {
@@ -338,7 +457,7 @@ impl App {
                 let (color, title) = match (config.enabled, config.mode) {
                     (false, _) => (MUTED, "Web protection is off"),
                     (true, Mode::ReportOnly) => (AMBER, "Report-only: matches are logged, not blocked"),
-                    (true, Mode::Block) if connected == 0 && self.web.filter.is_none() => (AMBER, "Connect a browser to start blocking"),
+                    (true, Mode::Block) if connected == 0 && self.web.filter.is_none() => (AMBER, "Add the extension to a browser to start blocking"),
                     (true, Mode::Block) => (GREEN, "Web protection is on"),
                 };
                 status_dot(ui, color, 6.0);
@@ -350,7 +469,7 @@ impl App {
                     ("Blocking rules", self.web.counts.blocking().to_string()),
                     ("Sites", self.web.counts.domains.to_string()),
                     ("Addresses", (self.web.counts.urls + self.web.counts.networks + self.web.counts.ports).to_string()),
-                    ("Browsers connected", format!("{connected} of {}", self.web.browsers.len())),
+                    ("Browsers protected", format!("{connected} of {installed}")),
                     ("DNS filter", if self.web.filter.is_some() { "running".into() } else { "off".into() }),
                 ],
             );
@@ -400,23 +519,26 @@ impl App {
         let mut disconnect = false;
         let mut open_folder = false;
         let any = self.web.browsers.iter().any(|b| b.current);
+        let missing: Vec<&str> = self
+            .web
+            .browsers
+            .iter()
+            .filter(|b| b.state() == GuardState::ExtensionMissing)
+            .map(|b| b.browser.as_str())
+            .collect();
         card(ui, |ui| {
             section_title(ui, "Browser Guard");
-            muted(ui, "The Phalanx extension checks every page your browser opens and shows a warning page instead of a dangerous site, including https:// sites.");
+            muted(ui, "The Phalanx extension checks every page your browser opens and shows a warning page instead of a dangerous site, including https:// sites. A browser is protected once the extension is added and has reached Phalanx.");
             ui.add_space(6.0);
             for b in &self.web.browsers {
-                ui.horizontal(|ui| {
-                    status_dot(ui, if b.current { GREEN } else { MUTED }, 4.0);
-                    ui.label(RichText::new(&b.browser).color(TEXT));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let text = match (&b.manifest, b.current) {
-                            (_, true) => "connected",
-                            (Some(_), false) => "registered by another copy",
-                            (None, _) => "not connected",
-                        };
-                        small(ui, text);
-                    });
-                });
+                let state = b.state();
+                let color = match state {
+                    GuardState::Protecting => GREEN,
+                    GuardState::Waiting | GuardState::ExtensionMissing | GuardState::OtherCopy => AMBER,
+                    GuardState::NotConnected if b.installed => AMBER,
+                    _ => MUTED,
+                };
+                setting_row(ui, &b.browser, &b.describe(), |ui| status_dot(ui, color, 5.0));
             }
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
@@ -426,15 +548,17 @@ impl App {
                     disconnect = small_button(ui, "Disconnect").clicked();
                 }
             });
-            if any {
+            if any && !missing.is_empty() {
                 ui.add_space(6.0);
                 let folder = native::extension_dir(&self.data_dir);
-                muted(ui, "Then add the extension once per browser:");
+                muted(ui, format!("Add the extension to {}:", missing.join(", ")));
                 muted(ui, "1. Open chrome://extensions (Edge: edge://extensions, Brave: brave://extensions) and turn on Developer mode.");
                 muted(ui, format!("2. Choose Load unpacked and pick {}", folder.display()));
-                muted(ui, "Firefox: about:debugging > This Firefox > Load Temporary Add-on, and pick manifest.json in that folder.");
-                small(ui, "The extension's icon shows \"!\" when it cannot reach Phalanx. Sites you allow from its warning page appear under Your sites.");
+                if missing.contains(&"Firefox") {
+                    muted(ui, "Firefox: about:debugging > This Firefox > Load Temporary Add-on, and pick manifest.json in that folder (it is removed when Firefox restarts).");
+                }
             }
+            small(ui, "Connecting only lets the extension talk to Phalanx; the extension does the blocking. Its icon shows \"!\" when it cannot reach Phalanx.");
         });
         if connect {
             self.connect_browsers();

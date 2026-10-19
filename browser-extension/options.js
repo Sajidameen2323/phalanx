@@ -48,7 +48,45 @@ function render(lists) {
   renderList("allowed", lists.allowed || [], "unallowSite", "No sites allowed by you.");
 }
 
+// Sites with ad blocking paused (kept by this browser), each with Resume.
+async function renderPauses() {
+  const pauses = await api.runtime.sendMessage({ type: "adPauses" });
+  const list = $("paused");
+  list.replaceChildren();
+  const rows = [
+    ...((pauses && pauses.always) || []).map((site) => [site, "always"]),
+    ...Object.entries((pauses && pauses.temp) || {}).map(([site, until]) => [
+      site,
+      until ? `for ${Math.max(1, Math.round((until - Date.now()) / 60000))} more min` : "until the browser closes",
+    ]),
+  ];
+  if (!rows.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "Ads are blocked on every site.";
+    list.append(li);
+    return;
+  }
+  for (const [site, when] of rows) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.textContent = `${site} · ${when}`;
+    const resume = document.createElement("button");
+    resume.textContent = "Resume";
+    resume.addEventListener("click", async () => {
+      resume.disabled = true;
+      const reply = await api.runtime.sendMessage({ type: "adPause", site, minutes: null });
+      if (reply && reply.ok) message(`Ad blocking is back on for ${site}.`);
+      else message("Could not change it: " + ((reply && reply.error) || "the extension is not responding"));
+      renderPauses();
+    });
+    li.append(name, resume);
+    list.append(li);
+  }
+}
+
 async function load() {
+  renderPauses();
   const local = await api.storage.local.get({ markResults: true, showCount: true, closePopups: true });
   $("mark").checked = local.markResults;
   $("count").checked = local.showCount;
@@ -81,7 +119,12 @@ async function refreshLists() {
   if (JSON.stringify([current.blocked, current.allowed]) !== shown) render(current);
 }
 setInterval(() => document.visibilityState === "visible" && refreshLists(), 3000);
-document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && refreshLists());
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    refreshLists();
+    renderPauses();
+  }
+});
 
 $("mark").addEventListener("change", (e) => api.storage.local.set({ markResults: e.target.checked }));
 $("popups").addEventListener("change", (e) => api.storage.local.set({ closePopups: e.target.checked }));

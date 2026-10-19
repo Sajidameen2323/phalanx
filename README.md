@@ -27,11 +27,19 @@ cargo build --release
 This produces `target\release\phalanx.exe` (the app) and `phalanx-cli.exe`. With the
 GNU toolchain, `build.rs` embeds the Phalanx icon and version information using
 `windres` (set `WINDRES` to use another one); without it the build still succeeds,
-without the icon. The icon assets in `assets/` come from the Phalanx logo: `phalanx-logo.png`
-and `phalanx-wordmark.png` (transparent, for dark backgrounds), their `-dark`
-versions (for light backgrounds), `phalanx-emblem.png` (the shield alone), and the
-app icon `phalanx.ico` / `phalanx.png` with the emblem on a dark tile so it stays
-readable on light taskbars and toolbars.
+without the icon.
+
+The icon assets in `assets/` come from the Phalanx logo:
+
+* `phalanx-logo.png` and `phalanx-wordmark.png` are transparent, for dark
+  backgrounds; their `-dark` versions are for light backgrounds.
+* `phalanx-emblem.svg` is the vector emblem, with no background. It is the source
+  of every icon. A dark outline and dark visor keep the helmet readable on light
+  taskbars too.
+* `phalanx-emblem-small.svg` is a heavier version for 16–32 px.
+* Rendered from these: `phalanx-emblem.png` (512 px), the app icon `phalanx.ico`
+  (16–256 px, small sizes from the heavier version), `phalanx.png`,
+  `phalanx-128.rgba`, and the extension's `icon16/32/48/128.png`.
 
 The first build takes several minutes, mostly compiling YARA-X's WebAssembly JIT.
 
@@ -212,6 +220,28 @@ false-positive entries and the extension's exclusions still win.
 
 Ad blocking only blocks in **Block** mode. In report-only mode or with web
 protection off, ads load normally and nothing is logged.
+
+**Pausing ad blocking on one site.** If a site breaks or asks you to turn off your
+ad blocker, open the extension's popup on that site and choose one of:
+
+* **Pause 1 hour**
+* **Until I close the browser**
+* **Always on this site**
+
+**Resume ad blocking** turns it back on. The extension's settings page lists every
+paused site with a **Resume** button.
+
+A pause covers the site and its subdomains, in that browser only. It is one
+`allowAllRequests` rule for the site's pages and frames:
+
+* **Always on this site:** a dynamic rule, kept until you resume.
+* **The other two:** a session rule, which the browser drops when it closes.
+
+The rule lets that site's ads and trackers load and keeps ad pop-ups from that site
+open. Threat rules rank above it, so dangerous sites and dangerous requests on the
+page are still blocked. A 1-hour pause ends at the first navigation after the hour
+is up. The DNS filter, if you use it, still blocks ad names for the whole PC: it
+cannot tell which site a lookup is for.
 
 **DNS filter (whole PC).** When it is on and the app is running, a resolver runs on
 `127.0.0.1:53` and forwards lookups to the PC's own resolvers. It checks the name

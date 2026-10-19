@@ -29,7 +29,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Registered host name (what the extension passes to `connectNative`).
 pub const HOST_NAME: &str = "com.phalanx.browser_guard";
@@ -475,11 +475,117 @@ fn write_message(output: &mut impl Write, value: &Value) -> Result<()> {
 /// Serves requests until the browser closes the pipe.
 pub fn run_host(data_dir: &Path, mut input: impl Read, mut output: impl Write) -> Result<()> {
     let mut state = HostState::new(data_dir);
+    // Which browser started us, so the app can say it is really protected.
+    let caller = calling_browser();
+    let mut last_contact: Option<Instant> = None;
+    let mut note_contact = |force: bool| {
+        if let Some(browser) = caller {
+            if force || last_contact.is_none_or(|t| t.elapsed() >= CONTACT_EVERY) {
+                record_contact(data_dir, browser);
+                last_contact = Some(Instant::now());
+            }
+        }
+    };
+    note_contact(true);
     while let Some(request) = read_message(&mut input)? {
         let reply = state.handle(&request);
         write_message(&mut output, &reply)?;
+        note_contact(false);
     }
     Ok(())
+}
+
+// ---------- contact tracking ----------
+
+const CONTACT_FILE: &str = "contact.json";
+/// While a browser stays connected, its contact time is refreshed this often.
+const CONTACT_EVERY: Duration = Duration::from_secs(300);
+
+/// Browser programs and the registration row they belong to.
+const BROWSER_EXES: &[(&str, &str)] = &[
+    ("chrome.exe", "Google Chrome"),
+    ("msedge.exe", "Microsoft Edge"),
+    ("brave.exe", "Brave"),
+    ("vivaldi.exe", "Chromium and Vivaldi"),
+    ("firefox.exe", "Firefox"),
+];
+
+/// The browser that started this process, found by walking up the parent
+/// processes (Chromium starts hosts through `cmd.exe`).
+fn calling_browser() -> Option<&'static str> {
+    let processes = process_table();
+    let mut pid = std::process::id();
+    for _ in 0..4 {
+        let parent = processes.iter().find(|p| p.0 == pid)?.1;
+        let (_, _, exe) = processes.iter().find(|p| p.0 == parent)?;
+        if let Some((_, row)) = BROWSER_EXES.iter().find(|(e, _)| exe.eq_ignore_ascii_case(e)) {
+            return Some(row);
+        }
+        pid = parent;
+    }
+    None
+}
+
+/// (process id, parent id, program name) of every process.
+fn process_table() -> Vec<(u32, u32, String)> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        };
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            let len = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
+            out.push((entry.th32ProcessID, entry.th32ParentProcessID, String::from_utf16_lossy(&entry.szExeFile[..len])));
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        out
+    }
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
+/// `2026-10-19T10:00:00+05:30` → `3 min ago`.
+fn ago(rfc3339: &str) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(rfc3339) else { return rfc3339.to_string() };
+    let minutes = (chrono::Local::now().fixed_offset() - then).num_minutes().max(0);
+    match minutes {
+        0..=1 => "just now".into(),
+        2..=119 => format!("{minutes} min ago"),
+        120..=2879 => format!("{} h ago", minutes / 60),
+        _ => format!("{} days ago", minutes / 1440),
+    }
+}
+
+fn contact_path(data_dir: &Path) -> PathBuf {
+    connector_dir(data_dir).join(CONTACT_FILE)
+}
+
+/// Last time each browser row reached the connector.
+pub fn contacts(data_dir: &Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(contact_path(data_dir)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn record_contact(data_dir: &Path, browser: &str) {
+    let mut all = contacts(data_dir);
+    all.insert(browser.to_string(), crate::store::now());
+    let path = contact_path(data_dir);
+    let _ = std::fs::create_dir_all(connector_dir(data_dir));
+    if let Ok(text) = serde_json::to_string_pretty(&all) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 // ---------- registration ----------
@@ -500,6 +606,66 @@ pub struct BrowserRegistration {
     pub manifest: Option<String>,
     /// Whether it points at this installation's manifest.
     pub current: bool,
+    /// The browser has a profile on this PC.
+    pub installed: bool,
+    /// Profiles (display names) where the Browser Guard extension is added.
+    pub extension_profiles: Vec<String>,
+    /// Last time this browser's extension reached Phalanx (RFC 3339).
+    pub last_contact: Option<String>,
+}
+
+/// What a browser row means for protection, most to least protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardState {
+    /// The extension is added and has reached Phalanx.
+    Protecting,
+    /// The extension is added but has never reached Phalanx (restart the browser).
+    Waiting,
+    /// The connector is registered, but the extension is not added.
+    ExtensionMissing,
+    /// The registration points at another copy of Phalanx.
+    OtherCopy,
+    /// The browser is installed but the connector is not registered for it.
+    NotConnected,
+    NotInstalled,
+}
+
+impl BrowserRegistration {
+    /// One line for the app and the command line.
+    pub fn describe(&self) -> String {
+        match self.state() {
+            GuardState::Protecting => {
+                let profiles = match self.extension_profiles.len() {
+                    1 => format!("in {}", self.extension_profiles[0]),
+                    n => format!("in {n} profiles"),
+                };
+                let ago = self.last_contact.as_deref().map(ago).unwrap_or_default();
+                format!("protecting ({profiles}), last contact {ago}")
+            }
+            GuardState::Waiting => "extension added; waiting for it to reach Phalanx (restart the browser if this stays)".into(),
+            GuardState::ExtensionMissing => "ready, but the extension is not added".into(),
+            GuardState::OtherCopy => "linked to another copy of Phalanx; reconnect".into(),
+            GuardState::NotConnected => "not connected".into(),
+            GuardState::NotInstalled => "not installed".into(),
+        }
+    }
+
+    pub fn state(&self) -> GuardState {
+        if !self.installed && self.last_contact.is_none() {
+            GuardState::NotInstalled
+        } else if self.manifest.is_none() {
+            GuardState::NotConnected
+        } else if !self.current {
+            GuardState::OtherCopy
+        } else if self.extension_profiles.is_empty() {
+            GuardState::ExtensionMissing
+        } else if self.last_contact.is_none() {
+            GuardState::Waiting
+        } else {
+            GuardState::Protecting
+        }
+    }
 }
 
 pub fn connector_dir(data_dir: &Path) -> PathBuf {
@@ -600,6 +766,8 @@ pub fn uninstall() -> Result<()> {
 /// Which browsers have the connector registered.
 pub fn status(data_dir: &Path) -> Vec<BrowserRegistration> {
     let (chromium, firefox) = manifest_paths(data_dir);
+    let contacts = contacts(data_dir);
+    let chromium_browsers = super::extensions::browsers();
     BROWSERS
         .iter()
         .map(|(browser, _key, is_firefox)| {
@@ -615,9 +783,48 @@ pub fn status(data_dir: &Path) -> Vec<BrowserRegistration> {
             let manifest: Option<String> = None;
             let expected = if *is_firefox { &firefox } else { &chromium };
             let current = manifest.as_deref().is_some_and(|m| Path::new(m) == expected.as_path() && expected.is_file());
-            BrowserRegistration { browser: browser.to_string(), manifest, current }
+            let (installed, extension_profiles) = if *is_firefox {
+                firefox_extension()
+            } else {
+                // The Chromium row covers Vivaldi and Chromium.
+                let names: Vec<&str> = match *browser {
+                    "Chromium and Vivaldi" => vec!["Vivaldi", "Chromium"],
+                    other => vec![other],
+                };
+                let found: Vec<&super::extensions::Browser> = chromium_browsers.iter().filter(|b| names.contains(&b.name.as_str())).collect();
+                let profiles = found
+                    .iter()
+                    .flat_map(|b| super::extensions::profiles_with_extension(&b.user_data, CHROMIUM_EXTENSION_ID))
+                    .collect();
+                (!found.is_empty(), profiles)
+            };
+            BrowserRegistration {
+                browser: browser.to_string(),
+                manifest,
+                current,
+                installed,
+                extension_profiles,
+                last_contact: contacts.get(*browser).cloned(),
+            }
         })
         .collect()
+}
+
+/// Whether Firefox has a profile here, and the profiles with the extension
+/// (temporary add-ons are listed while Firefox runs).
+fn firefox_extension() -> (bool, Vec<String>) {
+    let Some(root) = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(r"Mozilla\Firefox\Profiles")) else {
+        return (false, Vec::new());
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else { return (false, Vec::new()) };
+    let profiles = entries
+        .flatten()
+        .filter(|e| {
+            std::fs::read_to_string(e.path().join("extensions.json")).is_ok_and(|t| t.contains(FIREFOX_EXTENSION_ID))
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    (true, profiles)
 }
 
 #[cfg(test)]
@@ -811,6 +1018,28 @@ mod tests {
         assert!(!blocked(&mut state, "https://blocktest.phalanx.invalid/"));
         assert_eq!(state.handle(&json!({"type": "unallow_site", "site": "blocktest.phalanx.invalid"}))["ok"], true);
         assert!(blocked(&mut state, "https://blocktest.phalanx.invalid/"));
+    }
+
+    #[test]
+    fn guard_state_needs_registration_extension_and_contact() {
+        let row = |manifest: bool, current: bool, installed: bool, ext: bool, contact: bool| BrowserRegistration {
+            browser: "Google Chrome".into(),
+            manifest: manifest.then(|| "m.json".into()),
+            current,
+            installed,
+            extension_profiles: if ext { vec!["Person 1".into()] } else { Vec::new() },
+            last_contact: contact.then(|| "2026-10-19T10:00:00+05:30".into()),
+        };
+        assert_eq!(row(true, true, false, false, false).state(), GuardState::NotInstalled);
+        assert_eq!(row(false, false, true, false, false).state(), GuardState::NotConnected);
+        assert_eq!(row(true, false, true, true, true).state(), GuardState::OtherCopy);
+        assert_eq!(row(true, true, true, false, true).state(), GuardState::ExtensionMissing, "contact alone is not enough");
+        assert_eq!(row(true, true, true, true, false).state(), GuardState::Waiting);
+        assert_eq!(row(true, true, true, true, true).state(), GuardState::Protecting);
+
+        let tmp = tempfile::tempdir().unwrap();
+        record_contact(tmp.path(), "Brave");
+        assert!(contacts(tmp.path()).contains_key("Brave"));
     }
 
     #[test]

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Phalanx emblem: an open-topped shield around a Spartan helmet.
+       Transparent background. The helmet is built from separate pieces
+       (crest, dome with nose guard, two cheek guards); the gaps between
+       them form the visor. A thin dark outline keeps the light metal
+       readable on light taskbars. Heavier variant for 16-32 px icons. -->
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3AA5FF"/>
+      <stop offset="1" stop-color="#2878E6"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F5F7FB"/>
+      <stop offset="1" stop-color="#D3D9E4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Shield, open at the top where the crest rises -->
+  <path d="M192 90 L68 148 L68 292 C68 378 150 438 256 480 C362 438 444 378 444 292 L444 148 L320 90"
+        fill="none" stroke="url(#shield)" stroke-width="50" stroke-linejoin="miter" stroke-miterlimit="8"/>
+
+  <!-- Dark visor behind the pieces, so the helmet reads on light backgrounds -->
+  <path d="M150 226 L362 226 L362 304 L344 412 L168 412 L150 304 Z" fill="#111827"/>
+
+  <g fill="url(#metal)" stroke="#111827" stroke-width="26" stroke-linejoin="round" paint-order="stroke">
+    <!-- Crest -->
+    <path d="M256 20 L290 60 L268 176 L256 194 L244 176 L222 60 Z"/>
+    <!-- Dome with the nose guard -->
+    <path d="M228 128 L256 214 L284 128 C330 136 362 176 364 232 L274 252 L274 330 L256 354 L238 330 L238 252 L148 232 C150 176 182 136 228 128 Z"/>
+    <!-- Cheek guards -->
+    <path d="M148 264 L224 280 L224 414 L166 414 L148 304 Z"/>
+    <path d="M364 264 L288 280 L288 414 L346 414 L364 304 Z"/>
+  </g>
+</svg>
