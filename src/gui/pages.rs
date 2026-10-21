@@ -2,7 +2,7 @@
 //! button rows wrap, long text truncates, and the sidebar narrows.
 
 use super::*;
-use dots::{Outcome, StageMode, Symbol};
+use dots::{HeroScan, Outcome, StageMode};
 use eframe::egui::{pos2, vec2, Align, Align2, FontId, Id, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use threat_scanner::posture::Status;
 use widgets::*;
@@ -55,7 +55,9 @@ impl App {
                             Page::History => self.history_page(ui),
                             Page::Settings => self.settings_page(ui, ctx),
                         }
-                        ui.add_space(28.0);
+                        if self.page != Page::Dashboard {
+                            ui.add_space(28.0);
+                        }
                     });
             });
 
@@ -160,24 +162,26 @@ impl App {
             .iter()
             .filter(|s| s.started_at >= week_ago && s.detections > s.quarantined)
             .collect();
-        let last_manual = self.scans.iter().find(|s| s.finished_at.is_some() && !is_protection_kind(&s.kind));
+        let last_manual = self.scans.iter().find(|s| s.finished_at.is_some() && !s.cancelled && !is_protection_kind(&s.kind));
         let threat_count: i64 = unresolved.iter().map(|s| s.detections - s.quarantined).sum();
-        let (color, symbol, title, detail) = if let Some(job) = &self.job {
-            (theme().accent, Symbol::Dash, "Scanning".to_string(), format!("{} files checked", job.files))
+        let (color, title, detail) = if let Some(job) = &self.job {
+            let found = match self.results.len() {
+                0 => String::new(),
+                n => format!(" · {n} threat(s)"),
+            };
+            (theme().accent, "Scanning".to_string(), format!("{} files · {}{found}", job.files, fmt_duration(job.started.elapsed())))
         } else if let Some(latest) = unresolved.first() {
             let found_by = if is_protection_kind(&latest.kind) { "real-time protection" } else { "a scan" };
             (
                 theme().red,
-                Symbol::Alert,
                 "Threats need review".to_string(),
                 format!("{threat_count} not removed in the last 7 days · latest found by {found_by}, {}", short_time(&latest.started_at)),
             )
         } else {
             match last_manual {
-                None => (theme().amber, Symbol::Dash, "No scans yet".to_string(), "Run a quick scan to check this PC.".to_string()),
+                None => (theme().amber, "No scans yet".to_string(), "Run a quick scan to check this PC.".to_string()),
                 Some(s) => (
                     theme().green,
-                    Symbol::Check,
                     "No threats found".to_string(),
                     format!("Last scan {} · {} files", short_time(&s.started_at), s.files_scanned),
                 ),
@@ -188,8 +192,12 @@ impl App {
         // ---- the hero: an open dot field, no frame ----
         let width = ui.available_width();
         let narrow = width < 760.0;
-        let viewport = ui.clip_rect().height();
-        let hero_height = if narrow { 300.0 } else { (viewport * 0.6).clamp(340.0, 500.0) };
+        // The hero takes whatever height the rest of the page leaves (measured
+        // last frame), so the dashboard always fits without scrolling.
+        let viewport = ui.clip_rect().bottom() - ui.cursor().top();
+        let rest_id = Id::new("dashboard-rest");
+        let rest: f32 = ctx.data(|d| d.get_temp(rest_id)).unwrap_or(300.0);
+        let hero_height = if narrow { 300.0 } else { (viewport - rest - 4.0).clamp(300.0, 560.0) };
         let (rect, _) = ui.allocate_exact_size(vec2(width, hero_height), Sense::hover());
         let half = (hero_height * 0.34).min(170.0);
         let (center, clear) = if narrow {
@@ -199,10 +207,11 @@ impl App {
             let left = center.x + half * 1.25;
             (center, Rect::from_min_max(pos2(left, rect.center().y - 86.0), pos2(rect.right() - 24.0, rect.center().y + 86.0)))
         };
-        let status = dots::HeroStatus { color, symbol, live: self.watch.running, threats: threat_count.max(0) as usize };
+        let scan = self.job.as_ref().map(|job| HeroScan { files: job.files, threats: self.results.len() });
+        let status = dots::HeroStatus { color, live: self.watch.running, threats: threat_count.max(0) as usize, scan };
         self.hero_fx.show(ui, rect, center, half, clear, status);
 
-        let (mut quick, mut full, mut folder, mut view, mut review) = (false, false, false, false, false);
+        let (mut quick, mut full, mut folder, mut view, mut review, mut cancel) = (false, false, false, false, false, false);
         let mut headline = |ui: &mut Ui| {
             ui.label(RichText::new(&title).font(bold(if narrow { 30.0 } else { 40.0 })).extra_letter_spacing(-1.0).color(theme().text));
             ui.add(egui::Label::new(RichText::new(&detail).size(15.0).color(theme().muted)).wrap());
@@ -210,7 +219,8 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if scanning {
-                    view = primary_button(ui, "View scan").clicked();
+                    view = primary_button(ui, "Scan details").clicked();
+                    cancel = secondary_button(ui, "Cancel scan").clicked();
                 } else {
                     quick = primary_button(ui, "Quick scan").clicked();
                     full = secondary_button(ui, "Full scan").clicked();
@@ -232,15 +242,24 @@ impl App {
                 ui.add_space(below);
             }
         }
+        // Scans started here play out in the hero, so the page stays.
         if quick {
             self.start_scan(ctx, quick_scan_targets(), "quick");
+            self.page = Page::Dashboard;
         }
         if full {
             self.start_scan(ctx, system::fixed_drives(), "full");
+            self.page = Page::Dashboard;
         }
         if folder {
             if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                 self.start_scan(ctx, vec![dir], "custom");
+                self.page = Page::Dashboard;
+            }
+        }
+        if cancel {
+            if let Some(job) = &self.job {
+                job.cancel.store(true, Ordering::Relaxed);
             }
         }
         if view {
@@ -332,6 +351,11 @@ impl App {
         }
         if update_clicked {
             self.start_update(ctx, false);
+        }
+        let rest_now = ui.cursor().top() - rect.bottom();
+        if (rest_now - rest).abs() > 0.5 {
+            ctx.data_mut(|d| d.insert_temp(rest_id, rest_now));
+            ctx.request_repaint();
         }
     }
 
