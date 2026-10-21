@@ -9,7 +9,7 @@ use threat_scanner::scan::{self, ScanEvent, ScanOptions};
 use threat_scanner::store::Store;
 use threat_scanner::system::{self, Performance};
 use threat_scanner::posture::{self, Check, Status};
-use threat_scanner::watch::{self, RiskyOutcome, WatchConfig, WatchEvent};
+use threat_scanner::rtp::{self, Origin, RiskyOutcome, RtpConfig, RtpEvent};
 use threat_scanner::{ai, update, web, Category};
 
 /// Phalanx: on-demand threat scanner (hash blocklist, YARA rules, PE heuristics).
@@ -28,13 +28,14 @@ struct Cli {
 enum Command {
     /// Scan files or folders.
     Scan(ScanArgs),
-    /// Watch folders and scan new files as they arrive (Ctrl+C to stop).
+    /// Real-time protection: scan new files in folders as they arrive and,
+    /// with --programs, programs as they start (Ctrl+C to stop).
     Watch(WatchArgs),
     /// Show recent scans.
     History {
         #[arg(long, default_value_t = 20)]
         limit: u32,
-        /// Only scans of this kind (quick, custom, watch, cli).
+        /// Only scans of this kind (quick, custom, watch, process, cli).
         #[arg(long)]
         kind: Option<String>,
         #[arg(long)]
@@ -299,8 +300,18 @@ impl LoadArgs {
 #[derive(Args)]
 struct WatchArgs {
     /// Folders to watch, e.g. your Downloads folder.
-    #[arg(required = true)]
+    #[arg(required_unless_present = "programs")]
     folders: Vec<PathBuf>,
+    /// Also scan every program as it starts (Windows), and stop it if it is
+    /// malware (PUPs and hacking tools are only reported).
+    #[arg(long)]
+    programs: bool,
+    /// With --programs, only report detected programs; never stop them.
+    #[arg(long, requires = "programs")]
+    report_only: bool,
+    /// Report heuristic findings even on validly signed files.
+    #[arg(long)]
+    no_trust_signed: bool,
     #[command(flatten)]
     signatures: SignatureArgs,
     /// Quarantine malware, PUP and hacktool detections.
@@ -693,35 +704,49 @@ fn signatures_label(args: &SignatureArgs, dir: &Path) -> Option<String> {
 
 fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
     let engine = std::sync::Arc::new(engine(&args.signatures, dir)?);
-    let config = WatchConfig {
-        folders: args.folders.clone(),
-        exclude: [&args.signatures.rules[..], &args.signatures.hashes[..], &args.exclude[..]].concat(),
-        max_size_bytes: args.max_size_mb.saturating_mul(1024 * 1024),
-        quarantine_floor: args.quarantine.then_some(Category::Pup),
-        signatures: signatures_label(&args.signatures, dir),
-        catch_up_since: None,
-        settle: std::time::Duration::from_secs(3),
-        alert_risky: true,
-    };
+    let mut config = RtpConfig::new(args.folders.clone());
+    config.exclude = [&args.signatures.rules[..], &args.signatures.hashes[..], &args.exclude[..]].concat();
+    config.max_size_bytes = args.max_size_mb.saturating_mul(1024 * 1024);
+    config.quarantine_floor = args.quarantine.then_some(Category::Pup);
+    config.signatures = signatures_label(&args.signatures, dir);
+    config.process_protection = args.programs;
+    config.stop_running_threats = !args.report_only;
+    config.trust_signed = !args.no_trust_signed;
     let notify = args.notify;
-    let _handle = watch::start(engine, dir.to_path_buf(), config, move |event| match event {
-        WatchEvent::Started { watching, failed } => {
-            println!("Watching {watching} folder(s). Press Ctrl+C to stop.");
+    let _handle = rtp::start(engine, dir.to_path_buf(), config, move |event| match event {
+        RtpEvent::Started { watching, failed, programs } => {
+            let programs = if programs { " and programs as they start" } else { "" };
+            println!("Watching {watching} folder(s){programs}. Press Ctrl+C to stop.");
             for (folder, e) in failed {
-                eprintln!("warning: cannot watch {}: {e}", folder.display());
+                eprintln!("warning: cannot watch {} yet ({e}); retrying", folder.display());
             }
         }
-        WatchEvent::Detection(report) => {
+        RtpEvent::FolderLost { folder, reason } => eprintln!("warning: stopped watching {} ({reason}); retrying", folder.display()),
+        RtpEvent::FolderRestored { folder } => println!("watching {} again; checking recent files", folder.display()),
+        RtpEvent::FolderRescan { folder } => println!("many changes at once in {}; rescanning recent files", folder.display()),
+        RtpEvent::Detection { report, processes } | RtpEvent::Blocked { report, processes } => {
             let worst = report.worst();
-            println!("[{}] {}  {}\n    action: {}", worst.category, worst.threat, report.path, report.action);
+            println!("[{}] {}  {}
+    action: {}", worst.category, worst.threat, report.path, report.action);
+            for p in &processes {
+                match &p.stopped {
+                    Some(Ok(())) => println!("    stopped {} (pid {})", p.name, p.pid),
+                    Some(Err(e)) => println!("    could not stop {} (pid {}): {e}", p.name, p.pid),
+                    None => println!("    left running: {} (pid {})", p.name, p.pid),
+                }
+            }
             if notify {
                 system::notify(&format!("Threat detected: {}", worst.threat), &report.path);
             }
         }
-        WatchEvent::Scanned(report) => {
-            println!("scanned {} new file(s), {} threat(s)", report.stats.files_scanned, report.infected.len());
+        RtpEvent::Scanned { origin, report } => {
+            let what = match origin {
+                Origin::Folder => "new file(s)",
+                Origin::Program => "program(s)",
+            };
+            println!("scanned {} {what}, {} threat(s)", report.stats.files_scanned, report.infected.len());
         }
-        WatchEvent::RiskyFile { path, risk, origin } => {
+        RtpEvent::RiskyFile { path, risk, origin } => {
             let from = origin.as_ref().and_then(|o| o.host()).map(|h| format!(" from {h}")).unwrap_or_default();
             println!("new {}{from}: {}", risk.kind.label(), path.display());
             if let Some(d) = &risk.disguise {
@@ -731,12 +756,15 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
                 system::notify(&format!("New {} in a watched folder", risk.kind.label()), &path.display().to_string());
             }
         }
-        WatchEvent::RiskyChecked { path, outcome } => match outcome {
+        RtpEvent::RiskyChecked { path, outcome } => match outcome {
             RiskyOutcome::NoThreatFound => println!("    no known threats: {}", path.display()),
             RiskyOutcome::NotScanned(reason) => println!("    not scanned ({reason}): {}", path.display()),
             RiskyOutcome::Threat(_) => {}
         },
-        WatchEvent::Error(e) => eprintln!("warning: {e}"),
+        RtpEvent::Restarting { error, retry_in } => {
+            eprintln!("warning: {error}; restarting protection in {} s", retry_in.as_secs())
+        }
+        RtpEvent::Error(e) => eprintln!("warning: {e}"),
     })?;
     loop {
         std::thread::park();

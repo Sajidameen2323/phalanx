@@ -105,7 +105,7 @@ impl App {
     fn dashboard(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         page_header(ui, "Dashboard", "Scan files and folders for malware, potentially unwanted programs and hacking tools.");
 
-        // Threats from any scan (manual or folder protection) in the last 7
+        // Threats from any scan (manual or real-time protection) in the last 7
         // days that were not quarantined need attention.
         let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).to_rfc3339();
         let unresolved: Vec<&ScanRow> = self
@@ -113,10 +113,10 @@ impl App {
             .iter()
             .filter(|s| s.started_at >= week_ago && s.detections > s.quarantined)
             .collect();
-        let last_manual = self.scans.iter().find(|s| s.finished_at.is_some() && s.kind != "watch");
+        let last_manual = self.scans.iter().find(|s| s.finished_at.is_some() && !is_protection_kind(&s.kind));
         let (color, title, detail) = if let Some(latest) = unresolved.first() {
             let count: i64 = unresolved.iter().map(|s| s.detections - s.quarantined).sum();
-            let found_by = if latest.kind == "watch" { "folder protection" } else { "a scan" };
+            let found_by = if is_protection_kind(&latest.kind) { "real-time protection" } else { "a scan" };
             (
                 RED,
                 "Threats need your review",
@@ -152,13 +152,18 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 if self.watch.running {
                     status_dot(ui, GREEN, 4.5);
+                    let programs = if self.watch.programs {
+                        format!(" and programs as they start ({} checked)", self.watch.programs_checked)
+                    } else {
+                        String::new()
+                    };
                     ui.label(format!(
-                        "Folder protection is on: watching {} folder(s), {} new file(s) checked",
+                        "Real-time protection is on: watching {} folder(s), {} new file(s) checked{programs}",
                         self.watch.watching, self.watch.files_checked
                     ));
                 } else {
                     status_dot(ui, MUTED, 4.5);
-                    ui.label("Folder protection is off.");
+                    ui.label("Real-time protection is off.");
                     open_protection = small_button(ui, "Set up").clicked();
                 }
             });
@@ -463,34 +468,40 @@ impl App {
         page_header(
             ui,
             "Protection",
-            "Watch folders for new files and scan them automatically, at low priority, after they finish downloading.",
+            "Real-time protection scans new files in watched folders once they finish downloading, and every program as it starts.",
         );
 
         self.security_card(ui, ctx);
         ui.add_space(14.0);
 
         let mut toggle = false;
+        let nothing_to_protect = self.settings.watch_folders.is_empty() && !self.settings.program_protection;
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let (color, title) = match (self.settings.watch_enabled, self.watch.running) {
-                    (true, true) => (GREEN, "Folder protection is on"),
-                    (true, false) if self.settings.watch_folders.is_empty() => (AMBER, "Add a folder to start protection"),
+                    (true, true) if !self.watch.failed.is_empty() => (AMBER, "Real-time protection is on, with problems"),
+                    (true, true) => (GREEN, "Real-time protection is on"),
+                    (true, false) if nothing_to_protect => (AMBER, "Add a folder or turn on program protection"),
                     (true, false) => (AMBER, "Starting…"),
-                    (false, _) => (MUTED, "Folder protection is off"),
+                    (false, _) => (MUTED, "Real-time protection is off"),
                 };
                 status_dot(ui, color, 6.0);
                 ui.label(RichText::new(title).size(18.0).strong().color(TEXT));
             });
             if self.watch.running {
-                facts(
-                    ui,
-                    &[
-                        ("Watching", format!("{} folder(s)", self.watch.watching)),
-                        ("New files checked", self.watch.files_checked.to_string()),
-                        ("Threats", self.watch.threats.to_string()),
-                        ("Running since", self.watch.since.clone().unwrap_or_default()),
-                    ],
-                );
+                let mut items = vec![
+                    ("Watching", format!("{} folder(s)", self.watch.watching)),
+                    ("New files checked", self.watch.files_checked.to_string()),
+                ];
+                if self.watch.programs {
+                    items.push(("Programs checked", self.watch.programs_checked.to_string()));
+                }
+                items.push(("Threats", self.watch.threats.to_string()));
+                items.push(("Running since", self.watch.since.clone().unwrap_or_default()));
+                if self.watch.restarts > 0 {
+                    items.push(("Recovered from problems", self.watch.restarts.to_string()));
+                }
+                facts(ui, &items);
             }
             ui.add_space(6.0);
             let label = if self.settings.watch_enabled { "Turn off" } else { "Turn on protection" };
@@ -509,7 +520,7 @@ impl App {
         let mut add = false;
         card(ui, |ui| {
             section_title(ui, "Watched folders");
-            muted(ui, "Includes subfolders. Partial downloads (.crdownload, .part…) are scanned once they are complete.");
+            muted(ui, "Includes subfolders and folders moved or extracted into them. Partial downloads (.crdownload, .part…) are scanned once they are complete. A folder that disappears (an unplugged drive) is watched again as soon as it is back.");
             ui.add_space(6.0);
             if self.settings.watch_folders.is_empty() {
                 small(ui, "No folders yet.");
@@ -526,7 +537,7 @@ impl App {
                     });
                 });
                 if let Some((_, e)) = failed {
-                    small(ui, format!("Cannot watch: {e}"));
+                    small(ui, format!("Not watched right now: {e}. Retrying every few seconds."));
                 }
             }
             ui.add_space(6.0);
@@ -551,14 +562,42 @@ impl App {
         ui.add_space(14.0);
 
         card(ui, |ui| {
+            group_title(ui, "Program protection", "Checks the program file of everything that starts on this PC, wherever it is.");
+            setting_toggle(
+                ui,
+                &mut self.settings.program_protection,
+                "Scan programs as they start",
+                "Each program is checked once (until it changes), within about a second of starting. Very short-lived programs can finish first.",
+            );
+            row_divider(ui);
+            ui.add_enabled_ui(self.settings.program_protection, |ui| {
+                setting_toggle(
+                    ui,
+                    &mut self.settings.stop_running_threats,
+                    "Stop malware that is running",
+                    "End a running program found to be malware. Potentially unwanted programs, hacking tools and suspicious (heuristic) findings are reported but left running. Programs running as administrator can only be stopped if Phalanx runs as administrator too.",
+                );
+            });
+        });
+        ui.add_space(14.0);
+
+        card(ui, |ui| {
             section_title(ui, "How it behaves");
             muted(ui, if self.settings.risky_file_alerts {
                 "Programs, scripts and disk images are announced the moment they land, before you open them, and their scan result follows a few seconds later."
             } else {
                 "Alerts for new programs and scripts are off; turn them on in Settings > General."
             });
+            muted(ui, "Files already checked are remembered until they change or signatures are updated, so opening or moving them costs nothing. If part of protection fails it restarts by itself and checks what changed meanwhile.");
+            ui.add_space(4.0);
+            setting_toggle(
+                ui,
+                &mut self.settings.defer_when_fullscreen,
+                "Wait during games and presentations",
+                "Ordinary files are scanned after a full-screen game or presentation ends (at most 10 minutes later). New programs are always checked straight away.",
+            );
             muted(ui, format!(
-                "Runs on one background-priority thread. Threat notifications are {}. {}",
+                "Threat notifications are {}. {}",
                 if self.settings.notifications { "on" } else { "off" },
                 if self.autostart {
                     "Starts in the tray when you sign in to Windows."
@@ -667,7 +706,7 @@ impl App {
             for (filter, label) in [
                 (HistoryFilter::All, "All scans"),
                 (HistoryFilter::Manual, "Manual"),
-                (HistoryFilter::Watch, "Folder protection"),
+                (HistoryFilter::Watch, "Real-time protection"),
             ] {
                 if chip(ui, label, self.history_filter == filter) {
                     self.history_filter = filter;
@@ -682,8 +721,8 @@ impl App {
             .iter()
             .filter(|s| match filter {
                 HistoryFilter::All => true,
-                HistoryFilter::Manual => s.kind != "watch",
-                HistoryFilter::Watch => s.kind == "watch",
+                HistoryFilter::Manual => !is_protection_kind(&s.kind),
+                HistoryFilter::Watch => is_protection_kind(&s.kind),
             })
             .take(100)
             .cloned()
@@ -696,7 +735,7 @@ impl App {
             let expanded = self.expanded.get(&s.id);
             card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    let kind_color = if s.kind == "watch" { GREEN } else { ACCENT };
+                    let kind_color = if is_protection_kind(&s.kind) { GREEN } else { ACCENT };
                     badge(ui, &s.kind.to_uppercase(), kind_color);
                     ui.label(RichText::new(format!("#{} · {}", s.id, short_time(&s.started_at))).strong().color(TEXT));
                     let (status, color) = match (&s.finished_at, s.cancelled, s.detections) {
@@ -811,7 +850,7 @@ impl App {
                 ui,
                 &mut autostart,
                 "Start with Windows",
-                "Opens in the tray when you sign in, so folder protection starts automatically. Adds a per-user sign-in entry; no administrator rights are needed.",
+                "Opens in the tray when you sign in, so real-time protection starts automatically. Adds a per-user sign-in entry; no administrator rights are needed.",
             );
             row_divider(ui);
             ui.add_enabled_ui(has_tray, |ui| {
@@ -820,7 +859,7 @@ impl App {
                     &mut self.settings.close_to_tray,
                     "Keep running in the tray when the window is closed",
                     if has_tray {
-                        "Folder protection keeps working with the window closed. Right-click the tray icon to quit."
+                        "Real-time protection keeps working with the window closed. Right-click the tray icon to quit."
                     } else {
                         "Unavailable: the tray icon could not be created, so closing the window quits."
                     },
@@ -834,12 +873,12 @@ impl App {
 
         let mut test = false;
         card(ui, |ui| {
-            group_title(ui, "Notifications", "Windows notifications from folder protection. They work while the window is closed.");
+            group_title(ui, "Notifications", "Windows notifications from real-time protection. They work while the window is closed.");
             setting_toggle(
                 ui,
                 &mut self.settings.notifications,
                 "When a threat is found",
-                "Notify when folder protection detects malware, a potentially unwanted program or a hacking tool.",
+                "Notify when real-time protection detects malware, a potentially unwanted program or a hacking tool.",
             );
             row_divider(ui);
             setting_toggle(
@@ -897,7 +936,7 @@ impl App {
                 }
                 ui.add_space(2.0);
             }
-            small(ui, "Folder protection always uses one background-priority thread.");
+            small(ui, "Real-time protection scans one file at a time: new programs at normal priority, everything else at background priority.");
         });
         ui.add_space(14.0);
 
@@ -910,10 +949,17 @@ impl App {
                 "Flag packed or injection-capable Windows programs as suspicious. Occasionally flags legitimate software.",
             );
             row_divider(ui);
+            setting_toggle(
+                ui,
+                &mut self.settings.trust_signed,
+                "Trust signed software",
+                "Don't report heuristic findings on programs with a valid publisher signature (including Windows' own). Signature and hash matches are always reported.",
+            );
+            row_divider(ui);
             setting_row(
                 ui,
                 "Skip files larger than",
-                "Larger files are counted as skipped. Applies to scans and folder protection.",
+                "Larger files are counted as skipped. Applies to scans and real-time protection.",
                 |ui| {
                     ui.add(egui::DragValue::new(&mut self.settings.max_size_mb).range(1..=4096).suffix(" MiB"));
                 },
@@ -956,7 +1002,7 @@ impl App {
         let mut add_dir = false;
         let mut add_file = false;
         card(ui, |ui| {
-            group_title(ui, "Exclusions", "Never scanned, by manual scans or folder protection. Subfolders are included.");
+            group_title(ui, "Exclusions", "Never scanned, by manual scans or real-time protection. Subfolders are included.");
             if self.settings.exclusions.is_empty() {
                 small(ui, "No exclusions.");
             }
@@ -1477,7 +1523,7 @@ impl App {
             }
             if !recent.is_empty() {
                 ui.add_space(8.0);
-                ui.label(RichText::new("Recently found by folder protection").strong().color(TEXT));
+                ui.label(RichText::new("Recently found by real-time protection").strong().color(TEXT));
                 for p in recent.into_iter().take(6) {
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1755,6 +1801,11 @@ fn path_setting(ui: &mut Ui, label: &str, value: &mut Option<PathBuf>, folder: b
             *changed = true;
         }
     });
+}
+
+/// Scans recorded by real-time protection rather than started by the user.
+fn is_protection_kind(kind: &str) -> bool {
+    kind == "watch" || kind == "process"
 }
 
 fn capitalize(text: &str) -> String {

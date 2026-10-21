@@ -99,7 +99,7 @@ impl Tray {
         let (rgba, w, h) = crate::widgets::icon_rgba();
         let icon = tray_icon::Icon::from_rgba(rgba, w, h)?;
         let open = MenuItem::new(format!("Open {}", crate::widgets::APP_TITLE), true, None);
-        let quit = MenuItem::new("Quit (stops folder protection)", true, None);
+        let quit = MenuItem::new("Quit (stops real-time protection)", true, None);
         let menu = Menu::new();
         menu.append(&open)?;
         menu.append(&PredefinedMenuItem::separator())?;

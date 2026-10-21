@@ -24,7 +24,7 @@ use threat_scanner::store::{DetectionRow, MonthRow, QuarantineRow, ScanErrorRow,
 use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
-use threat_scanner::watch::{self, RiskyOutcome, WatchConfig, WatchEvent, WatchHandle};
+use threat_scanner::rtp::{self, Origin, ProcessHit, RiskyOutcome, RtpConfig, RtpEvent, RtpHandle};
 use threat_scanner::Category;
 use widgets::APP_TITLE;
 
@@ -108,6 +108,14 @@ struct Settings {
     notifications: bool,
     /// Warn as soon as a program or script lands in a watched folder.
     risky_file_alerts: bool,
+    /// Real-time protection also scans every program as it starts.
+    program_protection: bool,
+    /// Stop a running program detected as malware.
+    stop_running_threats: bool,
+    /// Ignore heuristic-only findings on validly signed files.
+    trust_signed: bool,
+    /// Hold back non-urgent protection scans during full-screen games.
+    defer_when_fullscreen: bool,
     close_to_tray: bool,
     /// Unix time the watcher was last known to be running; on start it
     /// catches up on files changed since then.
@@ -143,6 +151,10 @@ impl Default for Settings {
             watch_folders: downloads.into_iter().collect(),
             notifications: true,
             risky_file_alerts: true,
+            program_protection: true,
+            stop_running_threats: true,
+            trust_signed: true,
+            defer_when_fullscreen: true,
             close_to_tray: true,
             watch_checkpoint: None,
             ai_enabled: false,
@@ -221,6 +233,7 @@ impl Settings {
         options.threads = system::worker_threads(self.performance);
         options.background = self.performance.background();
         options.signatures = signatures;
+        options.trust_signed = self.trust_signed;
         options
     }
     /// Everything the running watcher depends on; a change restarts it.
@@ -233,6 +246,10 @@ impl Settings {
             self.quarantine_floor().map(|c| c.as_str()),
             self.notifications,
             self.risky_file_alerts,
+            self.program_protection,
+            self.stop_running_threats,
+            self.trust_signed,
+            self.defer_when_fullscreen,
         ))
         .unwrap_or_default()
     }
@@ -303,9 +320,14 @@ struct UpdateJob {
 }
 
 enum WatchMsg {
-    Started { watching: usize, failed: Vec<(PathBuf, String)> },
-    Detection(FileReport),
-    Scanned { files: i64, threats: usize },
+    Started { watching: usize, failed: Vec<(PathBuf, String)>, programs: bool },
+    FolderLost { folder: PathBuf, reason: String },
+    FolderRestored(PathBuf),
+    FolderRescan(PathBuf),
+    /// `repeat`: a program already detected that was started again.
+    Detection { report: FileReport, processes: Vec<ProcessHit>, repeat: bool },
+    Scanned { origin: Origin, files: i64, threats: usize },
+    Restarting { error: String, retry_in: Duration },
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
     Error(String),
@@ -334,7 +356,12 @@ struct WatchState {
     running: bool,
     watching: usize,
     failed: Vec<(PathBuf, String)>,
+    /// Programs are scanned as they start.
+    programs: bool,
     files_checked: i64,
+    programs_checked: i64,
+    /// Times protection recovered from a failure this session.
+    restarts: usize,
     threats: usize,
     since: Option<String>,
 }
@@ -409,8 +436,8 @@ struct App {
     update_check_rx: Option<Receiver<update::CheckResult>>,
     /// Time and result of the last check made in this session.
     update_check: Option<(String, update::CheckResult)>,
-    // Folder protection
-    watcher: Option<WatchHandle>,
+    // Real-time protection
+    watcher: Option<RtpHandle>,
     watch_rx: Option<Receiver<WatchMsg>>,
     /// `watch_key` plus engine identity of the running watcher.
     watcher_key: Option<String>,
@@ -1192,14 +1219,14 @@ impl App {
         }
     }
 
-    // ---------- folder protection ----------
+    // ---------- real-time protection ----------
 
-    /// Starts, restarts or stops the watcher to match settings and engine.
+    /// Starts, restarts or stops real-time protection to match settings and engine.
     fn sync_watcher(&mut self, ctx: &egui::Context) {
         let Some(engine) = self.engine.clone() else {
-            return; // keep the current watcher until new signatures are ready
+            return; // keep the current protection until new signatures are ready
         };
-        let active = self.settings.watch_enabled && !self.settings.watch_folders.is_empty();
+        let active = self.settings.watch_enabled && (!self.settings.watch_folders.is_empty() || self.settings.program_protection);
         let key = active.then(|| format!("{}|{:p}", self.settings.watch_key(), Arc::as_ptr(&engine)));
         if key == self.watcher_key {
             return;
@@ -1214,57 +1241,53 @@ impl App {
             return;
         }
 
-        let catch_up = self
-            .settings
-            .watch_checkpoint
-            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-        let config = WatchConfig {
-            folders: self.settings.watch_folders.clone(),
-            exclude: self.settings.exclude(),
-            max_size_bytes: self.settings.max_size_bytes(),
-            quarantine_floor: self.settings.quarantine_floor(),
-            signatures: self.signatures_label(),
-            catch_up_since: catch_up,
-            settle: Duration::from_secs(3),
-            alert_risky: self.settings.risky_file_alerts,
-        };
+        let mut config = RtpConfig::new(self.settings.watch_folders.clone());
+        config.exclude = self.settings.exclude();
+        config.max_size_bytes = self.settings.max_size_bytes();
+        config.quarantine_floor = self.settings.quarantine_floor();
+        config.signatures = self.signatures_label();
+        config.catch_up_since = self.settings.watch_checkpoint.map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+        config.alert_risky = self.settings.risky_file_alerts;
+        config.process_protection = self.settings.program_protection;
+        config.stop_running_threats = self.settings.stop_running_threats;
+        config.trust_signed = self.settings.trust_signed;
+        config.defer_when_fullscreen = self.settings.defer_when_fullscreen;
         let (tx, rx) = mpsc::channel();
         let notifications = self.settings.notifications;
         let repaint = ctx.clone();
-        let started = watch::start(engine, self.data_dir.clone(), config, move |event| {
+        let started = rtp::start(engine, self.data_dir.clone(), config, move |event| {
             let msg = match event {
-                WatchEvent::Started { watching, failed } => WatchMsg::Started { watching, failed },
-                WatchEvent::Detection(report) => {
-                    // Sent from the watcher thread so it works even while the window is hidden.
+                RtpEvent::Started { watching, failed, programs } => WatchMsg::Started { watching, failed, programs },
+                RtpEvent::FolderLost { folder, reason } => WatchMsg::FolderLost { folder, reason },
+                RtpEvent::FolderRestored { folder } => WatchMsg::FolderRestored(folder),
+                RtpEvent::FolderRescan { folder } => WatchMsg::FolderRescan(folder),
+                RtpEvent::Detection { report, processes } => {
+                    // Sent from the protection thread so it works even while the window is hidden.
                     if notifications {
-                        let worst = report.worst();
-                        let file = Path::new(&report.path)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| report.path.clone());
-                        let action = if report.action.starts_with("quarantined") {
-                            "It was quarantined."
-                        } else {
-                            "Open Phalanx to review it."
-                        };
-                        system::notify(
-                            &format!("Threat detected: {}", worst.threat),
-                            &format!("{file} ({}). {action}", worst.category),
-                        );
+                        let (title, body) = threat_notification(&report, &processes, false);
+                        system::notify(&title, &body);
                     }
-                    WatchMsg::Detection(report)
+                    WatchMsg::Detection { report, processes, repeat: false }
                 }
-                WatchEvent::Scanned(report) => WatchMsg::Scanned {
+                RtpEvent::Blocked { report, processes } => {
+                    if notifications {
+                        let (title, body) = threat_notification(&report, &processes, true);
+                        system::notify(&title, &body);
+                    }
+                    WatchMsg::Detection { report, processes, repeat: true }
+                }
+                RtpEvent::Scanned { origin, report } => WatchMsg::Scanned {
+                    origin,
                     files: report.stats.files_scanned,
                     threats: report.infected.len(),
                 },
-                WatchEvent::RiskyFile { path, risk, origin } => {
+                RtpEvent::RiskyFile { path, risk, origin } => {
                     // Only sent when risky-file alerts are on.
                     let (title, body) = risky_notification(&path, &risk, origin.as_ref());
                     system::notify(&title, &body);
                     WatchMsg::RiskyFile { path, risk, origin }
                 }
-                WatchEvent::RiskyChecked { path, outcome } => {
+                RtpEvent::RiskyChecked { path, outcome } => {
                     let file = widgets::file_name(&path.display().to_string());
                     match &outcome {
                         RiskyOutcome::NoThreatFound => system::notify(
@@ -1277,7 +1300,8 @@ impl App {
                     }
                     WatchMsg::RiskyChecked { path, outcome }
                 }
-                WatchEvent::Error(e) => WatchMsg::Error(e),
+                RtpEvent::Restarting { error, retry_in } => WatchMsg::Restarting { error, retry_in },
+                RtpEvent::Error(e) => WatchMsg::Error(e),
             };
             let _ = tx.send(msg);
             repaint.request_repaint();
@@ -1289,7 +1313,7 @@ impl App {
                 self.watch.running = true;
                 self.watch.since = Some(chrono::Local::now().format("%H:%M").to_string());
             }
-            Err(e) => self.log_activity(ActivityKind::Problem, "Folder protection failed to start", format!("{e:#}")),
+            Err(e) => self.log_activity(ActivityKind::Problem, "Real-time protection failed to start", format!("{e:#}")),
         }
     }
 
@@ -1314,39 +1338,88 @@ impl App {
         let mut changed_history = false;
         for msg in messages {
             match msg {
-                WatchMsg::Started { watching, failed } => {
+                WatchMsg::Started { watching, failed, programs } => {
                     self.watch.watching = watching;
-                    let text = format!("Watching {watching} folder(s)");
+                    self.watch.programs = programs;
+                    let mut text = format!("Watching {watching} folder(s)");
+                    if programs {
+                        text.push_str(" and programs as they start");
+                    }
                     for (folder, e) in &failed {
-                        self.log_activity(ActivityKind::Problem, format!("Cannot watch {}", folder.display()), e.clone());
+                        self.log_activity(
+                            ActivityKind::Problem,
+                            format!("Cannot watch {}", folder.display()),
+                            format!("{e}. Retrying every few seconds."),
+                        );
                     }
                     self.watch.failed = failed;
                     self.log_activity(ActivityKind::Info, text, "");
                     self.settings.watch_checkpoint = Some(unix_now());
                 }
-                WatchMsg::Detection(report) => {
-                    self.watch.threats += 1;
-                    let worst = report.worst().clone();
-                    self.log_file_activity(
-                        ActivityKind::Threat,
-                        format!("{} in {}", worst.threat, widgets::file_name(&report.path)),
-                        format!("{} · {}", report.path, report.action),
-                        (!report.action.starts_with("quarantined")).then(|| PathBuf::from(&report.path)),
+                WatchMsg::FolderLost { folder, reason } => {
+                    self.watch.watching = self.watch.watching.saturating_sub(1);
+                    self.log_activity(
+                        ActivityKind::Problem,
+                        format!("Stopped watching {}", folder.display()),
+                        format!("{reason}. It is watched again as soon as it is back."),
                     );
-                    self.notify(format!("Threat detected in a watched folder: {}", worst.threat), false);
+                    self.watch.failed.retain(|(f, _)| f != &folder);
+                    self.watch.failed.push((folder, reason));
                 }
-                WatchMsg::Scanned { files, threats } => {
-                    self.watch.files_checked += files;
-                    if files > 0 {
-                        let text = match threats {
-                            0 => format!("Checked {files} new file(s): clean"),
-                            n => format!("Checked {files} new file(s): {n} threat(s)"),
-                        };
-                        self.log_activity(ActivityKind::Info, text, "");
+                WatchMsg::FolderRestored(folder) => {
+                    self.watch.watching += 1;
+                    self.watch.failed.retain(|(f, _)| f != &folder);
+                    self.log_activity(ActivityKind::Info, format!("Watching {} again", folder.display()), "Checking files that changed meanwhile.");
+                }
+                WatchMsg::FolderRescan(folder) => self.log_activity(
+                    ActivityKind::Info,
+                    format!("Many changes at once in {}", folder.display()),
+                    "Windows dropped some change notices, so recent files are being rescanned.",
+                ),
+                WatchMsg::Detection { report, processes, repeat } => {
+                    if !repeat {
+                        self.watch.threats += 1;
+                        changed_history = true;
+                    }
+                    let worst = report.worst().clone();
+                    let mut detail = format!("{} · {}", report.path, report.action);
+                    for p in &processes {
+                        match &p.stopped {
+                            Some(Ok(())) => detail.push_str(&format!(" · stopped {} (pid {})", p.name, p.pid)),
+                            Some(Err(e)) => detail.push_str(&format!(" · could not stop {} (pid {}): {e}", p.name, p.pid)),
+                            None => detail.push_str(&format!(" · {} (pid {}) left running", p.name, p.pid)),
+                        }
+                    }
+                    let text = if repeat {
+                        format!("{} started again and was stopped: {}", widgets::file_name(&report.path), worst.threat)
+                    } else {
+                        format!("{} in {}", worst.threat, widgets::file_name(&report.path))
+                    };
+                    let quarantined = report.action.contains("quarantined (");
+                    self.log_file_activity(ActivityKind::Threat, text, detail, (!quarantined).then(|| PathBuf::from(&report.path)));
+                    if !repeat {
+                        let source = if processes.is_empty() { "in a watched folder" } else { "in a running program" };
+                        self.notify(format!("Threat detected {source}: {}", worst.threat), false);
+                    }
+                }
+                WatchMsg::Scanned { origin, files, threats } => {
+                    match origin {
+                        Origin::Folder => {
+                            self.watch.files_checked += files;
+                            if files > 0 {
+                                let text = match threats {
+                                    0 => format!("Checked {files} new file(s): clean"),
+                                    n => format!("Checked {files} new file(s): {n} threat(s)"),
+                                };
+                                self.log_activity(ActivityKind::Info, text, "");
+                            }
+                        }
+                        // Programs are checked constantly; only threats are logged.
+                        Origin::Program => self.watch.programs_checked += files,
                     }
                     self.settings.watch_checkpoint = Some(unix_now());
                     self.last_checkpoint = Instant::now();
-                    changed_history = true;
+                    changed_history |= threats > 0 || origin == Origin::Folder;
                 }
                 WatchMsg::RiskyFile { path, risk, origin } => {
                     let file = widgets::file_name(&path.display().to_string());
@@ -1372,7 +1445,15 @@ impl App {
                         RiskyOutcome::Threat(_) => {}
                     }
                 }
-                WatchMsg::Error(e) => self.log_activity(ActivityKind::Problem, "Watcher problem", e),
+                WatchMsg::Restarting { error, retry_in } => {
+                    self.watch.restarts += 1;
+                    self.log_activity(
+                        ActivityKind::Problem,
+                        format!("Protection hit a problem; restarting in {} s", retry_in.as_secs().max(1)),
+                        error,
+                    );
+                }
+                WatchMsg::Error(e) => self.log_activity(ActivityKind::Problem, "Protection problem", e),
             }
         }
         if changed_history {
@@ -1409,6 +1490,33 @@ impl App {
             Err(e) => self.notify(format!("Could not change start-up setting: {e:#}"), false),
         }
     }
+}
+
+/// Title and body of the "threat detected" notification; `repeat` for a
+/// program already detected that was started again.
+fn threat_notification(report: &FileReport, processes: &[ProcessHit], repeat: bool) -> (String, String) {
+    let worst = report.worst();
+    let file = widgets::file_name(&report.path);
+    let stopped = processes.iter().filter(|p| matches!(p.stopped, Some(Ok(())))).count();
+    let failed = processes.iter().filter(|p| matches!(p.stopped, Some(Err(_)))).count();
+    let title = if repeat {
+        format!("Stopped {file} again: {}", worst.threat)
+    } else if processes.is_empty() {
+        format!("Threat detected: {}", worst.threat)
+    } else {
+        format!("Threat running: {}", worst.threat)
+    };
+    let mut body = format!("{file} ({}). ", worst.category);
+    if stopped > 0 {
+        body.push_str("The program was stopped. ");
+    }
+    if failed > 0 {
+        body.push_str("It could not be stopped; close it yourself. ");
+    } else if !processes.is_empty() && stopped == 0 {
+        body.push_str("It is still running. ");
+    }
+    body.push_str(if report.action.contains("quarantined (") { "It was quarantined." } else { "Open Phalanx to review it." });
+    (title, body)
 }
 
 /// Title and body of the "a program just landed" notification.

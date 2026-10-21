@@ -52,16 +52,17 @@ target\release\phalanx.exe D:\folder  # open and scan immediately
 
 The app has these pages:
 
-* **Dashboard**: status (including threats that folder protection found but did not
-  remove), signature updates, monthly totals, and scan buttons. You can drop files
+* **Dashboard**: status (including threats that real-time protection found but did
+  not remove), signature updates, monthly totals, and scan buttons. You can drop files
   onto the window to scan them.
 * **Scan**: choose a **quick scan** (Downloads, Desktop, Documents, temp), a **full
   scan** (every file on the internal drives) or a **custom scan** (folders or
   files you pick); then live progress with a cancel button, and the detections.
   Select detections and quarantine them.
 * **Protection**: a read-only **Windows protection status** card (see below), and
-  folder watching. New files in watched folders (for example Downloads) are scanned
-  automatically and you get a Windows notification for each threat.
+  **real-time protection**: new files in watched folders (for example Downloads) and
+  every program that starts are scanned automatically, threats that are running are
+  stopped, and you get a Windows notification for each threat.
 * **Web protection**: block malware and phishing sites in your browsers (Browser
   Guard) and for the whole PC (DNS filter), check a site, manage allowed and
   blocked sites, and find dangerous browser extensions (see below).
@@ -70,7 +71,7 @@ The app has these pages:
 * **Quarantine**: restore or permanently delete isolated files.
 * **History**: every scan with its type, duration, files, data, threads, skipped
   and unreadable files, quarantined files and signature date. Expand a scan to see
-  its detections and errors. You can filter by manual scans or folder protection.
+  its detections and errors. You can filter by manual scans or real-time protection.
 * **Settings**, in tabs: **General** (startup, tray, notifications, data folder),
   **Scanning** (performance, detection, quarantine), **Exclusions**, **Signatures**
   and **AI inspection**.
@@ -78,15 +79,59 @@ The app has these pages:
 Layouts adapt to the window size: tiles reflow, button rows wrap, and long paths
 show the file name first.
 
-### Folder protection
+### Real-time protection
 
+Real-time protection (`src/rtp/`) follows the usual on-access antivirus pipeline,
+in user mode:
+
+```
+folder monitor ──┐                        ┌─ urgent lane: programs starting, new
+program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other files, catch-up
+                     disposition cache     │  (background priority)
+                                           └─ sweep lane: programs already running
+                                              at start (background priority)
+        ──▶ engine (hashes, YARA, heuristics; heuristic-only hits on signed
+            files dropped) ──▶ verdict cached ──▶ report, quarantine, stop
+```
+
+* **Watched folders.** Each folder has its own `ReadDirectoryChangesW` watch with a
+  64 KiB buffer. When Windows drops changes because too many happened at once (an
+  archive extracted into Downloads), the folder is rescanned for files changed in
+  the last 5 minutes instead of silently missing them. A folder moved or extracted
+  into a watched folder has its files scanned too.
 * **Scans finished downloads only.** A file is scanned once it has *settled*: no
   changes and an unchanged size for 3 seconds. Partial downloads (`.crdownload`,
   `.part`, `.tmp`…) are ignored until they are renamed to their final name.
-* **Light on resources.** It runs on one thread at Windows *background priority*
-  (lower CPU, disk and memory priority), so the PC stays responsive.
+* **Programs as they start.** The list of running programs is read twice a second,
+  and the program file of each new process is scanned in the urgent lane. A program
+  found to be malware is stopped (the process is identified
+  by id *and* creation time, so a reused process id is never mistaken for it) and,
+  with automatic quarantine on, quarantined once it has exited. A known threat that
+  is started again is stopped at once without rescanning. Only **malware** is
+  stopped: PUPs and hacking tools (often run on purpose) and suspicious (heuristic)
+  findings are reported and left running. Programs already running when protection
+  starts are checked in a lane of their own, in the background, so they never hold up
+  new files. Turn this off, or turn off stopping, on the
+  Protection page; clean program checks are not written to History.
+* **Signed software is trusted by heuristics.** A heuristic-only finding on a file
+  with a valid Authenticode signature, embedded or through a Windows security catalog
+  (how most of Windows is signed), is dropped. Revocation is not checked and nothing
+  is fetched from the network. Hash and YARA matches are always reported. This also
+  applies to manual scans (Settings > Scanning > Trust signed software).
+* **Disposition cache.** Each file version (path, size, modification and creation
+  time) is scanned once; opening, renaming back or relaunching it costs nothing.
+  The cache is cleared whenever signatures or settings change.
+* **Recovers by itself.** If any part fails or crashes, the whole pipeline restarts
+  after 2 s (doubling to at most 60 s while it keeps failing) and catches up on
+  files changed meanwhile. A watched folder that disappears (an unplugged drive) is
+  reported and watched again, with a catch-up scan, as soon as it is back; one that
+  is missing at start is retried the same way.
+* **Light on resources.** One file is scanned at a time per lane; everything but new
+  programs runs at Windows *background priority*. While a full-screen game or
+  presentation runs, the bulk lane waits (at most 10 minutes).
 * **Catches up.** Files that arrived while the app was closed are scanned the next
-  time it starts.
+  time it starts. A copied-in file counts as new even if it keeps an old
+  modification time.
 * **Keeps running when closed.** Closing the window keeps it running in the tray.
   Right-click the tray icon and choose **Quit** to stop it.
 * **Start with Windows.** This setting adds a per-user sign-in entry
@@ -402,8 +447,10 @@ phalanx-cli scan . --json                            # machine-readable report
 phalanx-cli scan . --rules my-rules\ --hashes bad.txt
 phalanx-cli scan D:\ --performance low-impact --exclude D:\VMs
 phalanx-cli watch %USERPROFILE%\Downloads --notify   # watch until Ctrl+C
+phalanx-cli watch %USERPROFILE%\Downloads --programs # also scan programs as they start
+phalanx-cli watch --programs --report-only           # programs only; never stop them
 
-phalanx-cli history [--kind watch]   # recent scans with full details
+phalanx-cli history [--kind watch]   # recent scans with full details (kinds: watch, process, ...)
 phalanx-cli detections       # recent detections
 phalanx-cli summary          # per-month totals
 phalanx-cli quarantine list
@@ -516,9 +563,15 @@ file is also detected, but your installed antivirus will probably remove it firs
 
 ## Limitations
 
-* Folder protection is not antivirus real-time protection. It scans files *after*
-  they land in watched folders and cannot block a program from running. There is
-  no kernel driver and no memory scanning.
+* Real-time protection runs in user mode, without a kernel driver, so nothing is
+  intercepted *before* it happens. Files are scanned after they land in watched
+  folders (not on every open elsewhere on the disk). Programs are checked within
+  about half a second of starting and stopped if they are known malware; a program
+  that runs for less than that can finish first, and it can act during that time.
+  DLLs a program loads, scripts run in memory (AMSI) and process memory are not
+  scanned, and there is no self-protection against malware stopping the app.
+* Without administrator rights, programs running as administrator cannot be
+  stopped; the detection still reports them.
 * Coverage is only as good as the feeds. YARA Forge core is tuned for low false
   positives rather than maximum coverage, and hash feeds only catch exact copies of
   known samples.

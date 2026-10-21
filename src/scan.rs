@@ -11,7 +11,7 @@ use crate::engine::Engine;
 use crate::engine::Verdict;
 use crate::quarantine::Quarantine;
 use crate::store::{ScanMeta, ScanStats, Store, MAX_STORED_ERRORS};
-use crate::{system, Category, Finding};
+use crate::{system, trust, Category, Finding, Source};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -60,6 +60,12 @@ pub struct ScanOptions {
     pub background: bool,
     /// When the signatures in use were last updated, recorded in history.
     pub signatures: Option<String>,
+    /// Drop heuristic-only findings on files with a valid Authenticode
+    /// signature (see [`crate::trust`]). Signature and hash matches stand.
+    pub trust_signed: bool,
+    /// Keep the history entry of a scan that found nothing. Real-time
+    /// protection turns this off for programs, which are checked constantly.
+    pub keep_clean_history: bool,
 }
 
 impl ScanOptions {
@@ -73,6 +79,8 @@ impl ScanOptions {
             threads: 1,
             background: true,
             signatures: None,
+            trust_signed: true,
+            keep_clean_history: true,
         }
     }
 }
@@ -231,7 +239,12 @@ pub fn run(
                     let msg = match fs::read(&path) {
                         Err(e) => WorkerMsg::Error(path.display().to_string(), e.to_string()),
                         Ok(data) => {
-                            let verdict = scanner.scan(&data);
+                            let mut verdict = scanner.scan(&data);
+                            let heuristic_only = !verdict.findings.is_empty()
+                                && verdict.findings.iter().all(|f| f.source == Source::Heuristic);
+                            if options.trust_signed && heuristic_only && trust::verify(&path).is_signed() {
+                                verdict.findings.clear();
+                            }
                             WorkerMsg::Scanned {
                                 bytes: data.len() as u64,
                                 data: (!verdict.findings.is_empty()).then_some(data),
@@ -317,6 +330,9 @@ pub fn run(
     let elapsed_ms = started.elapsed().as_millis();
     store.finish_scan(scan_id, &stats, elapsed_ms as i64, cancelled || outcome.is_err())?;
     outcome?;
+    if !options.keep_clean_history && stats.detections == 0 {
+        store.delete_scan(scan_id)?;
+    }
 
     Ok(ScanReport {
         scan_id,

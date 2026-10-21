@@ -8,13 +8,14 @@ pub mod heuristics;
 pub mod posture;
 pub mod quarantine;
 pub mod risk;
+pub mod rtp;
 pub mod scan;
 #[cfg(windows)]
 mod shortcut;
 pub mod store;
 pub mod system;
+pub mod trust;
 pub mod update;
-pub mod watch;
 pub mod web;
 
 use serde::Serialize;

@@ -264,6 +264,28 @@ impl Store {
         Ok(())
     }
 
+    /// Records the action taken on a detection after its scan finished (a
+    /// running program stopped, then quarantined); counts it as quarantined
+    /// in the scan when `quarantined`.
+    pub fn set_detection_action(&self, scan_id: i64, path: &str, action: &str, quarantined: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE Detections SET Action = ?3 WHERE ScanId = ?1 AND Path = ?2",
+            params![scan_id, path, action],
+        )?;
+        if quarantined {
+            self.conn.execute("UPDATE Scans SET Quarantined = Quarantined + 1 WHERE Id = ?1", [scan_id])?;
+        }
+        Ok(())
+    }
+
+    /// Removes a scan and everything recorded with it.
+    pub fn delete_scan(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM Detections WHERE ScanId = ?1", [id])?;
+        self.conn.execute("DELETE FROM ScanErrors WHERE ScanId = ?1", [id])?;
+        self.conn.execute("DELETE FROM Scans WHERE Id = ?1", [id])?;
+        Ok(())
+    }
+
     /// Newest first; `kind` limits the result to one scan kind.
     pub fn recent_scans(&self, limit: u32, kind: Option<&str>) -> Result<Vec<ScanRow>> {
         let mut stmt = self.conn.prepare(

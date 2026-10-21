@@ -16,6 +16,22 @@ pub fn enter_background_mode() {
     }
 }
 
+/// Whether an exclusive full-screen game or presentation mode is running, so
+/// non-urgent work can wait. "Busy" is not counted: Windows reports it for
+/// many ordinary windows, which would hold work back for no reason.
+pub fn fullscreen_app_running() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
+        let mut state = 0;
+        // SAFETY: plain FFI with a valid out-pointer.
+        let ok = unsafe { SHQueryUserNotificationState(&mut state) } >= 0;
+        ok && matches!(state, QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// Name shown in notifications, the Start menu and the window title.
 pub const APP_NAME: &str = "Phalanx";
 /// Identity Windows shows notifications under (System.AppUserModel.ID).
