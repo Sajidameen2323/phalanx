@@ -18,10 +18,10 @@ pub(super) struct AuditState {
 
 fn severity_color(s: Severity) -> Color32 {
     match s {
-        Severity::High => RED,
-        Severity::Medium => AMBER,
-        Severity::Low => YELLOW,
-        Severity::Info => GREEN,
+        Severity::High => theme().red,
+        Severity::Medium => theme().amber,
+        Severity::Low => theme().yellow,
+        Severity::Info => theme().green,
     }
 }
 
@@ -100,17 +100,13 @@ impl App {
     }
 
     pub(super) fn audit_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(
-            ui,
-            "Stealer check",
-            "Looks for what infostealers and the programs that install them leave behind: start-up entries, tasks, services, browser shortcuts and policies, proxy and hosts-file changes. Read-only.",
-        );
+        page_header(ui, "Stealer check");
 
         let (mut run, mut exclusions) = (false, false);
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if let Some((_, started)) = &self.audit.running {
-                    ui.add(egui::Spinner::new().color(ACCENT));
+                    spinner(ui);
                     muted(ui, format!("Checking… {}", fmt_duration(started.elapsed())));
                 } else {
                     run = primary_button(ui, if self.audit.report.is_some() { "Check again" } else { "Run stealer check" }).clicked();
@@ -158,14 +154,14 @@ impl App {
         if flagged.is_empty() {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    status_dot(ui, GREEN, 6.0);
-                    ui.label(RichText::new("Nothing suspicious found").size(17.0).strong().color(TEXT));
+                    status_dot(ui, theme().green, 6.0);
+                    ui.label(RichText::new("Nothing suspicious found").size(17.0).strong().color(theme().text));
                 });
                 muted(ui, "No start-up entry, task, service, browser shortcut, policy, proxy or hosts entry looks wrong. That lowers the odds that a stealer is still active, but cannot rule out one that has not been seen before.");
             });
             ui.add_space(14.0);
         } else if report.count(Severity::High) > 0 {
-            notice(ui, RED, "High-risk items: do not just delete them. Note where they are, run a Microsoft Defender Offline scan, and if Phalanx or Defender confirms malware, resetting Windows is the safest cleanup. Change passwords from another device.");
+            notice(ui, theme().red, "High-risk items: do not just delete them. Note where they are, run a Microsoft Defender Offline scan, and if Phalanx or Defender confirms malware, resetting Windows is the safest cleanup. Change passwords from another device.");
             ui.add_space(10.0);
         }
         for it in &flagged {
@@ -211,16 +207,16 @@ fn item_card(ui: &mut Ui, it: &AuditItem, ai_enabled: bool, action: &mut Option<
     card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             badge(ui, it.severity.label(), color);
-            badge(ui, it.kind.label(), MUTED);
-            ui.add(egui::Label::new(RichText::new(&it.title).strong().color(TEXT)).wrap());
+            badge(ui, it.kind.label(), theme().muted);
+            ui.add(egui::Label::new(RichText::new(&it.title).strong().color(theme().text)).wrap());
         });
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             for r in &it.reasons {
-                ui.add(egui::Label::new(RichText::new(format!("• {r}")).size(13.0).color(if it.severity > Severity::Info { color.lerp_to_gamma(TEXT, 0.35) } else { MUTED })).wrap());
+                ui.add(egui::Label::new(RichText::new(format!("• {r}")).size(13.0).color(if it.severity > Severity::Info { color.lerp_to_gamma(theme().text, 0.35) } else { theme().muted })).wrap());
             }
-            truncated(ui, format!("Where: {}", it.location), MUTED, 12.0);
+            truncated(ui, format!("Where: {}", it.location), theme().muted, 12.0);
             if !it.command.is_empty() {
-                ui.add(egui::Label::new(RichText::new(&it.command).monospace().size(11.5).color(MUTED)).truncate());
+                ui.add(egui::Label::new(RichText::new(&it.command).monospace().size(11.5).color(theme().muted)).truncate());
             }
             match &it.signature {
                 Signature::Signed { signer } => small(ui, format!("Signed by {signer}")),
@@ -231,7 +227,7 @@ fn item_card(ui: &mut Ui, it: &AuditItem, ai_enabled: bool, action: &mut Option<
             for d in &it.detections {
                 ui.horizontal_wrapped(|ui| {
                     badge(ui, &d.category.as_str().to_uppercase(), category_color(d.category));
-                    ui.label(RichText::new(&d.threat).color(TEXT));
+                    ui.label(RichText::new(&d.threat).color(theme().text));
                 });
             }
         });

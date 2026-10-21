@@ -1,7 +1,11 @@
 //! Desktop GUI for threat-scanner.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod brand;
 mod desktop;
+mod dots;
+mod mark;
+mod motion;
 mod pages;
 mod audit_page;
 mod web_page;
@@ -54,7 +58,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
             .with_icon(egui::IconData { rgba, width, height })
-            .with_inner_size([1040.0, 680.0])
+            .with_inner_size([1430.0, 780.0])
             .with_min_inner_size([560.0, 520.0])
             .with_visible(!background),
         ..Default::default()
@@ -92,9 +96,29 @@ enum SettingsTab {
     Ai,
 }
 
+/// Light, dark, or whatever Windows is set to.
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    fn preference(self) -> egui::ThemePreference {
+        match self {
+            Appearance::System => egui::ThemePreference::System,
+            Appearance::Light => egui::ThemePreference::Light,
+            Appearance::Dark => egui::ThemePreference::Dark,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 struct Settings {
+    appearance: Appearance,
     heuristics: bool,
     auto_quarantine: bool,
     quarantine_suspicious: bool,
@@ -139,6 +163,7 @@ impl Default for Settings {
     fn default() -> Self {
         let downloads = home_dir().map(|h| h.join("Downloads")).filter(|p| p.is_dir());
         Self {
+            appearance: Appearance::System,
             heuristics: true,
             auto_quarantine: false,
             quarantine_suspicious: false,
@@ -480,7 +505,13 @@ struct App {
     ai_models: Vec<String>,
     ai_models_rx: Option<Receiver<Result<Vec<String>, String>>>,
     audit: audit_page::AuditState,
-    logo: egui::TextureHandle,
+    logo: brand::Logo,
+    /// The dot-matrix scan stage, and which scan it is showing.
+    scan_fx: dots::ScanStage,
+    scan_run: u64,
+    hero_fx: dots::Hero,
+    /// The background before an appearance change, and when it changed.
+    theme_fade: Option<(egui::Color32, f64)>,
 }
 
 /// Writes the notification icon and registers the app's notification name
@@ -491,7 +522,11 @@ fn register_notifications(data_dir: &Path) -> Result<(), String> {
     let png = write_versioned(data_dir, "notification-icon", "png", widgets::ICON_PNG)?;
     let ico = write_versioned(data_dir, "app-icon", "ico", widgets::ICON_ICO)?;
     let exe = std::env::current_exe().map_err(|e| format!("finding this program: {e}"))?;
-    system::register_notification_identity(&png, &ico, &exe).map_err(|e| format!("{e:#}"))
+    // When the icon is built into the program, the shortcut uses it: the taskbar
+    // takes its icon from the shortcut and caches it by path, and the program's
+    // path does not change when the icon does.
+    let shortcut_icon = if cfg!(embedded_icon) { exe.clone() } else { ico };
+    system::register_notification_identity(&png, &shortcut_icon, &exe).map_err(|e| format!("{e:#}"))
 }
 
 /// Writes `bytes` to `<stem>-<content hash>.<ext>` in `dir` and deletes
@@ -603,7 +638,11 @@ impl App {
             ai_models: Vec::new(),
             ai_models_rx: None,
             audit: audit_page::AuditState::default(),
-            logo: widgets::logo_texture(ctx),
+            logo: brand::Logo::new(ctx),
+            scan_fx: dots::ScanStage::default(),
+            scan_run: 0,
+            hero_fx: dots::Hero::default(),
+            theme_fade: None,
         };
         app.reload_signatures(ctx);
         app.refresh();
@@ -898,6 +937,7 @@ impl App {
 
         self.results.clear();
         self.finished = None;
+        self.scan_run += 1;
         self.job = Some(ScanJob {
             rx,
             cancel,
@@ -1593,6 +1633,13 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let preference = self.settings.appearance.preference();
+        if ctx.options(|o| o.theme_preference) != preference {
+            ctx.set_theme(preference);
+        }
+        if let Some(previous) = widgets::sync_theme(&ctx) {
+            self.theme_fade = Some((previous, ctx.input(|i| i.time)));
+        }
         if std::mem::take(&mut self.start_hidden) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }

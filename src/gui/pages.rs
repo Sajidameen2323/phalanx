@@ -2,109 +2,156 @@
 //! button rows wrap, long text truncates, and the sidebar narrows.
 
 use super::*;
-use eframe::egui::{Align, Color32, FontId, Layout, Margin, RichText, Stroke, Ui, Vec2};
+use dots::{Outcome, StageMode, Symbol};
+use eframe::egui::{pos2, vec2, Align, Align2, FontId, Id, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use threat_scanner::posture::Status;
 use widgets::*;
 
+/// How long a toast stays up, in seconds.
+const TOAST_LIFE: f32 = 6.0;
+
 impl App {
     pub(super) fn draw(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let window = ui.max_rect();
         let narrow = ui.available_width() < 820.0;
         egui::Panel::left("nav")
-            .exact_size(if narrow { 168.0 } else { 214.0 })
+            .exact_size(if narrow { 176.0 } else { 222.0 })
             .resizable(false)
-            .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(Margin::same(12)))
+            .frame(egui::Frame::new().fill(theme().sidebar).inner_margin(Margin::symmetric(12, 16)))
             .show(ui, |ui| self.sidebar(ui));
 
-        let margin = if narrow { 16 } else { 28 };
+        // A page arrives with a short fade and rise. It is sprung, so a quick
+        // second click picks up from wherever the first one had got to.
+        let enter = Id::new("page-enter");
+        let shown: Option<Page> = ctx.data(|d| d.get_temp(Id::new("page-shown")));
+        if shown != Some(self.page) {
+            ctx.data_mut(|d| d.insert_temp(Id::new("page-shown"), self.page));
+            if shown.is_some() {
+                motion::set(ctx, enter, 0.0);
+            }
+        }
+        let t = motion::spring(ctx, enter, 1.0, 0.34, 1.0);
+
+        let margin: i8 = if narrow { 18 } else { 32 };
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(margin)))
+            .frame(egui::Frame::new().fill(theme().bg).inner_margin(Margin { left: margin, right: margin, top: 24, bottom: 0 }))
             .show(ui, |ui| {
-                self.toast_bar(ui);
+                self.toast_overlay(ui);
                 egui::ScrollArea::vertical()
+                    .id_salt(self.page as u8)
                     .auto_shrink([false; 2])
-                    .show(ui, |ui| match self.page {
-                        Page::Dashboard => self.dashboard(ui, ctx),
-                        Page::Scan => self.scan_page(ui, ctx),
-                        Page::Protection => self.protection_page(ui, ctx),
-                        Page::Web => self.web_page(ui, ctx),
-                        Page::Inspect => self.inspect_page(ui, ctx),
-                        Page::Privacy => self.privacy_page(ui, ctx),
-                        Page::Audit => self.audit_page(ui, ctx),
-                        Page::Quarantine => self.quarantine_page(ui),
-                        Page::History => self.history_page(ui),
-                        Page::Settings => self.settings_page(ui, ctx),
+                    .show(ui, |ui| {
+                        ui.multiply_opacity(t);
+                        ui.add_space((1.0 - t) * 14.0);
+                        match self.page {
+                            Page::Dashboard => self.dashboard(ui, ctx),
+                            Page::Scan => self.scan_page(ui, ctx),
+                            Page::Protection => self.protection_page(ui, ctx),
+                            Page::Web => self.web_page(ui, ctx),
+                            Page::Inspect => self.inspect_page(ui, ctx),
+                            Page::Privacy => self.privacy_page(ui, ctx),
+                            Page::Audit => self.audit_page(ui, ctx),
+                            Page::Quarantine => self.quarantine_page(ui),
+                            Page::History => self.history_page(ui),
+                            Page::Settings => self.settings_page(ui, ctx),
+                        }
+                        ui.add_space(28.0);
                     });
             });
+
+        // An appearance change eases over from the old background instead of cutting.
+        if let Some((previous, since)) = self.theme_fade {
+            let fade = 1.0 - motion::settle((ctx.input(|i| i.time) - since) as f32, 0.45);
+            if fade <= 0.01 {
+                self.theme_fade = None;
+            } else {
+                let layer = egui::LayerId::new(egui::Order::Foreground, Id::new("theme-fade"));
+                ctx.layer_painter(layer).rect_filled(window, 0.0, previous.gamma_multiply(fade));
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
-        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(self.logo.id(), Vec2::splat(38.0))));
-            ui.add_space(2.0);
-            ui.label(RichText::new(APP_TITLE.to_uppercase()).size(17.0).strong().extra_letter_spacing(1.5).color(TEXT));
+            ui.add_space(4.0);
+            self.logo.show(ui, 30.0);
+            ui.add_space(4.0);
+            brand::wordmark(ui, 12.5, theme().text);
         });
-        ui.add_space(20.0);
+        ui.add_space(18.0);
 
         let quarantined = self.quarantine.len();
-        let protection = if self.watch.running { Some(("on".to_string(), GREEN)) } else { None };
+        let protection = if self.watch.running { Some(("On".to_string(), theme().green)) } else { None };
         let inspecting = self.inspect.running.is_some() || self.inspect.preparing.is_some();
         let privacy = self
             .privacy
             .as_deref()
             .and_then(posture::score)
             .map(|s| (s.percent.to_string(), score_color(s.percent)));
+        // Grouped by what the user is doing: protect, investigate, review, configure.
         let items = [
-            (Page::Dashboard, "Dashboard", None),
-            (Page::Scan, "Scan", self.job.as_ref().map(|_| ("running".to_string(), ACCENT))),
-            (Page::Protection, "Protection", protection),
-            (Page::Web, "Web protection", self.web.running().then(|| ("on".to_string(), GREEN))),
-            (Page::Inspect, "AI Inspect", inspecting.then(|| ("working".to_string(), ACCENT))),
-            (Page::Privacy, "Privacy", privacy),
-            (Page::Audit, "Stealer check", self.audit_busy().then(|| ("checking".to_string(), ACCENT))),
-            (Page::Quarantine, "Quarantine", (quarantined > 0).then(|| (quarantined.to_string(), ACCENT))),
-            (Page::History, "History", None),
-            (Page::Settings, "Settings", None),
+            (Page::Dashboard, "Dashboard", None, false),
+            (Page::Scan, "Scan", self.job.as_ref().map(|_| ("Running".to_string(), theme().accent)), false),
+            (Page::Protection, "Protection", protection, false),
+            (Page::Web, "Web protection", self.web.running().then(|| ("On".to_string(), theme().green)), false),
+            (Page::Inspect, "AI Inspect", inspecting.then(|| ("Working".to_string(), theme().accent)), true),
+            (Page::Privacy, "Privacy", privacy, false),
+            (Page::Audit, "Stealer check", self.audit_busy().then(|| ("Checking".to_string(), theme().accent)), false),
+            (Page::Quarantine, "Quarantine", (quarantined > 0).then(|| (quarantined.to_string(), theme().muted)), true),
+            (Page::History, "History", None, false),
+            (Page::Settings, "Settings", None, true),
         ];
-        for (page, label, badge) in items {
-            let active = self.page == page;
-            let text = RichText::new(label).size(14.5).color(if active { TEXT } else { MUTED });
-            let button = egui::Button::new(text)
-                .fill(if active { CARD } else { Color32::TRANSPARENT })
-                .stroke(Stroke::NONE)
-                .corner_radius(8.0)
-                .min_size(Vec2::new(ui.available_width(), 38.0));
-            let response = ui.add(button);
-            if let Some((badge, color)) = badge {
-                let pos = response.rect.right_center() - Vec2::new(14.0, 0.0);
-                ui.painter().text(pos, egui::Align2::RIGHT_CENTER, badge, FontId::proportional(12.0), color);
+        // The selection is one pill that glides between rows, painted under them.
+        let pill = ui.painter().add(egui::Shape::Noop);
+        let mut selected = None;
+        for (page, label, badge, gap) in items {
+            if gap {
+                ui.add_space(12.0);
             }
-            if response.clicked() {
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+            let active = self.page == page;
+            if active {
+                selected = Some(rect);
+            }
+            let hover = motion::spring(ui.ctx(), response.id.with("hover"), (response.hovered() && !active) as u8 as f32, 0.2, 1.0);
+            if hover > 0.001 {
+                ui.painter().rect_filled(rect, 10.0, theme().hover.gamma_multiply(hover * 0.6));
+            }
+            let (font, color) = if active { (semibold(14.0), theme().text) } else { (FontId::proportional(14.0), theme().nav_text) };
+            ui.painter().text(rect.left_center() + vec2(12.0, 0.0), Align2::LEFT_CENTER, label, font, color);
+            if let Some((badge, color)) = badge {
+                ui.painter().text(rect.right_center() - vec2(12.0, 0.0), Align2::RIGHT_CENTER, badge, FontId::proportional(12.0), color);
+            }
+            if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.page = page;
                 self.pending_delete = None;
             }
         }
+        if let Some(target) = selected {
+            let top = motion::spring(ui.ctx(), Id::new("nav-pill"), target.top(), 0.32, 1.0);
+            let rect = Rect::from_min_size(pos2(target.left(), top), target.size());
+            ui.painter().set(pill, egui::Shape::rect_filled(rect, 10.0, theme().control));
+        }
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             let counts = match &self.signatures {
-                _ if self.engine_rx.is_some() => "loading signatures…".to_string(),
+                _ if self.engine_rx.is_some() => "Loading signatures…".to_string(),
                 Ok((rules, hashes)) => format!("{rules} rules · {hashes} hashes"),
-                Err(_) => "signatures failed to load".to_string(),
+                Err(_) => "Signatures failed to load".to_string(),
             };
             let updated = self
                 .manifest
                 .last_success()
-                .map(|t| format!("updated {}", short_time(t)))
-                .unwrap_or_else(|| "signatures never updated".into());
-            small(ui, updated);
-            small(ui, counts);
+                .map(|t| format!("Updated {}", short_time(t)))
+                .unwrap_or_else(|| "Signatures never updated".into());
             small(ui, format!("v{}", env!("CARGO_PKG_VERSION")));
+            small(ui, counts);
+            small(ui, updated);
         });
     }
 
     fn dashboard(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(ui, "Dashboard", "Scan files and folders for malware, potentially unwanted programs and hacking tools.");
-
         // Threats from any scan (manual or real-time protection) in the last 7
         // days that were not quarantined need attention.
         let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).to_rfc3339();
@@ -114,165 +161,178 @@ impl App {
             .filter(|s| s.started_at >= week_ago && s.detections > s.quarantined)
             .collect();
         let last_manual = self.scans.iter().find(|s| s.finished_at.is_some() && !is_protection_kind(&s.kind));
-        let (color, title, detail) = if let Some(latest) = unresolved.first() {
-            let count: i64 = unresolved.iter().map(|s| s.detections - s.quarantined).sum();
+        let threat_count: i64 = unresolved.iter().map(|s| s.detections - s.quarantined).sum();
+        let (color, symbol, title, detail) = if let Some(job) = &self.job {
+            (theme().accent, Symbol::Dash, "Scanning".to_string(), format!("{} files checked", job.files))
+        } else if let Some(latest) = unresolved.first() {
             let found_by = if is_protection_kind(&latest.kind) { "real-time protection" } else { "a scan" };
             (
-                RED,
-                "Threats need your review",
-                format!(
-                    "{count} threat(s) found in the last 7 days were not removed. Latest found by {found_by} on {}. Review them in History.",
-                    short_time(&latest.started_at)
-                ),
+                theme().red,
+                Symbol::Alert,
+                "Threats need review".to_string(),
+                format!("{threat_count} not removed in the last 7 days · latest found by {found_by}, {}", short_time(&latest.started_at)),
             )
         } else {
             match last_manual {
-                None => (AMBER, "No scans yet", "Run your first scan to check this PC.".to_string()),
+                None => (theme().amber, Symbol::Dash, "No scans yet".to_string(), "Run a quick scan to check this PC.".to_string()),
                 Some(s) => (
-                    GREEN,
-                    "No threats found",
-                    format!("Last scan {} checked {} files.", short_time(&s.started_at), s.files_scanned),
+                    theme().green,
+                    Symbol::Check,
+                    "No threats found".to_string(),
+                    format!("Last scan {} · {} files", short_time(&s.started_at), s.files_scanned),
                 ),
             }
         };
-        let mut open_protection = false;
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(46.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 23.0, color.gamma_multiply(0.18));
-                ui.painter().circle_filled(rect.center(), 9.0, color);
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(title).size(20.0).strong().color(TEXT));
-                    muted(ui, detail);
-                });
-            });
-            ui.add_space(6.0);
-            ui.separator();
+        let scanning = self.job.is_some() || self.queued_scan.is_some();
+
+        // ---- the hero: an open dot field, no frame ----
+        let width = ui.available_width();
+        let narrow = width < 760.0;
+        let viewport = ui.clip_rect().height();
+        let hero_height = if narrow { 300.0 } else { (viewport * 0.6).clamp(340.0, 500.0) };
+        let (rect, _) = ui.allocate_exact_size(vec2(width, hero_height), Sense::hover());
+        let half = (hero_height * 0.34).min(170.0);
+        let (center, clear) = if narrow {
+            (pos2(rect.center().x, rect.center().y), Rect::NOTHING)
+        } else {
+            let center = pos2(rect.left() + (width * 0.21).max(half * 1.2), rect.center().y);
+            let left = center.x + half * 1.25;
+            (center, Rect::from_min_max(pos2(left, rect.center().y - 86.0), pos2(rect.right() - 24.0, rect.center().y + 86.0)))
+        };
+        let status = dots::HeroStatus { color, symbol, live: self.watch.running, threats: threat_count.max(0) as usize };
+        self.hero_fx.show(ui, rect, center, half, clear, status);
+
+        let (mut quick, mut full, mut folder, mut view, mut review) = (false, false, false, false, false);
+        let mut headline = |ui: &mut Ui| {
+            ui.label(RichText::new(&title).font(bold(if narrow { 30.0 } else { 40.0 })).extra_letter_spacing(-1.0).color(theme().text));
+            ui.add(egui::Label::new(RichText::new(&detail).size(15.0).color(theme().muted)).wrap());
+            ui.add_space(18.0);
             ui.horizontal_wrapped(|ui| {
-                if self.watch.running {
-                    status_dot(ui, GREEN, 4.5);
-                    let programs = if self.watch.programs {
-                        format!(" and programs as they start ({} checked)", self.watch.programs_checked)
-                    } else {
-                        String::new()
-                    };
-                    ui.label(format!(
-                        "Real-time protection is on: watching {} folder(s), {} new file(s) checked{programs}",
-                        self.watch.watching, self.watch.files_checked
-                    ));
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if scanning {
+                    view = primary_button(ui, "View scan").clicked();
                 } else {
-                    status_dot(ui, MUTED, 4.5);
-                    ui.label("Real-time protection is off.");
-                    open_protection = small_button(ui, "Set up").clicked();
+                    quick = primary_button(ui, "Quick scan").clicked();
+                    full = secondary_button(ui, "Full scan").clicked();
+                    folder = secondary_button(ui, "Scan folder").clicked();
+                }
+                if threat_count > 0 && !scanning {
+                    review = secondary_button(ui, "Review threats").clicked();
                 }
             });
-            if let Some(checks) = &self.security {
-                let risks = checks.iter().filter(|c| c.status == Status::Risk).count();
-                let issues = risks + checks.iter().filter(|c| c.status == Status::Attention).count();
-                ui.horizontal_wrapped(|ui| {
-                    if issues == 0 {
-                        status_dot(ui, GREEN, 4.5);
-                        ui.label("Windows protections are on.");
-                    } else {
-                        status_dot(ui, if risks > 0 { RED } else { AMBER }, 4.5);
-                        ui.label(format!("{issues} Windows protection setting(s) need attention."));
-                        open_protection |= small_button(ui, "Review").clicked();
-                    }
+        };
+        if narrow {
+            ui.add_space(4.0);
+            headline(ui);
+        } else {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(clear.shrink2(vec2(0.0, 4.0))).layout(Layout::top_down(Align::Min)), |ui| headline(ui));
+            // The headline sits inside the hero; carry on below the hero, not below the headline.
+            let below = rect.bottom() - ui.cursor().top();
+            if below > 0.0 {
+                ui.add_space(below);
+            }
+        }
+        if quick {
+            self.start_scan(ctx, quick_scan_targets(), "quick");
+        }
+        if full {
+            self.start_scan(ctx, system::fixed_drives(), "full");
+        }
+        if folder {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.start_scan(ctx, vec![dir], "custom");
+            }
+        }
+        if view {
+            self.page = Page::Scan;
+        }
+        if review {
+            self.page = Page::History;
+        }
+        ui.add_space(10.0);
+
+        // ---- this month, as a strip of figures ----
+        let this_month = chrono::Local::now().format("%Y-%m").to_string();
+        let month = self.months.first().filter(|m| m.month == this_month);
+        let figures = [
+            ("Scans this month", month.map_or(0, |m| m.scans).to_string()),
+            ("Files scanned", month.map_or(0, |m| m.files_scanned).to_string()),
+            ("Threats found", month.map_or(0, |m| m.detections).to_string()),
+            ("In quarantine", self.quarantine.len().to_string()),
+        ];
+        let per_row = if narrow { 2 } else { 4 };
+        for row in figures.chunks(per_row) {
+            let (strip, _) = ui.allocate_exact_size(vec2(width, 66.0), Sense::hover());
+            let column = strip.width() / per_row as f32;
+            let painter = ui.painter();
+            for (i, (label, value)) in row.iter().enumerate() {
+                let x = strip.left() + column * i as f32 + if i == 0 { 0.0 } else { 22.0 };
+                if i > 0 {
+                    painter.vline(strip.left() + column * i as f32, (strip.top() + 8.0)..=(strip.bottom() - 8.0), Stroke::new(1.0, theme().hairline));
+                }
+                painter.text(pos2(x, strip.top() + 4.0), Align2::LEFT_TOP, value, semibold(30.0), theme().text);
+                painter.text(pos2(x, strip.top() + 44.0), Align2::LEFT_TOP, *label, FontId::proportional(12.5), theme().muted);
+            }
+        }
+        ui.add_space(18.0);
+
+        // ---- status, as a plain list ----
+        let mut open_protection = false;
+        let mut update_clicked = false;
+        row_divider(ui);
+        if self.watch.running {
+            let mut parts = vec![format!("{} folder(s)", self.watch.watching), format!("{} files checked", self.watch.files_checked)];
+            if self.watch.programs {
+                parts.push(format!("{} programs checked", self.watch.programs_checked));
+            }
+            setting_row(ui, "Real-time protection", &parts.join(" · "), |ui| badge(ui, "On", theme().green));
+        } else {
+            setting_row(ui, "Real-time protection", "Off", |ui| {
+                open_protection |= small_button(ui, "Turn on").clicked();
+            });
+        }
+        if let Some(checks) = &self.security {
+            let risks = checks.iter().filter(|c| c.status == Status::Risk).count();
+            let issues = risks + checks.iter().filter(|c| c.status == Status::Attention).count();
+            row_divider(ui);
+            if issues == 0 {
+                setting_row(ui, "Windows protections", "All on", |ui| badge(ui, "On", theme().green));
+            } else {
+                setting_row(ui, "Windows protections", &format!("{issues} setting(s) need attention"), |ui| {
+                    open_protection |= small_button(ui, "Review").clicked();
+                    badge(ui, if risks > 0 { "At risk" } else { "Review" }, if risks > 0 { theme().red } else { theme().amber });
                 });
+            }
+        }
+        row_divider(ui);
+        let counts = match &self.signatures {
+            _ if self.engine_rx.is_some() => "Loading…".into(),
+            Ok((r, h)) => format!("{r} rules · {h} hashes · {} web rules", self.web.counts.blocking()),
+            Err(_) => "Failed to load".into(),
+        };
+        let every = match (self.settings.auto_update, self.settings.auto_update_hours) {
+            (false, _) => "Auto-update off".to_string(),
+            (true, 1) => "Auto-update hourly".to_string(),
+            (true, h) => format!("Auto-update every {h} hours"),
+        };
+        let summary = match (&self.updating, self.manifest.last_success()) {
+            (Some(job), _) => job.step.clone(),
+            (None, Some(t)) => format!("Updated {} · {counts} · {every}", short_time(t)),
+            (None, None) => format!("Never updated · built-in set only · {every}"),
+        };
+        setting_row(ui, "Signatures", &summary, |ui| {
+            if self.updating.is_some() || self.update_check_rx.is_some() {
+                spinner(ui);
+            } else {
+                update_clicked = small_button(ui, "Check now").clicked();
             }
         });
         if open_protection {
             self.page = Page::Protection;
         }
-        ui.add_space(14.0);
-
-        let mut update_clicked = false;
-        card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.vertical(|ui| {
-                    section_title(ui, "Signatures");
-                    let counts = match &self.signatures {
-                        _ if self.engine_rx.is_some() => "loading…".into(),
-                        Ok((r, h)) => format!("{r} rules · {h} known-bad hashes"),
-                        Err(_) => "failed to load".into(),
-                    };
-                    match self.manifest.last_success() {
-                        Some(t) => muted(ui, format!("Updated {} · {counts} · {} web rules", short_time(t), self.web.counts.blocking())),
-                        None => {
-                            ui.label(RichText::new("Never updated: only the small built-in set is active.").color(AMBER));
-                        }
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                if let Some(job) = &self.updating {
-                    ui.add(egui::Spinner::new().color(ACCENT));
-                    truncated(ui, job.step.clone(), MUTED, 13.0);
-                    return;
-                }
-                if self.update_check_rx.is_some() {
-                    ui.add(egui::Spinner::new().color(ACCENT));
-                    muted(ui, "Checking feeds for new data…");
-                    return;
-                }
-                let checked = self
-                    .settings
-                    .last_update_check
-                    .map(|t| format!(", last checked {} ago", fmt_duration(Duration::from_secs(unix_now().saturating_sub(t)))))
-                    .unwrap_or_default();
-                if self.settings.auto_update {
-                    status_dot(ui, GREEN, 4.0);
-                    let every = match self.settings.auto_update_hours {
-                        1 => "every hour".to_string(),
-                        h => format!("every {h} hours"),
-                    };
-                    muted(ui, format!("Updates automatically {every}{checked}"));
-                } else {
-                    status_dot(ui, AMBER, 4.0);
-                    muted(ui, format!("Automatic updates are off{checked}"));
-                }
-                update_clicked = small_button(ui, "Check now").clicked();
-            });
-        });
         if update_clicked {
             self.start_update(ctx, false);
         }
-        ui.add_space(14.0);
-
-        let this_month = chrono::Local::now().format("%Y-%m").to_string();
-        let month = self.months.first().filter(|m| m.month == this_month);
-        stat_tiles(
-            ui,
-            &[
-                ("Scans this month", month.map_or(0, |m| m.scans).to_string()),
-                ("Files scanned", month.map_or(0, |m| m.files_scanned).to_string()),
-                ("Threats found", month.map_or(0, |m| m.detections).to_string()),
-                ("In quarantine", self.quarantine.len().to_string()),
-            ],
-        );
-        ui.add_space(14.0);
-
-        section_title(ui, "Start a scan");
-        ui.add_space(4.0);
-        self.scan_modes(ui, ctx);
-        ui.horizontal_wrapped(|ui| {
-            let threads = system::worker_threads(self.settings.performance);
-            small(
-                ui,
-                format!(
-                    "Performance: {} ({threads} thread(s){}). Change it in Settings.",
-                    self.settings.performance.label(),
-                    if self.settings.performance.background() { ", background priority" } else { "" }
-                ),
-            );
-            if small_button(ui, "Inspect a file with AI…").clicked() {
-                if let Some(file) = rfd::FileDialog::new().pick_file() {
-                    self.inspect_file(ctx, file);
-                }
-            }
-        });
     }
 
     /// The three ways to start a scan, as tiles that reflow with the width.
@@ -297,33 +357,33 @@ impl App {
             ui.columns(per_row, |cols| {
                 for (col, mode) in cols.iter_mut().zip(row) {
                     card(col, |ui| {
-                        ui.set_min_height(132.0);
+                        ui.set_min_height(112.0);
                         let (title, text) = match mode {
-                            Mode::Quick => ("Quick scan", "Downloads, Desktop, Documents and the temp folder, where downloaded threats usually land. Usually a few minutes.".to_string()),
-                            Mode::Full => ("Full scan", format!("Every file on your internal drives ({drive_list}). Can take an hour or more; you can keep working.")),
-                            Mode::Custom => ("Custom scan", "Choose folders or files to check. You can also drop them onto this window.".to_string()),
+                            Mode::Quick => ("Quick scan", "Downloads, Desktop, Documents, Temp".to_string()),
+                            Mode::Full => ("Full scan", format!("All internal drives · {drive_list}")),
+                            Mode::Custom => ("Custom scan", "Folders or files you choose".to_string()),
                         };
                         section_title(ui, title);
                         // Columns justify wrapped text; a plain top-down layout does not.
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            ui.add(egui::Label::new(RichText::new(text).size(12.5).color(MUTED)).wrap());
+                            ui.add(egui::Label::new(RichText::new(text).size(12.5).color(theme().muted)).wrap());
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
                         ui.add_enabled_ui(!busy, |ui| {
                             ui.horizontal_wrapped(|ui| match mode {
                                 Mode::Quick => {
-                                    if primary_button(ui, "Start quick scan").clicked() {
+                                    if primary_button(ui, "Start scan").clicked() {
                                         start = Some((quick_scan_targets(), "quick"));
                                     }
                                 }
                                 Mode::Full => {
-                                    if secondary_button(ui, "Start full scan").clicked() {
+                                    if secondary_button(ui, "Start scan").clicked() {
                                         start = Some((drives.clone(), "full"));
                                     }
                                 }
                                 Mode::Custom => {
-                                    pick_folder = secondary_button(ui, "Folder…").clicked();
-                                    pick_files = secondary_button(ui, "Files…").clicked();
+                                    pick_folder = secondary_button(ui, "Choose folder").clicked();
+                                    pick_files = secondary_button(ui, "Choose files").clicked();
                                 }
                             });
                         });
@@ -333,7 +393,7 @@ impl App {
         }
         if busy {
             ui.add_space(4.0);
-            small(ui, "A scan is running. Cancel it on the Scan page to start another.");
+            small(ui, "Scan in progress");
         }
         if pick_folder {
             if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -351,20 +411,22 @@ impl App {
     }
 
     fn scan_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(ui, "Scan", "Choose a scan, follow its progress and review what it found.");
+        page_header(ui, "Scan");
 
         if let Some(job) = &self.job {
+            let cancelling = job.cancel.load(Ordering::Relaxed);
+            self.scan_fx.show(ui, self.scan_run, StageMode::Scanning { files: job.files, threats: self.results.len(), cancelling });
+            ui.add_space(14.0);
             let mut cancel = false;
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(24.0).color(ACCENT));
-                    let state = if job.cancel.load(Ordering::Relaxed) { "Cancelling…" } else { "Scanning…" };
-                    ui.label(RichText::new(state).size(18.0).strong().color(TEXT));
+                    let state = if cancelling { "Cancelling" } else { "Scanning" };
+                    ui.label(RichText::new(state).font(semibold(18.0)).color(theme().text));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        cancel = secondary_button(ui, "Cancel").clicked();
+                        cancel = ui.add_enabled_ui(!cancelling, |ui| secondary_button(ui, "Cancel scan").clicked()).inner;
                     });
                 });
-                truncated(ui, job.targets.clone(), MUTED, 13.0);
+                truncated(ui, job.targets.clone(), theme().muted, 13.0);
                 ui.add_space(8.0);
                 facts(
                     ui,
@@ -374,11 +436,11 @@ impl App {
                         ("Threats", self.results.len().to_string()),
                         ("Elapsed", fmt_duration(job.started.elapsed())),
                         ("Threads", job.threads.to_string()),
-                        ("Type", job.kind.clone()),
+                        ("Type", capitalize(&job.kind)),
                     ],
                 );
                 ui.add_space(4.0);
-                truncated(ui, job.current.clone(), MUTED, 12.0);
+                truncated(ui, job.current.clone(), theme().muted, 12.0);
             });
             if cancel {
                 job.cancel.store(true, Ordering::Relaxed);
@@ -387,23 +449,23 @@ impl App {
         } else if self.queued_scan.is_some() {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(24.0).color(ACCENT));
-                    ui.label(RichText::new("Loading signatures…").size(18.0).strong().color(TEXT));
+                    spinner(ui);
+                    ui.label(RichText::new("Loading signatures").font(semibold(16.0)).color(theme().text));
                 });
-                muted(ui, "The scan starts as soon as the rules are compiled.");
             });
             return;
         } else if let Some(done) = &self.finished {
-            let (color, title) = match (done.cancelled, done.infected) {
-                (true, _) => (AMBER, "Scan cancelled".to_string()),
-                (false, 0) => (GREEN, "No threats found".to_string()),
-                (false, n) => (RED, format!("{n} threat(s) found")),
+            let (outcome, title) = match (done.cancelled, done.infected) {
+                (true, _) => (Outcome::Cancelled, "Scan cancelled".to_string()),
+                (false, 0) => (Outcome::Clean, "No threats found".to_string()),
+                (false, n) => (Outcome::Threats, format!("{n} threat(s) found")),
             };
+            self.scan_fx.show(ui, self.scan_run, StageMode::Done(outcome));
+            ui.add_space(14.0);
             let mut new_scan = false;
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    status_dot(ui, color, 6.0);
-                    ui.label(RichText::new(title).size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(title).font(semibold(18.0)).color(theme().text));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         new_scan = secondary_button(ui, "New scan").clicked();
                     });
@@ -465,11 +527,7 @@ impl App {
     }
 
     fn protection_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(
-            ui,
-            "Protection",
-            "Real-time protection scans new files in watched folders once they finish downloading, and every program as it starts.",
-        );
+        page_header(ui, "Protection");
 
         self.security_card(ui, ctx);
         ui.add_space(14.0);
@@ -479,14 +537,14 @@ impl App {
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let (color, title) = match (self.settings.watch_enabled, self.watch.running) {
-                    (true, true) if !self.watch.failed.is_empty() => (AMBER, "Real-time protection is on, with problems"),
-                    (true, true) => (GREEN, "Real-time protection is on"),
-                    (true, false) if nothing_to_protect => (AMBER, "Add a folder or turn on program protection"),
-                    (true, false) => (AMBER, "Starting…"),
-                    (false, _) => (MUTED, "Real-time protection is off"),
+                    (true, true) if !self.watch.failed.is_empty() => (theme().amber, "Real-time protection is on, with problems"),
+                    (true, true) => (theme().green, "Real-time protection is on"),
+                    (true, false) if nothing_to_protect => (theme().amber, "Add a folder or turn on program protection"),
+                    (true, false) => (theme().amber, "Starting…"),
+                    (false, _) => (theme().muted, "Real-time protection is off"),
                 };
                 status_dot(ui, color, 6.0);
-                ui.label(RichText::new(title).size(18.0).strong().color(TEXT));
+                ui.label(RichText::new(title).size(18.0).strong().color(theme().text));
             });
             if self.watch.running {
                 let mut items = vec![
@@ -520,20 +578,19 @@ impl App {
         let mut add = false;
         card(ui, |ui| {
             section_title(ui, "Watched folders");
-            muted(ui, "Includes subfolders and folders moved or extracted into them. Partial downloads (.crdownload, .part…) are scanned once they are complete. A folder that disappears (an unplugged drive) is watched again as soon as it is back.");
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             if self.settings.watch_folders.is_empty() {
-                small(ui, "No folders yet.");
+                small(ui, "No folders watched");
             }
             for (i, folder) in self.settings.watch_folders.iter().enumerate() {
                 let failed = self.watch.failed.iter().find(|(f, _)| f == folder);
                 ui.horizontal(|ui| {
-                    status_dot(ui, if failed.is_some() { RED } else if self.watch.running { GREEN } else { MUTED }, 4.0);
+                    status_dot(ui, if failed.is_some() { theme().red } else if self.watch.running { theme().green } else { theme().muted }, 4.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if small_button(ui, "Remove").clicked() {
                             remove = Some(i);
                         }
-                        truncated(ui, folder.display().to_string(), TEXT, 13.5);
+                        truncated(ui, folder.display().to_string(), theme().text, 13.5);
                     });
                 });
                 if let Some((_, e)) = failed {
@@ -562,7 +619,7 @@ impl App {
         ui.add_space(14.0);
 
         card(ui, |ui| {
-            group_title(ui, "Program protection", "Checks the program file of everything that starts on this PC, wherever it is.");
+            group_title(ui, "Program protection", "");
             setting_toggle(
                 ui,
                 &mut self.settings.program_protection,
@@ -582,30 +639,13 @@ impl App {
         ui.add_space(14.0);
 
         card(ui, |ui| {
-            section_title(ui, "How it behaves");
-            muted(ui, if self.settings.risky_file_alerts {
-                "Programs, scripts and disk images are announced the moment they land, before you open them, and their scan result follows a few seconds later."
-            } else {
-                "Alerts for new programs and scripts are off; turn them on in Settings > General."
-            });
-            muted(ui, "Files already checked are remembered until they change or signatures are updated, so opening or moving them costs nothing. If part of protection fails it restarts by itself and checks what changed meanwhile.");
-            ui.add_space(4.0);
+            group_title(ui, "Behavior", "");
             setting_toggle(
                 ui,
                 &mut self.settings.defer_when_fullscreen,
                 "Wait during games and presentations",
                 "Ordinary files are scanned after a full-screen game or presentation ends (at most 10 minutes later). New programs are always checked straight away.",
             );
-            muted(ui, format!(
-                "Threat notifications are {}. {}",
-                if self.settings.notifications { "on" } else { "off" },
-                if self.autostart {
-                    "Starts in the tray when you sign in to Windows."
-                } else {
-                    "Turn on \"Start with Windows\" in Settings to protect from sign-in."
-                }
-            ));
-            muted(ui, format!("Files that arrive while {APP_TITLE} is closed are checked the next time it starts."));
         });
         ui.add_space(14.0);
 
@@ -614,17 +654,17 @@ impl App {
         card(ui, |ui| {
             section_title(ui, "Recent activity");
             if self.activity.is_empty() {
-                small(ui, "Nothing yet.");
+                small(ui, "No activity yet");
             }
             for item in self.activity.iter().take(40) {
                 let color = match item.kind {
-                    ActivityKind::Threat => RED,
-                    ActivityKind::Risky | ActivityKind::Problem => AMBER,
-                    ActivityKind::Info => MUTED,
+                    ActivityKind::Threat => theme().red,
+                    ActivityKind::Risky | ActivityKind::Problem => theme().amber,
+                    ActivityKind::Info => theme().muted,
                 };
                 ui.horizontal(|ui| {
                     status_dot(ui, color, 3.5);
-                    ui.label(RichText::new(&item.time).size(12.0).color(MUTED));
+                    ui.label(RichText::new(&item.time).size(12.0).color(theme().muted));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let (true, Some(path)) = (ai_enabled, &item.path) {
                             if path.is_file() && small_button(ui, "Inspect with AI").clicked() {
@@ -632,15 +672,15 @@ impl App {
                             }
                         }
                         let text_color = match item.kind {
-                            ActivityKind::Threat => RED,
-                            ActivityKind::Risky => AMBER,
-                            _ => TEXT,
+                            ActivityKind::Threat => theme().red,
+                            ActivityKind::Risky => theme().amber,
+                            _ => theme().text,
                         };
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| truncated(ui, item.text.clone(), text_color, 13.0));
                     });
                 });
                 if !item.detail.is_empty() {
-                    truncated(ui, item.detail.clone(), MUTED, 12.0);
+                    truncated(ui, item.detail.clone(), theme().muted, 12.0);
                 }
             }
         });
@@ -650,18 +690,15 @@ impl App {
     }
 
     fn quarantine_page(&mut self, ui: &mut Ui) {
-        page_header(ui, "Quarantine", "Isolated files are encoded so they cannot run. Restore puts a file back exactly where it was.");
+        page_header(ui, "Quarantine");
         if self.quarantine.is_empty() {
-            card(ui, |ui| {
-                section_title(ui, "Quarantine is empty");
-                muted(ui, "Files you quarantine will appear here.");
-            });
+            card(ui, |ui| muted(ui, "Quarantine is empty"));
             return;
         }
         let mut action: Option<(String, bool)> = None;
         for item in &self.quarantine {
             card(ui, |ui| {
-                ui.label(RichText::new(&item.threat).size(15.0).strong().color(TEXT));
+                ui.label(RichText::new(&item.threat).font(semibold(15.0)).color(theme().text));
                 path_lines(ui, &item.original_path);
                 small(ui, format!("{} · {}", short_time(&item.quarantined_at), fmt_bytes(item.size)));
                 ui.horizontal_wrapped(|ui| {
@@ -687,7 +724,7 @@ impl App {
     }
 
     fn history_page(&mut self, ui: &mut Ui) {
-        page_header(ui, "History", "Every scan on this PC, with what it checked, what it found and how long it took.");
+        page_header(ui, "History");
 
         let this_month = chrono::Local::now().format("%Y-%m").to_string();
         let month = self.months.first().filter(|m| m.month == this_month);
@@ -735,14 +772,14 @@ impl App {
             let expanded = self.expanded.get(&s.id);
             card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    let kind_color = if is_protection_kind(&s.kind) { GREEN } else { ACCENT };
+                    let kind_color = if is_protection_kind(&s.kind) { theme().green } else { theme().accent };
                     badge(ui, &s.kind.to_uppercase(), kind_color);
-                    ui.label(RichText::new(format!("#{} · {}", s.id, short_time(&s.started_at))).strong().color(TEXT));
+                    ui.label(RichText::new(format!("#{} · {}", s.id, short_time(&s.started_at))).strong().color(theme().text));
                     let (status, color) = match (&s.finished_at, s.cancelled, s.detections) {
-                        (None, _, _) => ("Incomplete".to_string(), AMBER),
-                        (_, true, _) => ("Cancelled".to_string(), AMBER),
-                        (_, _, 0) => ("Clean".to_string(), GREEN),
-                        (_, _, n) => (format!("{n} threat(s)"), RED),
+                        (None, _, _) => ("Incomplete".to_string(), theme().amber),
+                        (_, true, _) => ("Cancelled".to_string(), theme().amber),
+                        (_, _, 0) => ("Clean".to_string(), theme().green),
+                        (_, _, n) => (format!("{n} threat(s)"), theme().red),
                     };
                     badge(ui, &status, color);
                 });
@@ -759,7 +796,7 @@ impl App {
                         ("Signatures", s.signatures.as_deref().map(short_time).unwrap_or_else(|| "built-in".into())),
                     ],
                 );
-                truncated(ui, s.targets.clone(), MUTED, 12.5);
+                truncated(ui, s.targets.clone(), theme().muted, 12.5);
                 let has_details = s.detections > 0 || s.errors > 0;
                 if has_details {
                     let label = if expanded.is_some() { "Hide details" } else { "Show details" };
@@ -772,7 +809,7 @@ impl App {
                     for d in &details.detections {
                         ui.horizontal(|ui| {
                             badge(ui, &d.category.to_uppercase(), category_color_str(&d.category));
-                            truncated(ui, format!("{} · {}", d.threat, d.source), TEXT, 13.0);
+                            truncated(ui, format!("{} · {}", d.threat, d.source), theme().text, 13.0);
                         });
                         path_lines(ui, &d.path);
                         small(ui, format!("Action: {}", d.action));
@@ -781,7 +818,7 @@ impl App {
                         ui.add_space(4.0);
                         small(ui, format!("Could not read {} file(s):", s.errors));
                         for e in details.errors.iter().take(30) {
-                            truncated(ui, format!("{}: {}", e.path, e.message), MUTED, 12.0);
+                            truncated(ui, format!("{}: {}", e.path, e.message), theme().muted, 12.0);
                         }
                         if s.errors > 30 {
                             small(ui, format!("…and {} more", s.errors - 30));
@@ -810,7 +847,7 @@ impl App {
     }
 
     fn settings_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(ui, "Settings", "Changes are saved automatically.");
+        page_header(ui, "Settings");
         ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
                 (SettingsTab::General, "General"),
@@ -842,6 +879,19 @@ impl App {
     }
 
     fn settings_general(&mut self, ui: &mut Ui) {
+        card(ui, |ui| {
+            group_title(ui, "Appearance", "");
+            setting_row(ui, "Theme", "", |ui| {
+                // Right to left, so the choices read System, Light, Dark.
+                for (appearance, label) in [(Appearance::Dark, "Dark"), (Appearance::Light, "Light"), (Appearance::System, "System")] {
+                    if chip(ui, label, self.settings.appearance == appearance) {
+                        self.settings.appearance = appearance;
+                    }
+                }
+            });
+        });
+        ui.add_space(14.0);
+
         let mut autostart = self.autostart;
         let has_tray = self.tray.is_some();
         card(ui, |ui| {
@@ -889,11 +939,11 @@ impl App {
             );
             row_divider(ui);
             let (description, label, color) = match &self.notification_identity {
-                Ok(()) => ("Notifications pop up with this app's name and icon. A Start-menu shortcut named Phalanx is needed for that.", APP_TITLE, GREEN),
+                Ok(()) => ("Notifications pop up with this app's name and icon. A Start-menu shortcut named Phalanx is needed for that.", APP_TITLE, theme().green),
                 Err(_) => (
                     "The app's name could not be registered, so Windows shows notifications as Windows PowerShell.",
                     "PowerShell",
-                    AMBER,
+                    theme().amber,
                 ),
             };
             setting_row(ui, "Shown as", description, |ui| {
@@ -1015,7 +1065,7 @@ impl App {
                         if small_button(ui, "Remove").clicked() {
                             remove = Some(i);
                         }
-                        truncated(ui, path.display().to_string(), TEXT, 13.5);
+                        truncated(ui, path.display().to_string(), theme().text, 13.5);
                     });
                 });
             }
@@ -1064,7 +1114,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if self.update_check_rx.is_some() {
-                    ui.add(egui::Spinner::new().color(ACCENT));
+                    spinner(ui);
                     muted(ui, "Checking feeds for new data…");
                 } else {
                     let status = match &self.update_check {
@@ -1091,7 +1141,7 @@ impl App {
                 _ if self.engine_rx.is_some() => muted(ui, "Loading signatures…"),
                 Ok((rules, hashes)) => muted(ui, format!("Loaded {rules} YARA rules and {hashes} known-bad hashes.")),
                 Err(e) => {
-                    ui.label(RichText::new(format!("Failed to load: {e}")).color(RED));
+                    ui.label(RichText::new(format!("Failed to load: {e}")).color(theme().red));
                 }
             }
             ui.add_space(6.0);
@@ -1099,9 +1149,9 @@ impl App {
                 let status = self.manifest.sources.iter().find(|s| s.name == source.name);
                 ui.horizontal_wrapped(|ui| {
                     let color = match status {
-                        Some(s) if s.ok => GREEN,
-                        Some(_) => RED,
-                        None => MUTED,
+                        Some(s) if s.ok => theme().green,
+                        Some(_) => theme().red,
+                        None => theme().muted,
                     };
                     status_dot(ui, color, 4.0);
                     ui.label(source.name);
@@ -1112,14 +1162,14 @@ impl App {
                     small(ui, when);
                 });
                 if let Some(s) = status {
-                    truncated(ui, s.message.clone(), if s.ok { MUTED } else { RED }, 12.0);
+                    truncated(ui, s.message.clone(), if s.ok { theme().muted } else { theme().red }, 12.0);
                 }
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if let Some(job) = &self.updating {
-                    ui.add(egui::Spinner::new().color(ACCENT));
-                    truncated(ui, job.step.clone(), MUTED, 13.0);
+                    spinner(ui);
+                    truncated(ui, job.step.clone(), theme().muted, 13.0);
                 } else {
                     update_clicked = primary_button(ui, "Update now").clicked();
                 }
@@ -1157,7 +1207,7 @@ impl App {
             ui.add_space(8.0);
             notice(
                 ui,
-                AMBER,
+                theme().amber,
                 "What is sent to Google: scripts and other text files are sent as text, up to the limit below. Programs and other binaries are never uploaded; only facts extracted on this PC (structure, imported functions, readable strings). On Gemini's free tier Google may use what you send to improve its products, so don't inspect files that contain personal or confidential information.",
             );
         });
@@ -1171,9 +1221,9 @@ impl App {
             card(ui, |ui| {
                 group_title(ui, "Gemini connection", "");
                 let (state, color) = match (saved, from_env) {
-                    (true, _) => ("Saved", GREEN),
-                    (false, true) => ("From environment", GREEN),
-                    _ => ("Not set", AMBER),
+                    (true, _) => ("Saved", theme().green),
+                    (false, true) => ("From environment", theme().green),
+                    _ => ("Not set", theme().amber),
                 };
                 setting_row(
                     ui,
@@ -1267,7 +1317,7 @@ impl App {
                 section_title(ui, "Windows protection status");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if self.posture_rx.is_some() {
-                        ui.add(egui::Spinner::new().color(ACCENT));
+                        spinner(ui);
                     } else {
                         recheck = small_button(ui, "Check again").clicked();
                     }
@@ -1276,17 +1326,10 @@ impl App {
                     }
                 });
             });
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!("{APP_TITLE} checks files; these Windows features block threats while programs run. Reading them changes nothing. A Turn on button changes one setting, only after you confirm and approve Windows' administrator prompt."))
-                        .color(MUTED),
-                )
-                .wrap(),
-            );
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             let Some(checks) = &self.security else {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().color(ACCENT));
+                    spinner(ui);
                     muted(ui, "Reading Windows Security settings…");
                 });
                 return;
@@ -1301,7 +1344,7 @@ impl App {
                             0 => "Your Windows protections are on".to_string(),
                             n => format!("{n} setting(s) need attention"),
                         };
-                        ui.label(RichText::new(title).size(16.0).strong().color(TEXT));
+                        ui.label(RichText::new(title).size(16.0).strong().color(theme().text));
                         let unknown = if score.unknown > 0 { format!(" {} could not be read.", score.unknown) } else { String::new() };
                         muted(ui, format!("{on} of {} scored protections are on.{unknown}", score.scored));
                     });
@@ -1352,13 +1395,13 @@ impl App {
     /// Confirmation for an administrator fix: shows the exact command first.
     fn fix_confirmation(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         if let Some(note) = &self.fix_note {
-            notice(ui, AMBER, note);
+            notice(ui, theme().amber, note);
             ui.add_space(10.0);
         }
         if self.fix_rx.is_some() {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().color(ACCENT));
+                    spinner(ui);
                     muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
                 });
             });
@@ -1370,11 +1413,11 @@ impl App {
         let (mut run, mut cancel) = (false, false);
         card(ui, |ui| {
             section_title(ui, if restarts { "Run Microsoft Defender Offline scan?" } else { "Change this Windows setting?" });
-            ui.add(egui::Label::new(RichText::new(fix.effect).color(TEXT)).wrap());
+            ui.add(egui::Label::new(RichText::new(fix.effect).color(theme().text)).wrap());
             ui.add_space(4.0);
             muted(ui, "Phalanx runs exactly this command as administrator. Windows asks for your permission first:");
-            egui::Frame::new().fill(BG).corner_radius(6.0).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
-                ui.label(RichText::new(fix.command).monospace().color(TEXT));
+            egui::Frame::new().fill(theme().bg).corner_radius(6.0).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+                ui.label(RichText::new(fix.command).monospace().color(theme().text));
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1393,15 +1436,11 @@ impl App {
     }
 
     fn privacy_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(
-            ui,
-            "Privacy",
-            "A checklist of Windows settings that decide how much this PC shares about you. Read-only: Phalanx never changes them.",
-        );
+        page_header(ui, "Privacy");
         let Some(checks) = self.privacy.clone() else {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().color(ACCENT));
+                    spinner(ui);
                     muted(ui, "Reading privacy settings…");
                 });
             });
@@ -1415,7 +1454,7 @@ impl App {
                     Some(score) => {
                         score_badge(ui, score.percent);
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(format!("Privacy level: {}", posture::level(score.percent))).size(18.0).strong().color(TEXT));
+                            ui.label(RichText::new(format!("Privacy level: {}", posture::level(score.percent))).size(18.0).strong().color(theme().text));
                             let private = checks.iter().filter(|c| c.status == Status::Good && c.weight > 0).count();
                             let unknown = if score.unknown > 0 { format!(" {} could not be read.", score.unknown) } else { String::new() };
                             muted(ui, format!("{private} of {} scored settings are private.{unknown}", score.scored));
@@ -1423,12 +1462,12 @@ impl App {
                         });
                     }
                     None => {
-                        ui.label(RichText::new("Privacy level unknown").size(18.0).strong().color(TEXT));
+                        ui.label(RichText::new("Privacy level unknown").size(18.0).strong().color(theme().text));
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     if self.posture_rx.is_some() {
-                        ui.add(egui::Spinner::new().color(ACCENT));
+                        spinner(ui);
                     } else {
                         recheck = small_button(ui, "Check again").clicked();
                     }
@@ -1477,11 +1516,7 @@ impl App {
     }
 
     fn inspect_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(
-            ui,
-            "AI Inspect",
-            "Ask Google Gemini to read a file you are unsure about and explain what it would do. Works best on scripts such as .py, .ps1, .js and .bat.",
-        );
+        page_header(ui, "AI Inspect");
         let has_key = self.settings.ai_key_protected.is_some() || std::env::var("GEMINI_API_KEY").is_ok_and(|k| !k.trim().is_empty());
         let ready = self.settings.ai_enabled && has_key;
         if !ready {
@@ -1523,14 +1558,14 @@ impl App {
             }
             if !recent.is_empty() {
                 ui.add_space(8.0);
-                ui.label(RichText::new("Recently found by real-time protection").strong().color(TEXT));
+                ui.label(RichText::new("Recently found by real-time protection").strong().color(theme().text));
                 for p in recent.into_iter().take(6) {
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if small_button(ui, "Inspect").clicked() {
                                 pick = Some(p.clone());
                             }
-                            truncated(ui, p.display().to_string(), TEXT, 13.0);
+                            truncated(ui, p.display().to_string(), theme().text, 13.0);
                         });
                     });
                 }
@@ -1547,7 +1582,7 @@ impl App {
         if self.inspect.preparing.is_some() {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().color(ACCENT));
+                    spinner(ui);
                     muted(ui, "Checking the file on this PC…");
                 });
             });
@@ -1558,8 +1593,8 @@ impl App {
             Some(Err(e)) => {
                 let e = e.clone();
                 card(ui, |ui| {
-                    ui.label(RichText::new("Could not read the file").strong().color(RED));
-                    ui.add(egui::Label::new(RichText::new(e).color(MUTED)).wrap());
+                    ui.label(RichText::new("Could not read the file").strong().color(theme().red));
+                    ui.add(egui::Label::new(RichText::new(e).color(theme().muted)).wrap());
                 });
                 return;
             }
@@ -1580,15 +1615,15 @@ impl App {
                 ],
             );
             if let Some(d) = evidence.risk.as_ref().and_then(|r| r.disguise.as_ref()) {
-                notice(ui, AMBER, &format!("Disguised name: {d}."));
+                notice(ui, theme().amber, &format!("Disguised name: {d}."));
             }
             ui.add_space(4.0);
             match &evidence.local_findings {
                 None => small(ui, "Local scan: skipped because signatures were still loading."),
                 Some(f) if f.is_empty() => {
                     ui.horizontal_wrapped(|ui| {
-                        status_dot(ui, GREEN, 4.0);
-                        ui.label(RichText::new("Local scan: no known threats.").color(TEXT));
+                        status_dot(ui, theme().green, 4.0);
+                        ui.label(RichText::new("Local scan: no known threats.").color(theme().text));
                         small(ui, "That does not prove a file is safe.");
                     });
                 }
@@ -1596,18 +1631,18 @@ impl App {
                     for x in f {
                         ui.horizontal_wrapped(|ui| {
                             badge(ui, &x.category.as_str().to_uppercase(), category_color(x.category));
-                            ui.label(RichText::new(&x.threat).strong().color(TEXT));
+                            ui.label(RichText::new(&x.threat).strong().color(theme().text));
                             small(ui, format!("found by {}", x.source.as_str()));
                         });
                     }
                 }
             }
             ui.add_space(8.0);
-            ui.label(RichText::new("What will be sent to Google Gemini").strong().color(TEXT));
+            ui.label(RichText::new("What will be sent to Google Gemini").strong().color(theme().text));
             for line in evidence.sent_summary() {
                 ui.horizontal_wrapped(|ui| {
-                    status_dot(ui, MUTED, 2.5);
-                    ui.add(egui::Label::new(RichText::new(line).size(12.5).color(MUTED)).wrap());
+                    status_dot(ui, theme().muted, 2.5);
+                    ui.add(egui::Label::new(RichText::new(line).size(12.5).color(theme().muted)).wrap());
                 });
             }
             small(ui, format!("Model: {}", self.settings.ai_model));
@@ -1628,8 +1663,8 @@ impl App {
             let elapsed = started.elapsed();
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(22.0).color(ACCENT));
-                    ui.label(RichText::new("Gemini is reading the file…").size(16.0).strong().color(TEXT));
+                    spinner(ui);
+                    ui.label(RichText::new("Gemini is reading the file…").size(16.0).strong().color(theme().text));
                     small(ui, fmt_duration(elapsed));
                 });
             });
@@ -1641,8 +1676,8 @@ impl App {
             None => {}
             Some(Err(e)) => {
                 card(ui, |ui| {
-                    ui.label(RichText::new("The inspection failed").strong().color(RED));
-                    ui.add(egui::Label::new(RichText::new(e).color(MUTED)).wrap());
+                    ui.label(RichText::new("The inspection failed").strong().color(theme().red));
+                    ui.add(egui::Label::new(RichText::new(e).color(theme().muted)).wrap());
                     ui.add_space(6.0);
                     again = secondary_button(ui, "Try again").clicked();
                 });
@@ -1662,32 +1697,32 @@ impl App {
                         });
                     });
                     ui.add_space(6.0);
-                    ui.add(egui::Label::new(RichText::new(&a.summary).color(TEXT)).wrap());
+                    ui.add(egui::Label::new(RichText::new(&a.summary).color(theme().text)).wrap());
                     if a.manipulation_attempt {
                         ui.add_space(4.0);
-                        notice(ui, RED, "The file contains text aimed at the AI or at security scanners, trying to influence the verdict. That is a strong sign of malicious intent.");
+                        notice(ui, theme().red, "The file contains text aimed at the AI or at security scanners, trying to influence the verdict. That is a strong sign of malicious intent.");
                     }
                     let local_hit = evidence.local_findings.as_ref().is_some_and(|f| !f.is_empty());
                     if local_hit && a.verdict == ai::Verdict::Safe {
                         ui.add_space(4.0);
-                        notice(ui, AMBER, "The local scanner flagged this file even though the AI did not. Trust the scanner's detection.");
+                        notice(ui, theme().amber, "The local scanner flagged this file even though the AI did not. Trust the scanner's detection.");
                     }
                     if !a.behaviors.is_empty() {
                         ui.add_space(8.0);
-                        ui.label(RichText::new("What it does").strong().color(TEXT));
+                        ui.label(RichText::new("What it does").strong().color(theme().text));
                         for b in &a.behaviors {
                             ui.horizontal_wrapped(|ui| {
                                 badge(ui, &b.severity.to_uppercase(), severity_color(&b.severity));
-                                ui.add(egui::Label::new(RichText::new(&b.title).strong().color(TEXT)).wrap());
+                                ui.add(egui::Label::new(RichText::new(&b.title).strong().color(theme().text)).wrap());
                             });
-                            ui.add(egui::Label::new(RichText::new(&b.evidence).monospace().size(12.0).color(MUTED)).wrap());
+                            ui.add(egui::Label::new(RichText::new(&b.evidence).monospace().size(12.0).color(theme().muted)).wrap());
                             ui.add_space(4.0);
                         }
                     }
                     if !a.recommendation.is_empty() {
                         ui.add_space(4.0);
-                        ui.label(RichText::new("What to do").strong().color(TEXT));
-                        ui.add(egui::Label::new(RichText::new(&a.recommendation).color(TEXT)).wrap());
+                        ui.label(RichText::new("What to do").strong().color(theme().text));
+                        ui.add(egui::Label::new(RichText::new(&a.recommendation).color(theme().text)).wrap());
                     }
                     ui.add_space(8.0);
                     let tokens = match (report.prompt_tokens, report.output_tokens) {
@@ -1721,24 +1756,50 @@ impl App {
         }
     }
 
-    fn toast_bar(&mut self, ui: &mut Ui) {
+    /// The latest notice, floating over the top of the page. It drops in on a
+    /// spring, so a new notice arriving mid-animation carries on smoothly, and
+    /// fades out at the end of its life.
+    fn toast_overlay(&mut self, ui: &mut Ui) {
         let Some(toast) = &self.toast else { return };
-        if toast.shown.elapsed() > Duration::from_secs(6) {
+        let age = toast.shown.elapsed().as_secs_f32();
+        if age > TOAST_LIFE {
             self.toast = None;
             return;
         }
-        let color = if toast.ok { GREEN } else { RED };
-        egui::Frame::new()
-            .fill(color.gamma_multiply(0.14))
-            .stroke(Stroke::new(1.0, color.gamma_multiply(0.5)))
-            .corner_radius(8.0)
-            .inner_margin(Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new(&toast.text).color(TEXT));
+        let ctx = ui.ctx().clone();
+        let id = Id::new("toast");
+        let key: Option<Instant> = ctx.data(|d| d.get_temp(id.with("shown")));
+        if key != Some(toast.shown) {
+            ctx.data_mut(|d| d.insert_temp(id.with("shown"), toast.shown));
+            motion::set(&ctx, id, 0.0);
+        }
+        let enter = motion::spring(&ctx, id, 1.0, 0.45, 0.8);
+        let exit = ((TOAST_LIFE - age) / 0.35).clamp(0.0, 1.0);
+        let panel = ui.max_rect();
+        let color = if toast.ok { theme().green } else { theme().red };
+        egui::Area::new(id)
+            .order(egui::Order::Foreground)
+            .pivot(Align2::CENTER_TOP)
+            .fixed_pos(pos2(panel.center().x, panel.top() - 30.0 + 34.0 * enter))
+            .interactable(false)
+            .show(&ctx, |ui| {
+                ui.multiply_opacity(enter.clamp(0.0, 1.0) * exit);
+                egui::Frame::new()
+                    .fill(theme().toast)
+                    .stroke(Stroke::new(1.0, theme().toast_edge))
+                    .corner_radius(20.0)
+                    .inner_margin(Margin::symmetric(16, 10))
+                    .shadow(egui::Shadow { offset: [0, 10], blur: 28, spread: 0, color: theme().shadow })
+                    .show(ui, |ui| {
+                        ui.set_max_width((panel.width() - 40.0).clamp(200.0, 560.0));
+                        ui.horizontal(|ui| {
+                            status_dot(ui, color, 3.5);
+                            ui.add(egui::Label::new(RichText::new(&toast.text).color(theme().text)).wrap());
+                        });
+                    });
             });
-        ui.add_space(12.0);
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        let next = if exit < 1.0 { 16 } else { ((TOAST_LIFE - 0.35 - age).max(0.0) * 1000.0) as u64 };
+        ctx.request_repaint_after(Duration::from_millis(next));
     }
 }
 
@@ -1748,32 +1809,32 @@ fn detection_card(ui: &mut Ui, row: &mut ResultRow, ai_enabled: bool) -> bool {
     let color = category_color(worst.category);
     let mut inspect = false;
     egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(10.0)
-        .inner_margin(Margin::same(14))
+        .fill(theme().card)
+        .stroke(Stroke::new(1.0, theme().hairline))
+        .corner_radius(14.0)
+        .inner_margin(Margin::same(16))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 let selectable = row.report.action == "reported";
                 ui.add_enabled(selectable, egui::Checkbox::without_text(&mut row.selected));
                 badge(ui, &worst.category.as_str().to_uppercase(), color);
-                ui.label(RichText::new(&worst.threat).size(15.0).strong().color(TEXT));
+                ui.label(RichText::new(&worst.threat).font(semibold(15.0)).color(theme().text));
                 let (text, c) = if row.report.action.starts_with("quarantined") {
-                    ("Quarantined", GREEN)
+                    ("Quarantined", theme().green)
                 } else if row.report.action.starts_with("quarantine failed") {
-                    ("Quarantine failed", RED)
+                    ("Quarantine failed", theme().red)
                 } else {
-                    ("Not removed", MUTED)
+                    ("Not removed", theme().muted)
                 };
                 ui.label(RichText::new(text).size(12.5).color(c));
             });
             path_lines(ui, &row.report.path);
             for f in &row.report.findings {
-                truncated(ui, format!("{} · {}", f.source.as_str(), f.details), MUTED, 12.0);
+                truncated(ui, format!("{} · {}", f.source.as_str(), f.details), theme().muted, 12.0);
             }
             if row.report.action.starts_with("quarantine failed") {
-                truncated(ui, row.report.action.clone(), RED, 12.0);
+                truncated(ui, row.report.action.clone(), theme().red, 12.0);
             }
             if ai_enabled && !row.report.action.starts_with("quarantined") {
                 inspect = small_button(ui, "Inspect with AI").clicked();
