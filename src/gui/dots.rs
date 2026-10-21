@@ -546,9 +546,9 @@ pub struct HeroStatus {
     pub color: Color32,
     /// Real-time protection is running: the field pulses outward from the shield.
     pub live: bool,
-    /// Unresolved threats, shown as warm embers in the field.
+    /// Unresolved threats, shown as warm embers around the shield.
     pub threats: usize,
-    /// A scan is running: the shield unwinds into a turning helix.
+    /// A scan is running: the shield holds still and takes the arrows.
     pub scan: Option<HeroScan>,
 }
 
@@ -557,6 +557,10 @@ const PULSE_EVERY: f32 = 5.0;
 const PULSE_LIFE: f32 = 2.4;
 /// Distance to the viewer, in points: smaller gives a stronger perspective.
 const FOCAL: f32 = 1100.0;
+/// How fast an arrow crosses the field, in points per second.
+const ARROW_SPEED: f32 = 820.0;
+/// An arrow's length, in lattice cells.
+const ARROW_CELLS: i32 = 7;
 
 #[derive(Clone, Copy)]
 struct V3 {
@@ -575,9 +579,6 @@ impl V3 {
     }
     fn scale(self, k: f32) -> V3 {
         v3(self.x * k, self.y * k, self.z * k)
-    }
-    fn lerp(self, o: V3, t: f32) -> V3 {
-        self.add(v3(o.x - self.x, o.y - self.y, o.z - self.z).scale(t))
     }
     fn dot(self, o: V3) -> f32 {
         self.x * o.x + self.y * o.y + self.z * o.z
@@ -608,6 +609,30 @@ struct Particle {
     alpha: f32,
 }
 
+/// A file, as an arrow flying in from the right along one row of the
+/// lattice, and how far across the shield's face it strikes (0 at the
+/// shield's right edge, 1 at its middle).
+struct Arrow {
+    born: f64,
+    row: i32,
+    depth: f32,
+    threat: bool,
+}
+
+/// A spark knocked off the shield by a blocked arrow.
+struct Spark {
+    at: Pos2,
+    velocity: Vec2,
+    born: f64,
+}
+
+/// A threat's arrow, stuck in the shield's face where it struck (offset
+/// from the shield's centre).
+struct Stuck {
+    at: Vec2,
+    born: f64,
+}
+
 /// The dashboard's open field of dots, with no frame: it fades out at its
 /// edges into the window. Out of it rises the logo's shield, built of dots
 /// with real depth: a curved face with the P standing proud of it.
@@ -616,11 +641,15 @@ struct Particle {
 ///   curved path; the P's dots arrive last, so the letter writes itself in.
 /// - The shield turns to face the pointer wherever it is in the window, and
 ///   is lit from the upper left: as it turns, a sheen slides across the face
-///   and the silver P catches the light. At rest it sways very slightly.
-/// - During a scan the shield unwinds into a three-strand helix around a
-///   bright core (the P), turning faster the faster files are scanned; each
-///   file sparks a dot in the field and each threat sends a red shockwave.
-///   When the scan ends the helix winds back into the shield.
+///   and the P catches the light. At rest it sways very slightly.
+/// - During a scan it holds still and takes the hits. Every file is an
+///   arrow of dots that runs in from the right along a row of the lattice,
+///   in volleys, faster as the scan speeds up, and strikes the face. A
+///   clean file breaks on it: the face flares where it was struck, the
+///   shield gives a little and sparks fall away. A threat is a red arrow
+///   that sticks, its shaft left standing out of the face, with a red
+///   shockwave across the field. When the scan ends the shield flashes the
+///   result colour; stuck arrows stay until the next scan.
 /// - Dots part around the pointer; clicking the shield bursts it and it
 ///   springs back together; clicking the field sends a ripple. While
 ///   real-time protection runs, a pulse leaves the shield every few seconds.
@@ -630,8 +659,6 @@ pub struct Hero {
     rows: i32,
     /// Pointer displacement per field dot, eased.
     offsets: Vec<Vec2>,
-    /// Brightness left on field dots by scanned files.
-    flash: Vec<f32>,
     born: Option<f64>,
     burst: Option<f64>,
     ripples: Vec<Ripple>,
@@ -641,12 +668,28 @@ pub struct Hero {
     color: Option<[f32; 3]>,
     files_seen: i64,
     threats_seen: usize,
-    /// Files per second, smoothed, and the helix's turn.
+    /// Files per second, smoothed, and arrows owed to the volley.
     rate: f32,
-    spin: f32,
-    /// Which part of the shield each dot is on (and how far down it is),
-    /// for the layout it was computed for.
-    cells: Vec<Option<(super::brand::Part, f32)>>,
+    owed: f32,
+    threats_due: usize,
+    arrows: Vec<Arrow>,
+    sparks: Vec<Spark>,
+    stuck: Vec<Stuck>,
+    /// Where arrows struck the face (offset from the centre), when, and
+    /// whether it was a threat.
+    impacts: Vec<(Vec2, f64, bool)>,
+    /// How hard the last arrows knocked the shield, easing off.
+    recoil: f32,
+    /// A scan ran since the shield last flashed its result, and when it did.
+    scanned: bool,
+    flashed: Option<f64>,
+    /// The dots of the shield (offset from its centre, on the P or not, how
+    /// far down, and an index for randomness), which field dots it covers,
+    /// and how far right the shield reaches on each lattice row, for the
+    /// layout they were computed for.
+    shield_dots: Vec<(Vec2, bool, f32, u32)>,
+    covered: Vec<bool>,
+    reach: Vec<Option<f32>>,
     cells_for: Option<[i32; 5]>,
 }
 
@@ -681,9 +724,12 @@ impl Hero {
         if cols != self.cols || rows != self.rows {
             (self.cols, self.rows) = (cols, rows);
             self.offsets = vec![Vec2::ZERO; count];
-            self.flash = vec![0.0; count];
         }
         let origin = rect.center() - vec2((cols - 1) as f32, (rows - 1) as f32) * HERO_GAP / 2.0;
+        let cell = |i: usize| origin + vec2((i as i32 % cols) as f32, (i as i32 / cols) as f32) * HERO_GAP;
+        let cell_at = |col: i32, row: i32| origin + vec2(col as f32, row as f32) * HERO_GAP;
+        let row_of = |y: f32| ((y - origin.y) / HERO_GAP).round() as i32;
+        let col_of = |x: f32| ((x - origin.x) / HERO_GAP).round() as i32;
 
         // The shield is the logo's: its outline and its P, sampled on the
         // lattice once per layout.
@@ -692,50 +738,93 @@ impl Hero {
             let outline = super::brand::shield_outline();
             let mark_width = 2.0 * half / super::brand::ASPECT;
             let mark_origin = center - vec2(mark_width / 2.0, half);
-            self.cells = (0..rows * cols)
-                .map(|i| {
-                    let home = origin + vec2((i % cols) as f32, (i / cols) as f32) * HERO_GAP;
-                    let u = (home - mark_origin) / mark_width;
-                    super::brand::part_at(&outline, [u.x, u.y]).map(|part| (part, u.y / super::brand::ASPECT))
-                })
-                .collect();
+            self.shield_dots.clear();
+            self.covered = vec![false; count];
+            self.reach = vec![None; rows.max(0) as usize];
+            for i in 0..count {
+                let u = (cell(i) - mark_origin) / mark_width;
+                if let Some(part) = super::brand::part_at(&outline, [u.x, u.y]) {
+                    self.covered[i] = true;
+                    let letter = part == super::brand::Part::Letter;
+                    let local = cell(i) - center;
+                    self.shield_dots.push((local, letter, u.y / super::brand::ASPECT, i as u32));
+                    let row = i / cols as usize;
+                    self.reach[row] = Some(self.reach[row].map_or(local.x, |r: f32| r.max(local.x)));
+                }
+            }
             self.cells_for = Some(layout);
         }
+        let mark_half_width = half / super::brand::ASPECT;
+        let depth = 0.26 * half;
+        // How far a point on the shield's face stands out towards the viewer.
+        let face_z = |local: Vec2, letter: bool| -> f32 {
+            let u = (local.x / mark_half_width).clamp(-1.0, 1.0);
+            let w = (local.y / half).clamp(-1.0, 1.0);
+            -depth * (1.0 - u * u) - 0.25 * depth * (1.0 - w * w) - if letter { 0.09 * half } else { 0.0 }
+        };
 
         // ---- the scan ----
-        let blend = motion::spring(&ctx, ui.id().with("hero-scan"), status.scan.is_some() as u8 as f32, 1.0, 1.0);
-        let helix_on = blend.clamp(0.0, 1.0);
+        let blend = motion::spring(&ctx, ui.id().with("hero-scan"), status.scan.is_some() as u8 as f32, 0.8, 1.0);
+        let scan_on = blend.clamp(0.0, 1.0);
+        let e = smoothstep(blend);
         match &status.scan {
             Some(scan) => {
+                if !self.scanned {
+                    self.stuck.clear();
+                }
                 let new = if self.files_seen == 0 { 0 } else { (scan.files - self.files_seen).max(0) };
                 let instant = new as f32 / dt.max(1.0 / 240.0);
                 self.rate += (instant - self.rate) * (1.0 - (-dt * 1.5).exp());
-                for _ in 0..new.min(5) {
-                    let i = (self.rand() * count as f32) as usize;
-                    if let Some(f) = self.flash.get_mut(i) {
-                        *f = 1.0;
-                    }
-                }
-                while self.threats_seen < scan.threats {
-                    self.threats_seen += 1;
-                    let at = vec2(self.rand() * rect.width(), self.rand() * rect.height());
-                    self.ripples.push(Ripple { at, born: now, color: rgb(theme().red), strength: 1.0 });
-                }
+                self.threats_due += scan.threats.saturating_sub(self.threats_seen);
+                self.threats_seen = scan.threats;
                 self.files_seen = scan.files.max(1);
+                self.scanned = true;
+                // One arrow stands for many files when the scan is fast, so
+                // the volleys stay readable rather than a blur.
+                if !still && blend > 0.6 {
+                    self.owed += dt * (self.rate / 45.0).clamp(4.0, 14.0);
+                }
             }
             None => {
+                // Threats found too late to fly are lodged straight away.
+                for _ in 0..self.threats_due {
+                    let at = vec2((0.1 + 0.5 * self.rand()) * mark_half_width, (self.rand() - 0.6) * 1.1 * half);
+                    self.stuck.push(Stuck { at, born: now });
+                }
                 self.files_seen = 0;
                 self.threats_seen = 0;
+                self.threats_due = 0;
+                self.owed = 0.0;
                 self.rate *= (-dt * 2.0).exp();
+                // The volley is over: the shield flashes the result and a ripple rolls out.
+                if self.scanned && self.arrows.is_empty() && blend < 0.3 {
+                    self.scanned = false;
+                    self.flashed = Some(now);
+                    self.ripples.push(Ripple { at: center - rect.min, born: now, color: base, strength: 1.0 });
+                }
             }
         }
-        let fade = (-dt * 2.5).exp();
-        self.flash.iter_mut().for_each(|f| *f *= fade);
-        if !still {
-            self.spin += dt * (0.55 + (self.rate / 250.0).min(4.0)) * helix_on;
+        // Arrows come in on the rows the shield covers, its upper part most.
+        let shield_rows: Vec<i32> = (0..rows).filter(|&r| self.reach.get(r as usize).copied().flatten().is_some()).collect();
+        while self.owed >= 1.0 && !shield_rows.is_empty() {
+            self.owed -= 1.0;
+            let threat = self.threats_due > 0;
+            if threat {
+                self.threats_due -= 1;
+            }
+            let pick = (self.rand().powf(1.3) * shield_rows.len() as f32 * 0.85) as usize;
+            let row = shield_rows[pick.min(shield_rows.len() - 1)];
+            let depth = 0.2 + 0.6 * self.rand();
+            self.arrows.push(Arrow { born: now, row, depth, threat });
+        }
+        self.owed = self.owed.min(3.0);
+        self.recoil *= (-dt * 8.0).exp();
+        let glow = self.flashed.map_or(0.0, |f| (-((now - f) as f32) * 3.0).exp());
+        if glow < 0.01 {
+            self.flashed = None;
         }
 
-        // ---- the camera: the shield faces the pointer ----
+        // ---- the camera: the shield faces the pointer; during a scan it holds still ----
         let pointer_anywhere = ctx.pointer_latest_pos().filter(|_| ctx.input(|i| i.pointer.has_pointer()));
         let (px, py) = pointer_anywhere
             .map(|q| (((q.x - center.x) / (rect.width() * 0.55)).clamp(-1.0, 1.0), ((q.y - center.y) / (rect.height() * 0.7)).clamp(-1.0, 1.0)))
@@ -743,19 +832,73 @@ impl Hero {
         let (px, py) = if still { (0.0, 0.0) } else { (px, py) };
         let yaw = motion::spring(&ctx, ui.id().with("hero-yaw"), -px * 0.42, 0.8, 1.0);
         let pitch = motion::spring(&ctx, ui.id().with("hero-pitch"), py * 0.3, 0.8, 1.0);
-        let sway = if still { 0.0 } else { 1.0 - helix_on };
+        let sway = if still { 0.0 } else { 1.0 - scan_on };
         let t = now as f32;
-        // While the helix turns, the pointer only steers it gently.
-        let yaw = yaw * (1.0 - 0.6 * helix_on) + 0.07 * (t * 0.45).sin() * sway;
-        let pitch = pitch * (1.0 - 0.6 * helix_on) + 0.035 * (t * 0.31).sin() * sway + 0.3 * helix_on;
+        // Each hit turns it a touch away from the arrows, and it comes back.
+        let give = self.recoil.min(1.5);
+        let yaw = yaw * (1.0 - e) + 0.07 * (t * 0.45).sin() * sway + 0.035 * give;
+        let pitch = pitch * (1.0 - e) + 0.035 * (t * 0.31).sin() * sway;
+        let knock = vec2(-3.0 * give, 0.0);
         let light = v3(-0.45, -0.65, -1.0).normalized();
         let half_vector = light.add(v3(0.0, 0.0, -1.0)).normalized();
+        let project = |p: V3| {
+            let p = p.add(v3(knock.x, knock.y, 0.0)).turned(yaw, pitch);
+            let s = FOCAL / (FOCAL + p.z).max(200.0);
+            (p.z, center + vec2(p.x, p.y) * s, s)
+        };
+        // Where an arrow on `row` strikes the face, `depth` of the way in from the right edge.
+        let strike = |row: i32, depth: f32| -> Option<Vec2> {
+            let edge = self.reach.get(row as usize).copied().flatten()?;
+            Some(vec2(edge * (1.0 - depth), cell_at(0, row).y - center.y))
+        };
+
+        // ---- arrows ----
+        let pal = theme();
+        let (ink, red, cyan) = (ink(), rgb(pal.red), rgb(pal.cyan));
+        let start_x = rect.right() - 14.0;
+        let mut landed = Vec::new();
+        for (index, arrow) in self.arrows.iter().enumerate() {
+            let x = start_x - ARROW_SPEED * (now - arrow.born) as f32;
+            match strike(arrow.row, arrow.depth) {
+                Some(hit) if x <= center.x + hit.x => landed.push((index, hit)),
+                None => landed.push((index, vec2(0.0, 0.0))),
+                _ => {}
+            }
+        }
+        for &(index, hit) in &landed {
+            let threat = self.arrows[index].threat;
+            let at = center + hit + knock;
+            self.impacts.push((hit, now, threat));
+            self.recoil = (self.recoil + 0.5).min(2.0);
+            if threat {
+                self.stuck.push(Stuck { at: hit, born: now });
+                self.ripples.push(Ripple { at: at - rect.min, born: now, color: red, strength: 1.0 });
+            } else {
+                // Broken on the shield: sparks fly back and fall.
+                for _ in 0..6 {
+                    let velocity = vec2(70.0 + 170.0 * self.rand(), -60.0 - 170.0 * self.rand());
+                    self.sparks.push(Spark { at, velocity, born: now });
+                }
+            }
+        }
+        let mut index = 0;
+        self.arrows.retain(|_| {
+            index += 1;
+            !landed.iter().any(|(i, _)| *i == index - 1)
+        });
+        for spark in &mut self.sparks {
+            spark.velocity.y += 560.0 * dt;
+            spark.at += spark.velocity * dt;
+        }
+        self.sparks.retain(|s| now - s.born < 0.6);
+        self.impacts.retain(|(_, born, _)| now - born < 0.4);
+        self.stuck.truncate(14);
 
         // ---- pointer, click, burst ----
         let pointer = response.hover_pos();
         if response.clicked() {
             if let Some(pt) = pointer {
-                if (pt - center).x.abs() < half && (pt - center).y.abs() < half {
+                if (pt - center).x.abs() < half && (pt - center).y.abs() < half && blend < 0.1 {
                     self.burst = Some(now);
                 } else {
                     self.ripples.push(Ripple { at: pt - rect.min, born: now, color: base, strength: 0.9 });
@@ -774,134 +917,167 @@ impl Hero {
         let pulse_t = (age - 2.6).rem_euclid(PULSE_EVERY);
         let pulsing = status.live && status.scan.is_none() && !still && age > 2.6 && pulse_t < PULSE_LIFE;
 
-        let pal = theme();
-        let (ink, red, blue, cyan) = (ink(), rgb(pal.red), rgb(pal.accent), rgb(pal.cyan));
         let painter = ui.painter_at(rect);
         let mut moving = false;
         let follow = if still { 1.0 } else { 1.0 - (-dt * 14.0).exp() };
-        let mark_half_width = half / super::brand::ASPECT;
-        let depth = 0.26 * half;
-        let mut particles: Vec<Particle> = Vec::new();
         const REACH: f32 = 72.0;
-        for row in 0..rows {
-            for col in 0..cols {
-                let i = (row * cols + col) as usize;
-                let n = i as u32;
-                let home = origin + vec2(col as f32, row as f32) * HERO_GAP;
 
-                if let Some((part, v)) = self.cells[i] {
-                    let letter = part == super::brand::Part::Letter;
-                    // Where the dot sits on the shield's curved face.
-                    let (lx, ly) = (home.x - center.x, home.y - center.y);
-                    let u = (lx / mark_half_width).clamp(-1.0, 1.0);
-                    let w = (ly / half).clamp(-1.0, 1.0);
-                    let z = -depth * (1.0 - u * u) - 0.25 * depth * (1.0 - w * w) - if letter { 0.09 * half } else { 0.0 };
-                    let normal = v3(2.0 * depth * u / mark_half_width, 0.5 * depth * w / half, -1.0).normalized();
-                    // Arrival: from somewhere in the field (and behind it), on a curve.
-                    let delay = 0.12 + 0.55 * hash(n ^ 0x51) + 0.3 * v + if letter { 0.45 } else { 0.0 };
-                    let arrive = motion::settle(age - delay, 0.85);
-                    let from = origin + vec2(hash(n ^ 0xF00) * cols as f32, hash(n ^ 0xBA5) * rows as f32).floor() * HERO_GAP;
-                    let path = home - from;
-                    let side = vec2(-path.y, path.x) / path.length().max(1.0) * (hash(n ^ 0xC17) - 0.5) * 180.0 * (PI * arrive).sin();
-                    let flat = from + path * arrive + side;
-                    let mut on_shield = v3(flat.x - center.x, flat.y - center.y, z * arrive + (1.0 - arrive) * 240.0 * hash(n ^ 0xA7));
-                    if let Some(bt) = burst {
-                        // Thrown out towards the viewer, then sprung back into place.
-                        let amount = motion::settle(bt, 0.14) - motion::settle(bt - 0.22, 0.75);
-                        let out = v3(lx / half, ly / half, -0.7 - hash(n ^ 0xD1));
-                        on_shield = on_shield.add(out.scale(amount * half * 0.85));
-                    }
-                    // The helix: three strands round a core of the P's dots.
-                    let along = hash(n ^ 0x7E1);
-                    let thick = 1.0 + (hash(n ^ 0x7E2) - 0.5) * 0.18;
-                    let (radius, angle, length) = if letter {
-                        (0.12 * half, along * TAU * 3.0 - self.spin * 1.4, 1.8 * half)
-                    } else {
-                        (0.42 * half, along * TAU * 2.0 + (n % 3) as f32 * TAU / 3.0 + self.spin, 2.25 * half)
-                    };
-                    let on_helix = v3((along - 0.5) * length, angle.sin() * radius * thick, angle.cos() * radius * thick);
-                    let e = smoothstep(blend * 1.4 - hash(n ^ 0x99) * 0.4);
-                    let swirl = v3(0.0, 0.0, (PI * e).sin() * (hash(n ^ 0x5A) - 0.5) * half * 0.9);
-                    let p = on_shield.lerp(on_helix, e).add(swirl).turned(yaw, pitch);
-                    let s = FOCAL / (FOCAL + p.z).max(200.0);
-                    let at = center + vec2(p.x, p.y) * s;
-
-                    // Light: diffuse from the upper left, a specular glint, and depth on the helix.
-                    let lit = normal.turned(yaw, pitch);
-                    let diffuse = lit.dot(light).max(0.0);
-                    let glint = lit.dot(half_vector).max(0.0).powi(30);
-                    // The P is silver on dark backgrounds and graphite on light ones.
-                    let face = if letter && pal.dark {
-                        mix(mix([150, 150, 158], [255, 255, 255], diffuse), [255, 255, 255], glint)
-                    } else if letter {
-                        mix(mix([20, 20, 22], [86, 86, 92], diffuse), [200, 200, 210], glint)
-                    } else {
-                        mix(shade(base, 0.45 + 0.75 * diffuse), [255, 255, 255], glint * 0.45)
-                    };
-                    let front = ((-p.z / (0.5 * half)).clamp(-1.0, 1.0) + 1.0) / 2.0;
-                    let strand = if letter { ink } else { mix(blue, cyan, front) };
-                    let color = mix(face, strand, e);
-                    let alpha = (0.15 + 0.85 * arrive) * (1.0 - e * (1.0 - (0.3 + 0.7 * front)));
-                    let size = HERO_GAP * (0.1 + if letter { 0.22 } else { 0.17 } * arrive) * s * (1.0 + e * (front - 0.4) * 0.6);
-                    particles.push(Particle { depth: p.z, at, radius: size, color, alpha });
-                    continue;
-                }
-
-                // Field dot: parts around the pointer like water, and springs back.
-                let mut target = Vec2::ZERO;
-                if let Some(q) = pointer.filter(|_| !still) {
-                    let d = home - q;
-                    let len = d.length();
-                    if len < REACH {
-                        target = d / len.max(0.001) * (1.0 - len / REACH).powi(2) * 16.0;
-                    }
-                }
-                let offset = &mut self.offsets[i];
-                *offset += (target - *offset) * follow;
-                if offset.length_sq() < 0.0025 && target == Vec2::ZERO {
-                    *offset = Vec2::ZERO;
-                } else {
-                    moving = true;
-                }
-                let mut pt = home + *offset;
-                let (push, boost, tint) = ripple_at(&self.ripples, rect.min, pt, now);
-                pt += push;
-                let mut pulse = 0.0;
-                if pulsing {
-                    let d = (home - center).length();
-                    let wave = pulse_t * 330.0;
-                    let fade = (1.0 - pulse_t / PULSE_LIFE).powf(1.5);
-                    pulse = ((-((d - wave) / 30.0).powi(2)).exp() + 0.4 * (-((d - wave + 70.0) / 26.0).powi(2)).exp()) * fade;
-                    pt += (home - center) / d.max(1.0) * pulse * 4.0;
-                }
-                // Fades at the field's edges and under the headline.
-                let edge_x = (home.x - rect.left()).min(rect.right() - home.x) / 90.0;
-                let edge_y = (home.y - rect.top()).min(rect.bottom() - home.y) / 70.0;
-                let mut alpha = pal.dot_alpha * 1.4 * smoothstep(edge_x.min(edge_y));
-                let under_text = smoothstep(rect_distance(clear, home) / 46.0);
-                alpha *= 0.15 + 0.85 * under_text;
-                let mut color = ink;
-                let mut radius = 0.95;
-                if status.threats > 0 && under_text > 0.9 && hash(n ^ 0xE3) < (0.012 * status.threats as f32).min(0.05) {
-                    color = red;
-                    alpha = 0.75;
-                    radius = 1.6 + hash(n ^ 0xE4) * 0.9;
-                }
-                let f = self.flash[i];
-                color = mix(color, mix(blue, cyan, f), f.min(1.0));
-                color = mix(color, base, pulse.min(1.0));
-                color = mix(color, tint, (boost * 0.8).min(0.7));
-                alpha += f * 0.7 * under_text + pulse * 0.55 * under_text + boost * 0.5;
-                radius += f * 0.9 + pulse * 1.2 + boost * 1.1;
-                if alpha > 0.01 {
-                    painter.circle_filled(pt, radius, rgba(color, alpha));
+        // ---- the field ----
+        for i in 0..count {
+            if self.covered[i] {
+                continue;
+            }
+            let n = i as u32;
+            let home = cell(i);
+            // Parts around the pointer like water, and springs back.
+            let mut target = Vec2::ZERO;
+            if let Some(q) = pointer.filter(|_| !still) {
+                let d = home - q;
+                let len = d.length();
+                if len < REACH {
+                    target = d / len.max(0.001) * (1.0 - len / REACH).powi(2) * 16.0;
                 }
             }
+            let offset = &mut self.offsets[i];
+            *offset += (target - *offset) * follow;
+            if offset.length_sq() < 0.0025 && target == Vec2::ZERO {
+                *offset = Vec2::ZERO;
+            } else {
+                moving = true;
+            }
+            let mut pt = home + *offset;
+            let (push, boost, tint) = ripple_at(&self.ripples, rect.min, pt, now);
+            pt += push;
+            let mut pulse = 0.0;
+            if pulsing {
+                let d = (home - center).length();
+                let wave = pulse_t * 330.0;
+                let fade = (1.0 - pulse_t / PULSE_LIFE).powf(1.5);
+                pulse = ((-((d - wave) / 30.0).powi(2)).exp() + 0.4 * (-((d - wave + 70.0) / 26.0).powi(2)).exp()) * fade;
+                pt += (home - center) / d.max(1.0) * pulse * 4.0;
+            }
+            // Fades at the field's edges and under the headline.
+            let edge_x = (home.x - rect.left()).min(rect.right() - home.x) / 90.0;
+            let edge_y = (home.y - rect.top()).min(rect.bottom() - home.y) / 70.0;
+            let mut alpha = pal.dot_alpha * 1.4 * smoothstep(edge_x.min(edge_y));
+            let under_text = smoothstep(rect_distance(clear, home) / 46.0);
+            alpha *= 0.15 + 0.85 * under_text;
+            let mut color = ink;
+            let mut radius = 0.95;
+            // Unresolved threats: a few warm embers close around the shield.
+            let around = (home - center).length() / half;
+            if status.threats > 0 && status.scan.is_none() && under_text > 0.9 && (1.1..1.7).contains(&around) && hash(n ^ 0xE3) < status.threats.min(6) as f32 / 700.0 {
+                color = red;
+                alpha = 0.8 * (1.0 - scan_on);
+                radius = 2.0 + hash(n ^ 0xE4) * 0.8;
+            }
+            color = mix(color, base, pulse.min(1.0));
+            color = mix(color, tint, (boost * 0.8).min(0.7));
+            alpha += pulse * 0.55 * under_text + boost * 0.5;
+            radius += pulse * 1.2 + boost * 1.1;
+            if alpha > 0.01 {
+                painter.circle_filled(pt, radius, rgba(color, alpha));
+            }
+        }
+
+        // ---- the shield ----
+        let mut particles: Vec<Particle> = Vec::new();
+        for &(local, letter, v, n) in &self.shield_dots {
+            let z = face_z(local, letter);
+            let normal = v3(2.0 * depth * (local.x / mark_half_width).clamp(-1.0, 1.0) / mark_half_width, 0.5 * depth * (local.y / half).clamp(-1.0, 1.0) / half, -1.0).normalized();
+            // Arrival: from somewhere in the field (and behind it), on a curve.
+            let delay = 0.12 + 0.55 * hash(n ^ 0x51) + 0.3 * v + if letter { 0.45 } else { 0.0 };
+            let arrive = motion::settle(age - delay, 0.85);
+            let home = center + local;
+            let from = origin + vec2(hash(n ^ 0xF00) * cols as f32, hash(n ^ 0xBA5) * rows as f32).floor() * HERO_GAP;
+            let path = home - from;
+            let side = vec2(-path.y, path.x) / path.length().max(1.0) * (hash(n ^ 0xC17) - 0.5) * 180.0 * (PI * arrive).sin();
+            let flat = from + path * arrive + side - center;
+            let mut point = v3(flat.x, flat.y, z * arrive + (1.0 - arrive) * 240.0 * hash(n ^ 0xA7));
+            if let Some(bt) = burst {
+                // Thrown out towards the viewer, then sprung back into place.
+                let amount = motion::settle(bt, 0.14) - motion::settle(bt - 0.22, 0.75);
+                let out = v3(local.x / half, local.y / half, -0.7 - hash(n ^ 0xD1));
+                point = point.add(out.scale(amount * half * 0.85));
+            }
+            // A strike flares the face around where it hit, and dents it in.
+            let mut flare = 0.0f32;
+            let mut flare_red = false;
+            for &(hit, born, threat) in &self.impacts {
+                let f = (-((local - hit).length() / (0.14 * half)).powi(2)).exp() * (1.0 - (now - born) as f32 / 0.4);
+                if f > flare {
+                    (flare, flare_red) = (f, threat);
+                }
+            }
+            let (depth_z, at, s) = project(point.add(v3(0.0, 0.0, flare * 0.06 * half)));
+            // Light: diffuse from the upper left, and a specular glint.
+            let lit = normal.turned(yaw, pitch);
+            let diffuse = lit.dot(light).max(0.0);
+            let glint = lit.dot(half_vector).max(0.0).powi(30);
+            // The P is silver on dark backgrounds and graphite on light ones.
+            let face = if letter && pal.dark {
+                mix(mix([150, 150, 158], [255, 255, 255], diffuse), [255, 255, 255], glint)
+            } else if letter {
+                mix(mix([20, 20, 22], [86, 86, 92], diffuse), [200, 200, 210], glint)
+            } else {
+                mix(shade(base, 0.45 + 0.75 * diffuse), [255, 255, 255], glint * 0.45)
+            };
+            let struck = if flare_red { red } else { mix(cyan, [255, 255, 255], 0.4) };
+            let color = mix(mix(face, struck, flare), [255, 255, 255], glow * 0.6);
+            let alpha = 0.15 + 0.85 * arrive;
+            let size = HERO_GAP * (0.1 + if letter { 0.22 } else { 0.17 } * arrive) * s * (1.0 + 0.5 * flare + 0.3 * glow);
+            particles.push(Particle { depth: depth_z, at, radius: size, color, alpha });
         }
         // Back to front, so near dots cover far ones as the shield turns.
         particles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
         for d in &particles {
             painter.circle_filled(d.at, d.radius, rgba(d.color, d.alpha));
+        }
+
+        // ---- threats' arrows, standing out of the face ----
+        let pulse = 0.8 + 0.2 * (t * 4.0).sin();
+        for arrow in &self.stuck {
+            let appear = motion::settle((now - arrow.born) as f32, 0.15);
+            let (_, at, _) = project(v3(arrow.at.x, arrow.at.y, face_z(arrow.at, false)));
+            let (col, row) = (col_of(at.x), row_of(at.y));
+            // Red at the point and the fletching, a pale shaft, so it reads on a red shield too.
+            painter.circle_filled(cell_at(col, row), HERO_GAP * 0.75, rgba(red, 0.18 * appear * pulse));
+            painter.circle_filled(cell_at(col, row), HERO_GAP * 0.3, rgba(red, appear));
+            for d in 1..ARROW_CELLS - 1 {
+                painter.circle_filled(cell_at(col + d, row), HERO_GAP * 0.2, rgba(ink, appear * (0.95 - d as f32 * 0.06)));
+            }
+            for fin in [-1, 1] {
+                painter.circle_filled(cell_at(col + ARROW_CELLS - 1, row + fin), HERO_GAP * 0.18, rgba(red, appear * pulse));
+                painter.circle_filled(cell_at(col + ARROW_CELLS - 2, row + fin), HERO_GAP * 0.15, rgba(red, 0.7 * appear));
+            }
+        }
+
+        // ---- arrows in flight, along their rows ----
+        for arrow in &self.arrows {
+            let x = start_x - ARROW_SPEED * (now - arrow.born) as f32;
+            let head = col_of(x);
+            let shaft = if arrow.threat { red } else { ink };
+            for d in 0..ARROW_CELLS {
+                let at = cell_at(head + d, arrow.row);
+                if at.x > rect.right() - 6.0 {
+                    continue;
+                }
+                // Faint where it passes behind the headline.
+                let behind_text = 0.2 + 0.8 * smoothstep(rect_distance(clear, at) / 18.0);
+                let (radius, color, alpha) = if d == 0 { (0.3, if arrow.threat { red } else { [255, 255, 255] }, 1.0) } else { (0.2, shaft, 0.9 - d as f32 * 0.06) };
+                painter.circle_filled(at, HERO_GAP * radius, rgba(color, alpha * behind_text * scan_on.max(0.4)));
+            }
+            for fin in [-1, 1] {
+                let at = cell_at(head + ARROW_CELLS, arrow.row + fin);
+                let behind_text = 0.2 + 0.8 * smoothstep(rect_distance(clear, at) / 18.0);
+                painter.circle_filled(at, HERO_GAP * 0.16, rgba(shaft, 0.55 * behind_text));
+            }
+        }
+        // Sparks, snapped to the lattice like everything else.
+        for spark in &self.sparks {
+            let life = 1.0 - (now - spark.born) as f32 / 0.6;
+            let at = cell_at(col_of(spark.at.x), row_of(spark.at.y));
+            painter.circle_filled(at, HERO_GAP * 0.2 * life + 0.5, rgba([255, 214, 150], life));
         }
 
         let busy = age < 2.8
@@ -910,8 +1086,11 @@ impl Hero {
             || burst.is_some()
             || !self.ripples.is_empty()
             || status.scan.is_some()
+            || !self.arrows.is_empty()
+            || !self.sparks.is_empty()
+            || !self.stuck.is_empty()
             || (blend - blend.round()).abs() > 0.001
-            || self.flash.iter().any(|f| *f > 0.01);
+            || self.flashed.is_some();
         if still {
             return;
         }

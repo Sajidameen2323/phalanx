@@ -169,7 +169,8 @@ impl App {
                 0 => String::new(),
                 n => format!(" · {n} threat(s)"),
             };
-            (theme().accent, "Scanning".to_string(), format!("{} files · {}{found}", job.files, fmt_duration(job.started.elapsed())))
+            // Neutral while it works; the result colour arrives when the scan ends.
+            (theme().muted, "Scanning".to_string(), format!("{} files · {}{found}", job.files, fmt_duration(job.started.elapsed())))
         } else if let Some(latest) = unresolved.first() {
             let found_by = if is_protection_kind(&latest.kind) { "real-time protection" } else { "a scan" };
             (
