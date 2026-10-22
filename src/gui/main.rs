@@ -28,7 +28,8 @@ use threat_scanner::store::{DetectionRow, MonthRow, QuarantineRow, ScanErrorRow,
 use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
-use threat_scanner::rtp::{self, Origin, ProcessHit, RiskyOutcome, RtpConfig, RtpEvent, RtpHandle};
+use threat_scanner::cmdline::Confidence;
+use threat_scanner::rtp::{self, CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome, RtpConfig, RtpEvent, RtpHandle};
 use threat_scanner::Category;
 use widgets::APP_TITLE;
 
@@ -351,6 +352,7 @@ enum WatchMsg {
     Restarting { error: String, retry_in: Duration },
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
+    Command(CommandHit),
     Error(String),
 }
 
@@ -1380,6 +1382,15 @@ impl App {
                     }
                     WatchMsg::RiskyChecked { path, outcome }
                 }
+                RtpEvent::Command(hit) => {
+                    // Medium-confidence matches are common in admin tools; they
+                    // are only logged.
+                    if notifications && hit.confidence() == Confidence::High {
+                        let (title, body) = command_notification(&hit);
+                        system::notify(&title, &body);
+                    }
+                    WatchMsg::Command(hit)
+                }
                 RtpEvent::Restarting { error, retry_in } => WatchMsg::Restarting { error, retry_in },
                 RtpEvent::Error(e) => WatchMsg::Error(e),
             };
@@ -1525,6 +1536,29 @@ impl App {
                         RiskyOutcome::Threat(_) => {}
                     }
                 }
+                WatchMsg::Command(hit) => {
+                    let kind = if hit.confidence() == Confidence::High { ActivityKind::Threat } else { ActivityKind::Risky };
+                    let mut detail: Vec<String> = hit.matches.iter().map(|m| m.reason.clone()).collect();
+                    detail.push(format!("command: {}", hit.command));
+                    if let Some(script) = &hit.script {
+                        detail.push(format!("decoded: {script}"));
+                    }
+                    match (hit.pid, &hit.parent) {
+                        (Some(pid), Some(parent)) => detail.push(format!("pid {pid}, started by {parent}")),
+                        (Some(pid), None) => detail.push(format!("pid {pid}")),
+                        _ => {}
+                    }
+                    detail.push("Report-only: nothing was stopped".into());
+                    if !hit.in_history() {
+                        detail.push("Medium confidence, so not kept in History".into());
+                    }
+                    let text = match hit.source {
+                        CommandSource::Program => format!("Suspicious command in {}: {}", hit.program, hit.headline()),
+                        CommandSource::RunBox => format!("Suspicious command in the Run box: {}", hit.headline()),
+                    };
+                    self.log_activity(kind, text, detail.join(" · "));
+                    changed_history |= hit.in_history();
+                }
                 WatchMsg::Restarting { error, retry_in } => {
                     self.watch.restarts += 1;
                     self.log_activity(
@@ -1597,6 +1631,22 @@ fn threat_notification(report: &FileReport, processes: &[ProcessHit], repeat: bo
     }
     body.push_str(if report.action.contains("quarantined (") { "It was quarantined." } else { "Open Phalanx to review it." });
     (title, body)
+}
+
+/// Title and body of the "suspicious command" notification.
+fn command_notification(hit: &CommandHit) -> (String, String) {
+    let title = match hit.source {
+        CommandSource::Program => format!("Suspicious command in {}", hit.program),
+        CommandSource::RunBox => "Suspicious command in the Run box".to_string(),
+    };
+    let mut body = format!("{}.", capitalize_first(hit.headline()));
+    body.push_str(" Phalanx only reported it. If a web page told you to run this, close it and do not run it again.");
+    (title, body)
+}
+
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 /// Title and body of the "a program just landed" notification.

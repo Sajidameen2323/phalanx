@@ -337,7 +337,7 @@ pub fn powershell_json<T: serde::de::DeserializeOwned>(script: &str, timeout: st
 }
 
 /// A script as PowerShell's `-EncodedCommand` expects: UTF-16LE, base64.
-fn encode_powershell(script: &str) -> String {
+pub(crate) fn encode_powershell(script: &str) -> String {
     base64(&script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>())
 }
 

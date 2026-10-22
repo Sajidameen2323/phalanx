@@ -2,8 +2,32 @@
 
 <img src="assets/phalanx.png" width="96" alt="Phalanx emblem">
 
-An on-demand malware scanner written in Rust. It is an original implementation; it
-contains no Malwarebytes code or signatures.
+**Phalanx is one place to protect a Windows PC.** It finds and removes malware,
+watches for new threats as they arrive, blocks dangerous websites in your browsers
+and for the whole PC, looks for what infostealers leave behind, and checks that
+Windows' own protections are switched on. Everything runs on your PC, needs no
+account, and shows you exactly what it found and why.
+
+| Area | What Phalanx does |
+| --- | --- |
+| **Scanning** | Quick, full and custom scans with hash signatures, YARA rules and Windows-program heuristics, plus a reversible quarantine and a complete history. |
+| **Real-time protection** | Scans new downloads and every program that starts, and stops running malware. It also reads the command lines of PowerShell and other Windows tools, and the commands pasted into the Run box, to catch attacks that never drop a file, such as fake CAPTCHA (ClickFix) pages. This part only reports for now. |
+| **Web protection** | Browser Guard blocks malware and phishing sites before your browser sends them a single request, marks dangerous search results, and can block ads and trackers. A DNS filter extends the blocking to every program on the PC. It also finds malicious browser extensions and checks each browser's security settings. |
+| **Stealer check** | Looks for the start-up entries, scheduled tasks, browser switches, policies, proxies and hosts-file changes that infostealers use. |
+| **Windows protection and privacy** | Checks Microsoft Defender, SmartScreen, the firewall, memory integrity and more, and can switch on what is off. A privacy checklist does the same for Windows privacy settings. |
+| **AI Inspect** | Asks Google Gemini for a second opinion on a file (optional, needs your own API key). |
+| **Signature updates** | Pulls fresh malware hashes, YARA rules and malicious web addresses from public threat-intelligence feeds (abuse.ch, YARA Forge, URLhaus). |
+
+Phalanx works in user mode, without a kernel driver, so it is designed to run
+**alongside Microsoft Defender**, not instead of it. It adds the web blocking,
+stealer checks, command-line checks and clear explanations on top. See
+[docs/hardening-plan.md](docs/hardening-plan.md) for what is planned next.
+
+It is written in Rust and is an original implementation; it contains no
+Malwarebytes code or signatures. The app is `phalanx.exe`; `phalanx-cli.exe` offers
+the same features on the command line.
+
+## How scanning works
 
 Detection layers, in order:
 
@@ -114,6 +138,24 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
   starts are checked in a lane of their own, in the background, so they never hold up
   new files. Turn this off, or turn off stopping, on the
   Protection page; clean program checks are not written to History.
+* **Command lines are checked (report only).** Most infostealers now arrive without a
+  file: a fake CAPTCHA page has you paste a command into the Run box (ClickFix), or a
+  shortcut starts PowerShell with the payload on its command line. With program
+  protection on, the command line of each PowerShell, `cmd`, `conhost`, `mshta`,
+  `rundll32`, `regsvr32`, `certutil`, `bitsadmin`, `wscript` and `cscript` that starts
+  is read and checked against rules for downloading and running code, encoded and
+  hidden commands, Defender exclusions, AMSI bypasses and ClickFix's fake verification
+  comments (`src/cmdline.rs`, shared with the Stealer check). An `-EncodedCommand` is
+  decoded and its script also goes through the signatures. New entries in the Run
+  box's history (`RunMRU`) are checked the same way, which catches a pasted command
+  even when it exits too quickly for the program monitor. Every match is shown in the
+  activity log. High-confidence ones are also recorded in History (kind `COMMAND`,
+  category suspicious) and notify; medium-confidence ones (encoded commands, hidden
+  windows, `Invoke-Expression` alone, all common in admin tools and terminals) are
+  not kept. The same command line is reported once every 10 minutes, however often
+  it runs. **Nothing is stopped yet**: this release only
+  reports, so false positives surface before any rule acts. Programs that Phalanx
+  itself starts are not checked.
 * **Signed software is trusted by heuristics.** A heuristic-only finding on a file
   with a valid Authenticode signature, embedded or through a Windows security catalog
   (how most of Windows is signed), is dropped. Revocation is not checked and nothing

@@ -1923,7 +1923,7 @@ fn detection_card(ui: &mut Ui, row: &mut ResultRow, ai_enabled: bool) -> bool {
 
 /// Scans recorded by real-time protection rather than started by the user.
 fn is_protection_kind(kind: &str) -> bool {
-    kind == "watch" || kind == "process"
+    kind == "watch" || kind == "process" || kind == "command"
 }
 
 fn capitalize(text: &str) -> String {
