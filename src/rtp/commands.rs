@@ -5,8 +5,9 @@
 //! be found before any rule is trusted to act. High-confidence matches are
 //! recorded in history; medium ones (common in admin tools and terminals)
 //! are only shown in the activity log. The same command line is reported
-//! once per [`REPEAT_WINDOW`]. Children of Phalanx itself (its own PowerShell
-//! queries) are never checked.
+//! once per [`REPEAT_WINDOW`]. Programs started by Phalanx (its own PowerShell
+//! queries), whether by this copy or by another one from the same folder
+//! (the app and `phalanx-cli`), are never checked.
 
 use super::process::{self, ProcessInfo};
 use super::{Ctx, RtpEvent};
@@ -14,7 +15,7 @@ use crate::cmdline::{self, Confidence, Match};
 use crate::store::{ScanMeta, ScanStats, Store};
 use crate::{Category, Finding, Source};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
@@ -104,7 +105,8 @@ const CLICKFIX_HOSTS: &[&str] = &["powershell", "pwsh", "mshta", "cmd", "conhost
 /// for naming its parent.
 pub(super) fn check_program(ctx: &Ctx<'_>, info: &ProcessInfo, by_pid: &HashMap<u32, &ProcessInfo>) -> Option<CommandHit> {
     let host = cmdline::host(&info.name)?;
-    if info.parent == std::process::id() {
+    let own_exe = std::env::current_exe().ok();
+    if started_by_phalanx(info, by_pid, std::process::id(), own_exe.as_deref().and_then(Path::parent)) {
         return None;
     }
     let command = process::command_line(&info.id)?;
@@ -135,6 +137,32 @@ pub(super) fn check_program(ctx: &Ctx<'_>, info: &ProcessInfo, by_pid: &HashMap<
         script,
         matches: sorted(matches),
     })
+}
+
+/// The programs Phalanx is made of; their own PowerShell queries are not checked.
+const PHALANX_PROGRAMS: &[&str] = &["phalanx.exe", "phalanx-cli.exe"];
+
+/// Whether `info` was started by this process, or by a Phalanx program in
+/// `own_dir` (the folder this copy runs from). Only that folder counts, so
+/// malware cannot hide by naming itself `phalanx.exe`.
+fn started_by_phalanx(info: &ProcessInfo, by_pid: &HashMap<u32, &ProcessInfo>, own_pid: u32, own_dir: Option<&Path>) -> bool {
+    if info.parent == own_pid {
+        return true;
+    }
+    let (Some(parent), Some(own_dir)) = (by_pid.get(&info.parent), own_dir) else { return false };
+    // A parent started after the child is a reused process id, not its parent.
+    if parent.id.created > info.id.created {
+        return false;
+    }
+    let same_folder = parent.image.parent().is_some_and(|dir| same_path(dir, own_dir));
+    let name = parent.image.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    same_folder && PHALANX_PROGRAMS.contains(&name.as_str())
+}
+
+/// Windows paths compare without regard to case or a trailing separator.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.display().to_string().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+    norm(a) == norm(b)
 }
 
 /// Checks a command added to the Run box's history.
@@ -346,5 +374,38 @@ mod run_box {
                 CloseHandle(self.event);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtp::process::ProcessId;
+
+    fn proc(pid: u32, created: u64, image: &str, parent: u32) -> ProcessInfo {
+        let image = PathBuf::from(image);
+        let name = image.file_name().unwrap().to_string_lossy().into_owned();
+        ProcessInfo { id: ProcessId { pid, created }, name, image, parent }
+    }
+
+    #[test]
+    fn programs_started_by_phalanx_are_skipped_only_from_its_own_folder() {
+        let own_dir = Path::new(r"C:\Program Files\Phalanx");
+        let cli = proc(10, 100, r"C:\Program Files\Phalanx\phalanx-cli.exe", 1);
+        let app = proc(11, 100, r"c:\program files\phalanx\PHALANX.EXE", 1);
+        let impostor = proc(12, 100, r"C:\Users\u\Downloads\phalanx.exe", 1);
+        let other = proc(13, 100, r"C:\Program Files\Phalanx\helper.exe", 1);
+        let by_pid: HashMap<u32, &ProcessInfo> = [&cli, &app, &impostor, &other].into_iter().map(|p| (p.id.pid, p)).collect();
+        let child = |parent: u32, created: u64| proc(50, created, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", parent);
+
+        assert!(started_by_phalanx(&child(99, 200), &by_pid, 99, Some(own_dir)), "this process");
+        assert!(started_by_phalanx(&child(10, 200), &by_pid, 99, Some(own_dir)), "phalanx-cli from the same folder");
+        assert!(started_by_phalanx(&child(11, 200), &by_pid, 99, Some(own_dir)), "the app, in any case");
+        assert!(!started_by_phalanx(&child(12, 200), &by_pid, 99, Some(own_dir)), "a phalanx.exe elsewhere");
+        assert!(!started_by_phalanx(&child(13, 200), &by_pid, 99, Some(own_dir)), "another program in the folder");
+        assert!(!started_by_phalanx(&child(10, 50), &by_pid, 99, Some(own_dir)), "a reused process id");
+        assert!(!started_by_phalanx(&child(77, 200), &by_pid, 99, Some(own_dir)), "an unknown parent");
+        assert!(!started_by_phalanx(&child(10, 200), &by_pid, 99, None), "own folder unknown");
+        assert!(same_path(Path::new(r"C:\A\b\"), Path::new("c:/a/B")));
     }
 }
