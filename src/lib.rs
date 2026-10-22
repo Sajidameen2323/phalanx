@@ -3,6 +3,7 @@
 
 pub mod ai;
 pub mod audit;
+pub mod cmdline;
 pub mod engine;
 pub mod heuristics;
 pub mod posture;

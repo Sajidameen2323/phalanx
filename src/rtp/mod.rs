@@ -23,17 +23,23 @@
 //! is checked within about half a second of starting and stopped if it is
 //! known malware, and very short-lived programs can finish before that.
 //!
+//! With program protection on, the command lines of script hosts and Windows
+//! tools, and commands entered in the Run box, are also checked against
+//! [`crate::cmdline`]'s rules (see [`commands`]; report-only for now).
+//!
 //! A supervisor restarts the whole pipeline if any part fails or panics,
 //! with backoff, and catches up on files that changed while it was down.
 //! Verdicts are cached for the lifetime of a [`RtpHandle`]; callers start a
 //! new one when signatures or settings change, which also clears the cache.
 
 mod cache;
+pub mod commands;
 mod dirwatch;
 mod files;
 pub mod process;
 
 use self::cache::{Disposition, DispositionCache, FileKey};
+pub use self::commands::{CommandHit, CommandSource};
 use self::process::ProcessInfo;
 use crate::engine::Engine;
 use crate::risk::{DownloadOrigin, RiskyFile};
@@ -81,6 +87,10 @@ pub struct RtpConfig {
     pub alert_risky: bool,
     /// Scan the program file of every process that starts (Windows).
     pub process_protection: bool,
+    /// With `process_protection`: check the command lines of script hosts
+    /// and Windows tools as they start, and commands entered in the Run box.
+    /// Matches are only reported.
+    pub command_rules: bool,
     /// Stop a running program found to be malware. PUPs and hacking tools
     /// (often run on purpose) and heuristic findings are only reported.
     pub stop_running_threats: bool,
@@ -103,6 +113,7 @@ impl RtpConfig {
             settle: Duration::from_secs(3),
             alert_risky: true,
             process_protection: false,
+            command_rules: true,
             stop_running_threats: true,
             trust_signed: true,
             defer_when_fullscreen: true,
@@ -158,6 +169,8 @@ pub enum RtpEvent {
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     /// The scan of a file announced by `RiskyFile` finished.
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
+    /// A command line matched the command-line rules (reported only).
+    Command(CommandHit),
     /// Part of protection failed; everything restarts after `retry_in`.
     Restarting { error: String, retry_in: Duration },
     Error(String),
@@ -218,6 +231,8 @@ struct Ctx<'a> {
     /// Set when stopping or when any thread of this run ends.
     halt: AtomicBool,
     cache: &'a Mutex<DispositionCache>,
+    /// Command lines reported recently, so repeats are collapsed.
+    commands: &'a Mutex<commands::Recent>,
     /// Canonical paths never scanned.
     excluded: &'a [PathBuf],
     events: &'a EventSink,
@@ -249,6 +264,10 @@ impl Ctx<'_> {
         self.config.process_protection && process::SUPPORTED
     }
 
+    fn commands_enabled(&self) -> bool {
+        self.programs_enabled() && self.config.command_rules
+    }
+
     fn lookup(&self, path: &Path) -> Lookup {
         let Some(key) = FileKey::of(path) else { return Lookup::Gone };
         match self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
@@ -273,6 +292,7 @@ enum Item {
 
 fn supervise(engine: &Engine, data_dir: &Path, config: &RtpConfig, stop: &AtomicBool, events: &EventSink) {
     let cache = Mutex::new(DispositionCache::default());
+    let recent_commands = Mutex::new(commands::Recent::default());
     let excluded: Vec<PathBuf> = config
         .exclude
         .iter()
@@ -286,7 +306,7 @@ fn supervise(engine: &Engine, data_dir: &Path, config: &RtpConfig, stop: &Atomic
     loop {
         let started = SystemTime::now();
         let began = Instant::now();
-        let ctx = Ctx { engine, data_dir, config, stop, halt: AtomicBool::new(false), cache: &cache, excluded: &excluded, events };
+        let ctx = Ctx { engine, data_dir, config, stop, halt: AtomicBool::new(false), cache: &cache, commands: &recent_commands, excluded: &excluded, events };
         let outcome = run_once(&ctx, catch_up);
         if stop.load(Ordering::Relaxed) {
             return;
@@ -332,6 +352,10 @@ fn run_once(ctx: &Ctx<'_>, catch_up: Option<SystemTime>) -> Result<(), String> {
             add(spawn_part(s, ctx, "sweep-lane", true, move || lane(ctx, sweep_rx, true)), "sweep-lane");
             let urgent = urgent_tx.clone();
             add(spawn_part(s, ctx, "program-monitor", false, move || programs(ctx, &urgent, &sweep_tx)), "program-monitor");
+            #[cfg(windows)]
+            if ctx.commands_enabled() {
+                add(spawn_part(s, ctx, "run-box-monitor", true, move || commands::run_box(ctx)), "run-box-monitor");
+            }
         } else {
             drop(sweep_rx);
         }
@@ -381,8 +405,9 @@ fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
 
 /// Watches for programs starting. Programs already running when protection
 /// starts go to the sweep lane, so they never hold up new files; new ones go
-/// to the urgent lane.
+/// to the urgent lane. Command lines are checked here, before the scan.
 fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Result<()> {
+    let store = if ctx.commands_enabled() { Some(scan::open_store(ctx.data_dir)?) } else { None };
     let mut known: HashSet<process::ProcessId> = HashSet::new();
     let mut first = true;
     let mut failures = 0;
@@ -392,12 +417,18 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Resul
                 failures = 0;
                 let lane = if first { sweep } else { urgent };
                 let mut current = HashSet::with_capacity(list.len());
-                for info in list {
+                let by_pid: HashMap<u32, &ProcessInfo> = list.iter().map(|p| (p.id.pid, p)).collect();
+                for info in &list {
                     current.insert(info.id.clone());
                     if known.contains(&info.id) || ctx.is_excluded(&info.image) {
                         continue;
                     }
-                    lane.send(Item::Program(info)).map_err(|_| anyhow!("the scan lane stopped"))?;
+                    if let Some(store) = &store {
+                        if let Some(hit) = commands::check_program(ctx, info, &by_pid) {
+                            commands::report(ctx, store, hit);
+                        }
+                    }
+                    lane.send(Item::Program(info.clone())).map_err(|_| anyhow!("the scan lane stopped"))?;
                 }
                 known = current;
                 first = false;

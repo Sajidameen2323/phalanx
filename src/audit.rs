@@ -17,6 +17,7 @@
 //! Each program found is also scanned with the local engine. Nothing is
 //! changed; removing persistence is left to the user, with the location shown.
 
+use crate::cmdline::tokens;
 use crate::engine::Engine;
 use crate::Finding;
 use serde::{Deserialize, Serialize};
@@ -438,25 +439,7 @@ fn rate(it: &mut AuditItem, env: &Env) {
 
 /// Script hosts and the arguments that make them suspicious.
 fn script_reasons(host: &str, args: &str) -> Vec<String> {
-    let a = args.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let has = |needles: &[&str]| needles.iter().any(|n| a.contains(n));
-    if has(&[" -enc ", " -e ", "-encodedcommand", "frombase64string", " -ec "]) || a.starts_with("-e ") || a.starts_with("-enc ") {
-        out.push(format!("{host} runs encoded (hidden) code"));
-    }
-    if has(&["http://", "https://", "downloadstring", "downloadfile", "invoke-webrequest", "iwr ", "curl ", "wget ", "bitsadmin", "urlcache", "net.webclient"]) {
-        out.push(format!("{host} downloads and runs code from the internet"));
-    }
-    if has(&["iex", "invoke-expression"]) && !out.iter().any(|r| r.contains("encoded")) {
-        out.push(format!("{host} runs code built at run time (Invoke-Expression)"));
-    }
-    if has(&["-w hidden", "-windowstyle hidden", "-win hidden", "-windowstyle 1"]) {
-        out.push(format!("{host} runs in a hidden window"));
-    }
-    if host == "mshta" || (host == "regsvr32" && has(&["/i:http", "scrobj"])) {
-        out.push(format!("{host} is a common way to run downloaded scripts"));
-    }
-    out
+    crate::cmdline::analyze(host, args).into_iter().map(|m| m.reason).collect()
 }
 
 /// Switches that let another program control the browser or read its data.
@@ -531,28 +514,6 @@ fn split_program(command: &str, env: &Env) -> (Option<PathBuf>, String) {
         Some(first) if !first.is_empty() => (Some(env.resolve(first)), parts[1..].join(" ").trim().to_string()),
         _ => (None, String::new()),
     }
-}
-
-/// Splits arguments on spaces, keeping quoted parts together.
-fn tokens(args: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for c in args.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            ' ' if !quoted => {
-                if !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
 }
 
 /// The environment the paths are interpreted in.
