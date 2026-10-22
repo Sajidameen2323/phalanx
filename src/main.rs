@@ -67,6 +67,11 @@ enum Command {
         /// Only report which feeds have new data (exit code 1 if any).
         #[arg(long, conflicts_with = "force")]
         check: bool,
+        /// Save a free abuse.ch Auth-Key (https://auth.abuse.ch/), encrypted
+        /// for this Windows user, for MalwareBazaar, ThreatFox and URLhaus.
+        /// Without one those feeds are skipped. `none` removes it.
+        #[arg(long, value_name = "KEY", conflicts_with_all = ["force", "check"])]
+        set_key: Option<String>,
     },
     /// Look for what infostealers and their loaders leave behind: start-up
     /// entries, tasks, services, browser shortcuts and policies, proxy and
@@ -598,8 +603,14 @@ fn run() -> Result<ExitCode> {
         }
         Command::Inspect(args) => inspect(args, &dir),
         Command::Web(cmd) => web_command(cmd, &dir),
-        Command::Update { force, check } => {
+        Command::Update { force, check, set_key } => {
             let sig_dir = update::signature_dir(&dir);
+            if let Some(key) = set_key {
+                let remove = key.eq_ignore_ascii_case("none");
+                update::save_auth_key(&sig_dir, (!remove).then_some(key.as_str()))?;
+                println!("{}", if remove { "abuse.ch Auth-Key removed." } else { "abuse.ch Auth-Key saved. Run `phalanx-cli update` to download its feeds." });
+                return Ok(ExitCode::SUCCESS);
+            }
             if *check {
                 let result = update::check_for_updates(&sig_dir);
                 for name in &result.changed {
@@ -615,9 +626,13 @@ fn run() -> Result<ExitCode> {
             }
             let manifest = update::update_all(&sig_dir, *force, &mut |step| eprintln!("{step}"))?;
             for s in &manifest.sources {
-                println!("{} {}: {}", if s.ok { "ok  " } else { "FAIL" }, s.name, s.message);
+                let state = if s.ok { "ok  " } else if s.skipped { "skip" } else { "FAIL" };
+                println!("{state} {}: {}", s.name, s.message);
             }
-            if !manifest.installed_anything() && manifest.sources.iter().all(|s| s.ok) {
+            if manifest.sources.iter().any(|s| s.skipped) {
+                println!("Get a free abuse.ch Auth-Key at {} and save it with `phalanx-cli update --set-key <KEY>`.", update::AUTH_KEY_PORTAL);
+            }
+            if !manifest.installed_anything() && !manifest.sources.iter().any(|s| s.failed()) {
                 println!("Everything was already up to date.");
                 return Ok(ExitCode::SUCCESS);
             }
@@ -631,7 +646,7 @@ fn run() -> Result<ExitCode> {
                 engine.rule_count(),
                 engine.hash_count()
             );
-            Ok(if manifest.sources.iter().all(|s| s.ok) {
+            Ok(if !manifest.sources.iter().any(|s| s.failed()) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)
@@ -787,6 +802,11 @@ fn print_checks(title: &str, checks: &[Check], privacy: bool) {
             (Status::Unknown, _) => "unknown",
         };
         println!("  {state}  {}: {}", c.title, c.detail);
+        if let Some(toggle) = c.toggle {
+            let protective = c.status != Status::Good;
+            let page = if privacy { "Privacy" } else { "Protection" };
+            println!("           the Phalanx app can switch this ({page} page): {}", toggle.label(protective));
+        }
         if let Some(fix) = &c.fix {
             println!("           fix (as administrator): {}", fix.command);
         }

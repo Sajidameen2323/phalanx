@@ -119,6 +119,19 @@ pub fn notify(summary: &str, body: &str) {
     let _ = toast.show();
 }
 
+/// Tells File Explorer that its view settings changed (such as showing file
+/// extensions), so open windows update without signing out.
+pub fn refresh_explorer_settings() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
+        let area: Vec<u16> = "ShellState".encode_utf16().chain(Some(0)).collect();
+        SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, area.as_ptr() as isize, SMTO_ABORTIFHUNG, 1000, std::ptr::null_mut());
+        SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST, std::ptr::null(), std::ptr::null());
+    }
+}
+
 /// Encrypts a secret for the current Windows user (DPAPI), hex-encoded for
 /// storage in a settings file. Only this user on this PC can decrypt it.
 pub fn protect_secret(secret: &str) -> Result<String> {

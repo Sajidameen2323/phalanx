@@ -23,7 +23,10 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileReport {
     pub browser: String,
+    /// The name the browser shows for the profile.
     pub profile: String,
+    /// The profile's folder (`Default`, `Profile 1`), which opens its pages.
+    pub profile_dir: String,
     pub checks: Vec<Check>,
 }
 
@@ -52,20 +55,32 @@ fn install_dirs(name: &str) -> Vec<PathBuf> {
         "Microsoft Edge" => r"Microsoft\Edge\Application",
         "Brave" => r"BraveSoftware\Brave-Browser\Application",
         "Vivaldi" => r"Vivaldi\Application",
+        "Chromium" => r"Chromium\Application",
         _ => return Vec::new(),
     };
     [pf, pf86, local].into_iter().flatten().map(|b| b.join(rel)).filter(|d| d.is_dir()).collect()
 }
 
+/// The browser's program file, without `.exe`.
 fn exe_name(name: &str) -> &'static str {
     match name {
-        "Google Chrome" => "chrome",
+        "Google Chrome" | "Chromium" => "chrome",
         "Microsoft Edge" => "msedge",
         "Brave" => "brave",
         "Vivaldi" => "vivaldi",
-        _ => "chromium",
+        _ => "chrome",
     }
 }
+
+/// The name links use for the browser (`start:<program> <page>`).
+fn program(name: &str) -> &'static str {
+    match name {
+        "Chromium" => "chromium",
+        name => exe_name(name),
+    }
+}
+
+const BROWSERS: [&str; 5] = ["Google Chrome", "Microsoft Edge", "Brave", "Vivaldi", "Chromium"];
 
 /// Settings page for a browser, opened with the browser itself.
 fn settings_link(name: &str) -> Link {
@@ -73,8 +88,50 @@ fn settings_link(name: &str) -> Link {
         "Google Chrome" => Link { label: "Open Chrome security settings", target: "start:chrome chrome://settings/security" },
         "Microsoft Edge" => Link { label: "Open Edge privacy and security settings", target: "start:msedge edge://settings/privacy" },
         "Brave" => Link { label: "Open Brave security settings", target: "start:brave brave://settings/security" },
+        // Vivaldi answers Chromium's own page addresses.
+        "Vivaldi" => Link { label: "Open Vivaldi security settings", target: "start:vivaldi chrome://settings/security" },
+        "Chromium" => Link { label: "Open Chromium security settings", target: "start:chromium chrome://settings/security" },
         _ => Link { label: "Open the browser's settings", target: "start:chrome chrome://settings/security" },
     }
+}
+
+/// Opens a browser's own page (`chrome://settings/security`) with that
+/// browser, in the given profile folder when one is named. `program` is the
+/// browser's program name (`chrome`, `msedge`, `brave`, `vivaldi`).
+/// Chromium ignores internal pages given on its command line, so the page
+/// goes through Browser Guard ([`crate::posture::browser_page_address`]).
+pub fn open_browser_page(program_name: &str, page: &str, profile: Option<&str>) -> std::io::Result<()> {
+    let address = crate::posture::browser_page_address(page);
+    let installed = BROWSERS
+        .into_iter()
+        .filter(|name| program(name) == program_name)
+        .flat_map(|name| install_dirs(name).into_iter().map(move |dir| dir.join(format!("{}.exe", exe_name(name)))))
+        .find(|exe| exe.is_file());
+    let Some(exe) = installed else {
+        // Not in a usual folder: let Windows find it (App Paths). The profile
+        // cannot be passed safely through `start`, so the last one used opens.
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/c", "start", "", program_name, &address]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        return command.spawn().map(drop);
+    };
+    let mut command = std::process::Command::new(exe);
+    // A running browser hands the request to the window of that profile.
+    if let Some(profile) = profile.filter(|p| is_profile_folder(p)) {
+        command.arg(format!("--profile-directory={profile}"));
+    }
+    command.arg(address).spawn().map(drop)
+}
+
+/// Profile folder names as Chromium makes them (`Default`, `Profile 3`,
+/// `Guest Profile`): nothing that could act as another argument.
+fn is_profile_folder(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_')
 }
 
 /// The browser's own password manager.
@@ -83,13 +140,15 @@ fn passwords_link(name: &str) -> Link {
     match name {
         "Microsoft Edge" => Link { label, target: "start:msedge edge://wallet/passwords" },
         "Brave" => Link { label, target: "start:brave brave://password-manager/passwords" },
+        "Vivaldi" => Link { label: "Open Vivaldi settings (Privacy and security > Passwords)", target: "start:vivaldi chrome://settings/security" },
+        "Chromium" => Link { label, target: "start:chromium chrome://password-manager/passwords" },
         _ => Link { label, target: "start:chrome chrome://password-manager/passwords" },
     }
 }
 
 /// Every browser page the checks link to, for tests.
 pub fn browser_links() -> Vec<&'static str> {
-    ["Google Chrome", "Microsoft Edge", "Brave", "Vivaldi"]
+    BROWSERS
         .iter()
         .flat_map(|name| [settings_link(name), update_link(name), passwords_link(name)])
         .map(|link| link.target)
@@ -101,6 +160,7 @@ fn update_link(name: &str) -> Link {
         "Google Chrome" => Link { label: "Open About Chrome (updates and restarts)", target: "start:chrome chrome://settings/help" },
         "Microsoft Edge" => Link { label: "Open About Edge (updates and restarts)", target: "start:msedge edge://settings/help" },
         "Brave" => Link { label: "Open About Brave (updates and restarts)", target: "start:brave brave://settings/help" },
+        "Vivaldi" => Link { label: "Open About Vivaldi (updates and restarts)", target: "start:vivaldi chrome://settings/help" },
         _ => settings_link(name),
     }
 }
@@ -193,6 +253,7 @@ pub fn version_check(name: &str, installed: Option<&str>, latest: Option<&str>, 
         weight: 5,
         link: update_link(name),
         fix: None,
+        toggle: None,
     }
 }
 
@@ -233,6 +294,7 @@ pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_sta
         weight: 3,
         link,
         fix: None,
+        toggle: None,
     });
 
     // JavaScript optimizer (V8 JIT): content setting 2 = blocked everywhere.
@@ -251,6 +313,7 @@ pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_sta
         weight: 2,
         link,
         fix: None,
+        toggle: None,
     });
 
     // Secure DNS lives in Local State, for all profiles.
@@ -269,6 +332,7 @@ pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_sta
         weight: 0,
         link,
         fix: None,
+        toggle: None,
     });
 
     // Browser Guard: present in either preference file's extension settings.
@@ -282,6 +346,7 @@ pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_sta
         weight: 4,
         link: Link { label: "Open the Web protection page in Phalanx", target: "" },
         fix: None,
+        toggle: None,
     });
 
     let (status, detail) = match passwords {
@@ -301,6 +366,7 @@ pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_sta
         weight: 2,
         link: passwords_link(name),
         fix: None,
+        toggle: None,
     });
     checks
 }
@@ -350,6 +416,7 @@ pub fn check(online: bool) -> HardeningReport {
                 browser: browser.name.clone(),
                 profile: display,
                 checks: profile_checks(&browser, &dir, local_state.as_ref()),
+                profile_dir: dir,
             });
         }
     }
@@ -363,6 +430,22 @@ mod tests {
 
     fn find<'a>(checks: &'a [Check], id: &str) -> &'a Check {
         checks.iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn only_real_profile_folders_reach_the_command_line() {
+        assert!(is_profile_folder("Default"));
+        assert!(is_profile_folder("Profile 12"));
+        assert!(is_profile_folder("Guest Profile"));
+        assert!(!is_profile_folder("--disable-web-security"));
+        assert!(!is_profile_folder("Profile 1\" --x"));
+        assert!(!is_profile_folder(""));
+        // Every browser opens its own pages, never another browser's.
+        for name in BROWSERS {
+            for link in [settings_link(name), update_link(name), passwords_link(name)] {
+                assert!(link.target.starts_with(&format!("start:{} ", program(name))), "{name}: {}", link.target);
+            }
+        }
     }
 
     #[test]
