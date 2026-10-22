@@ -334,11 +334,7 @@ impl App {
     }
 
     pub(super) fn web_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        page_header(
-            ui,
-            "Web protection",
-            "Blocks malware and phishing sites in your browsers and for the whole PC, and finds dangerous browser extensions.",
-        );
+        page_header(ui, "Web protection");
         // Extensions get added and browsers report in while the page is open.
         if self.web.browsers_checked.elapsed() >= BROWSER_REFRESH {
             self.web.browsers = native::status(&self.data_dir);
@@ -385,13 +381,13 @@ impl App {
         let web = &self.web;
         let (protected, installed) = (web.protected_browsers(), web.installed_browsers());
         let browsers = match (protected, installed) {
-            (_, 0) => (MUTED, "No supported browser found".to_string()),
-            (0, _) => (AMBER, "No browser is protected yet: connect browsers and add the extension".to_string()),
-            (p, i) if p < i => (AMBER, format!("{p} of {i} browsers protected")),
-            (p, _) => (GREEN, format!("All {p} browsers protected")),
+            (_, 0) => (theme().muted, "No supported browser found".to_string()),
+            (0, _) => (theme().amber, "No browser is protected yet: connect browsers and add the extension".to_string()),
+            (p, i) if p < i => (theme().amber, format!("{p} of {i} browsers protected")),
+            (p, _) => (theme().green, format!("All {p} browsers protected")),
         };
         let hardening = match &web.hardening {
-            None => (MUTED, "Not checked yet".to_string()),
+            None => (theme().muted, "Not checked yet".to_string()),
             Some(report) => {
                 use threat_scanner::posture::Status;
                 let issues = report
@@ -401,26 +397,26 @@ impl App {
                     .chain(report.profiles.iter().flat_map(|p| p.checks.iter()))
                     .filter(|c| matches!(c.status, Status::Risk | Status::Attention))
                     .count();
-                if issues == 0 { (GREEN, "Browsers up to date, no settings to review".to_string()) } else { (AMBER, format!("{issues} item(s) to review")) }
+                if issues == 0 { (theme().green, "Browsers up to date, no settings to review".to_string()) } else { (theme().amber, format!("{issues} item(s) to review")) }
             }
         };
         let extensions = match &web.scan {
-            None => (MUTED, "Not checked yet".to_string()),
+            None => (theme().muted, "Not checked yet".to_string()),
             Some(scan) => match (scan.flagged().filter(|e| e.category.is_some()).count(), scan.flagged().count()) {
-                (0, 0) => (GREEN, "Nothing needs your attention".to_string()),
-                (0, n) => (AMBER, format!("{n} worth reviewing")),
-                (t, _) => (RED, format!("{t} dangerous extension(s)")),
+                (0, 0) => (theme().green, "Nothing needs your attention".to_string()),
+                (0, n) => (theme().amber, format!("{n} worth reviewing")),
+                (t, _) => (theme().red, format!("{t} dangerous extension(s)")),
             },
         };
         let dns = match (&web.filter, &web.filter_error) {
-            (_, Some(_)) => (RED, "Could not start".to_string()),
-            (Some(_), None) if web.windows_dns => (GREEN, "Running, and Windows uses it".to_string()),
-            (Some(_), None) => (AMBER, "Running, but Windows does not use it yet".to_string()),
-            (None, None) => (MUTED, "Off (optional: protects every program, not just browsers)".to_string()),
+            (_, Some(_)) => (theme().red, "Could not start".to_string()),
+            (Some(_), None) if web.windows_dns => (theme().green, "Running, and Windows uses it".to_string()),
+            (Some(_), None) => (theme().amber, "Running, but Windows does not use it yet".to_string()),
+            (None, None) => (theme().muted, "Off (optional: protects every program, not just browsers)".to_string()),
         };
         let day_ago = (chrono::Local::now() - chrono::Duration::days(1)).to_rfc3339();
         let recent = web.events.iter().filter(|e| e.time >= day_ago && e.action == "blocked").count();
-        let activity = (if recent == 0 { MUTED } else { RED }, format!("{recent} dangerous site(s) blocked in the last 24 hours"));
+        let activity = (if recent == 0 { theme().muted } else { theme().red }, format!("{recent} dangerous site(s) blocked in the last 24 hours"));
         let rows = [
             ("Browser Guard", browsers, WebTab::Browsers),
             ("Browser hardening", hardening, WebTab::Browsers),
@@ -455,13 +451,13 @@ impl App {
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let (color, title) = match (config.enabled, config.mode) {
-                    (false, _) => (MUTED, "Web protection is off"),
-                    (true, Mode::ReportOnly) => (AMBER, "Report-only: matches are logged, not blocked"),
-                    (true, Mode::Block) if connected == 0 && self.web.filter.is_none() => (AMBER, "Add the extension to a browser to start blocking"),
-                    (true, Mode::Block) => (GREEN, "Web protection is on"),
+                    (false, _) => (theme().muted, "Web protection is off"),
+                    (true, Mode::ReportOnly) => (theme().amber, "Report-only: matches are logged, not blocked"),
+                    (true, Mode::Block) if connected == 0 && self.web.filter.is_none() => (theme().amber, "Add the extension to a browser to start blocking"),
+                    (true, Mode::Block) => (theme().green, "Web protection is on"),
                 };
                 status_dot(ui, color, 6.0);
-                ui.label(RichText::new(title).size(18.0).strong().color(TEXT));
+                ui.label(RichText::new(title).size(18.0).strong().color(theme().text));
             });
             facts(
                 ui,
@@ -474,7 +470,7 @@ impl App {
                 ],
             );
             if let Some(e) = &self.web.rules_error {
-                notice(ui, RED, &format!("Some web rules could not be loaded: {e}"));
+                notice(ui, theme().red, &format!("Some web rules could not be loaded: {e}"));
             }
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
@@ -533,10 +529,10 @@ impl App {
             for b in &self.web.browsers {
                 let state = b.state();
                 let color = match state {
-                    GuardState::Protecting => GREEN,
-                    GuardState::Waiting | GuardState::ExtensionMissing | GuardState::OtherCopy => AMBER,
-                    GuardState::NotConnected if b.installed => AMBER,
-                    _ => MUTED,
+                    GuardState::Protecting => theme().green,
+                    GuardState::Waiting | GuardState::ExtensionMissing | GuardState::OtherCopy => theme().amber,
+                    GuardState::NotConnected if b.installed => theme().amber,
+                    _ => theme().muted,
                 };
                 setting_row(ui, &b.browser, &b.describe(), |ui| status_dot(ui, color, 5.0));
             }
@@ -594,11 +590,11 @@ impl App {
             if let Some((target, verdict)) = &self.web.check_result {
                 ui.add_space(6.0);
                 let (color, text) = if verdict.blocks() {
-                    (RED, format!("{target} would be blocked: {} ({}), via {}", verdict.threat, verdict.category, verdict.list))
+                    (theme().red, format!("{target} would be blocked: {} ({}), via {}", verdict.threat, verdict.category, verdict.list))
                 } else if verdict.code == threat_scanner::web::VerdictCode::Clean {
-                    (GREEN, format!("{target}: no known threats"))
+                    (theme().green, format!("{target}: no known threats"))
                 } else {
-                    (GREEN, format!("{target}: {}", verdict.code.label()))
+                    (theme().green, format!("{target}: {}", verdict.code.label()))
                 };
                 notice(ui, color, &text);
             }
@@ -628,9 +624,9 @@ impl App {
             });
             let config = &self.web.config;
             let lists = [
-                ("Allowed", &config.user_allow, GREEN),
-                ("Blocked", &config.user_block, RED),
-                ("Allowed from the browser's warning page", &config.extension_exclusions, AMBER),
+                ("Allowed", &config.user_allow, theme().green),
+                ("Blocked", &config.user_block, theme().red),
+                ("Allowed from the browser's warning page", &config.extension_exclusions, theme().amber),
             ];
             if lists.iter().all(|(_, l, _)| l.is_empty()) {
                 small(ui, "No sites yet.");
@@ -640,11 +636,11 @@ impl App {
                     continue;
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new(label).size(13.0).color(MUTED));
+                ui.label(RichText::new(label).size(13.0).color(theme().muted));
                 for site in list {
                     ui.horizontal(|ui| {
                         status_dot(ui, color, 3.5);
-                        ui.label(RichText::new(site).color(TEXT));
+                        ui.label(RichText::new(site).color(theme().text));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if small_button(ui, "Remove").clicked() {
                                 forget = Some(site.clone());
@@ -697,14 +693,14 @@ impl App {
                 ),
             );
             if report.flagged().count() == 0 && report.settings.is_empty() {
-                notice(ui, GREEN, "Nothing needs your attention.");
+                notice(ui, theme().green, "Nothing needs your attention.");
             }
             for e in report.flagged() {
                 ui.add_space(8.0);
-                let color = e.category.map(category_color).unwrap_or(MUTED);
+                let color = e.category.map(category_color).unwrap_or(theme().muted);
                 ui.horizontal_wrapped(|ui| {
                     badge(ui, &e.rating().to_uppercase(), color);
-                    ui.label(RichText::new(format!("{} {}", e.name, e.version)).strong().color(TEXT));
+                    ui.label(RichText::new(format!("{} {}", e.name, e.version)).strong().color(theme().text));
                     small(ui, format!("{} · {} · risk {}/100", e.browser, e.profile_name, e.score));
                 });
                 for r in &e.reasons {
@@ -716,10 +712,10 @@ impl App {
             }
             for s in &report.settings {
                 ui.add_space(8.0);
-                let color = if s.blocked { RED } else { AMBER };
+                let color = if s.blocked { theme().red } else { theme().amber };
                 ui.horizontal_wrapped(|ui| {
                     badge(ui, if s.blocked { "THREAT" } else { "REVIEW" }, color);
-                    ui.label(RichText::new(format!("{} {}: {}", s.browser, s.setting, s.value)).color(TEXT));
+                    ui.label(RichText::new(format!("{} {}: {}", s.browser, s.setting, s.value)).color(theme().text));
                 });
                 small(ui, format!("{} ({}). Change it in the browser's settings.", s.reason, s.profile_name));
             }
@@ -757,7 +753,7 @@ impl App {
                 section_title(ui, "Browser hardening");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if self.web.hardening_rx.is_some() {
-                        ui.add(egui::Spinner::new().color(ACCENT));
+                        spinner(ui);
                     } else {
                         recheck = small_button(ui, "Check again").clicked();
                     }
@@ -767,14 +763,14 @@ impl App {
             let Some(report) = &self.web.hardening else { return };
             for v in &report.versions {
                 row_divider(ui);
-                ui.label(RichText::new(&v.browser).strong().color(TEXT));
+                ui.label(RichText::new(&v.browser).strong().color(theme().text));
                 if check_row(ui, &v.check, false) == Some(CheckAction::OpenSettings) {
                     open = Some(v.check.link);
                 }
             }
             for p in &report.profiles {
                 row_divider(ui);
-                ui.label(RichText::new(format!("{} · {}", p.browser, p.profile)).strong().color(TEXT));
+                ui.label(RichText::new(format!("{} · {}", p.browser, p.profile)).strong().color(theme().text));
                 for c in p.checks.iter().filter(|c| c.status != threat_scanner::posture::Status::Info || c.id == "secure_dns") {
                     if check_row(ui, c, false) == Some(CheckAction::OpenSettings) {
                         open = Some(c.link);
@@ -861,13 +857,13 @@ impl App {
                 "A local resolver that answers blocked names with a block address, so every program, not just browsers, is stopped from reaching them.",
             );
             if let Some(e) = &self.web.filter_error {
-                notice(ui, RED, &format!("The DNS filter could not start: {e}. Another program may be using the address; change it below."));
+                notice(ui, theme().red, &format!("The DNS filter could not start: {e}. Another program may be using the address; change it below."));
             } else if running {
                 let note = if self.web.windows_dns {
-                    (GREEN, format!("Running on {}, forwarding to {}. Windows is using it.", self.web.config.dns_listen, upstreams.join(", ")))
+                    (theme().green, format!("Running on {}, forwarding to {}. Windows is using it.", self.web.config.dns_listen, upstreams.join(", ")))
                 } else {
                     (
-                        AMBER,
+                        theme().amber,
                         format!(
                             "Running on {}, but Windows does not use it yet. Set your network adapter's DNS server to {} (Settings > Network & internet > your connection > DNS server assignment), and set the router as the alternate so the internet keeps working when Phalanx is closed.",
                             self.web.config.dns_listen,
@@ -938,7 +934,7 @@ impl App {
                         DnsChange::Restore => ("Restore the DNS settings saved before?", "Each adapter goes back to exactly what it used before (automatic from the router, or the servers it had). Windows asks for administrator permission."),
                     };
                     ui.add_space(6.0);
-                    notice(ui, if change == DnsChange::Apply && !self.web.dns_fallback { RED } else { AMBER }, &format!("{title} {text}"));
+                    notice(ui, if change == DnsChange::Apply && !self.web.dns_fallback { theme().red } else { theme().amber }, &format!("{title} {text}"));
                     ui.horizontal(|ui| {
                         if primary_button(ui, "Run as administrator").clicked() {
                             self.web.dns_confirm = None;
@@ -951,7 +947,7 @@ impl App {
                 }
                 _ if busy => {
                     ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().color(ACCENT));
+                        spinner(ui);
                         muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
                     });
                 }
@@ -979,15 +975,15 @@ impl App {
                 small(ui, "Nothing blocked yet.");
             }
             for e in self.web.events.iter().take(30) {
-                let color = if e.action == "blocked" { RED } else { AMBER };
+                let color = if e.action == "blocked" { theme().red } else { theme().amber };
                 ui.horizontal(|ui| {
                     status_dot(ui, color, 3.5);
-                    ui.label(RichText::new(short_time(&e.time)).size(12.0).color(MUTED));
+                    ui.label(RichText::new(short_time(&e.time)).size(12.0).color(theme().muted));
                     let source = if e.source == "dns" { "DNS" } else { "browser" };
                     ui.label(RichText::new(format!("{} ({source})", e.action)).size(12.0).color(color));
-                    truncated(ui, e.target.clone(), TEXT, 13.0);
+                    truncated(ui, e.target.clone(), theme().text, 13.0);
                 });
-                truncated(ui, format!("{} · {} · {}", e.threat, e.category, e.list), MUTED, 12.0);
+                truncated(ui, format!("{} · {} · {}", e.threat, e.category, e.list), theme().muted, 12.0);
             }
         });
     }
