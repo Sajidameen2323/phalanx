@@ -61,6 +61,10 @@ impl App {
                     });
             });
 
+        // Popups float over whichever page asked for them.
+        self.fix_dialog(ctx);
+        self.dns_dialog(ctx);
+
         // An appearance change eases over from the old background instead of cutting.
         if let Some((previous, since)) = self.theme_fade {
             let fade = 1.0 - motion::settle((ctx.input(|i| i.time) - since) as f32, 0.45);
@@ -888,17 +892,15 @@ impl App {
         });
         ui.add_space(14.0);
 
-        let engine_before = (self.settings.heuristics, self.settings.rules_dir.clone(), self.settings.hashes_file.clone());
-        let mut reload = false;
+        let heuristics_before = self.settings.heuristics;
         match self.settings_tab {
             SettingsTab::General => self.settings_general(ui),
             SettingsTab::Scanning => self.settings_scanning(ui),
             SettingsTab::Exclusions => self.settings_exclusions(ui),
-            SettingsTab::Signatures => self.settings_signatures(ui, ctx, &mut reload),
+            SettingsTab::Signatures => self.settings_signatures(ui, ctx),
             SettingsTab::Ai => self.settings_ai(ui, ctx),
         }
-        let engine_after = (self.settings.heuristics, self.settings.rules_dir.clone(), self.settings.hashes_file.clone());
-        if reload || engine_after != engine_before {
+        if self.settings.heuristics != heuristics_before {
             self.reload_signatures(ctx);
         }
     }
@@ -1115,7 +1117,7 @@ impl App {
         }
     }
 
-    fn settings_signatures(&mut self, ui: &mut Ui, ctx: &egui::Context, reload: &mut bool) {
+    fn settings_signatures(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut update_clicked = false;
         let mut check_clicked = false;
         card(ui, |ui| {
@@ -1175,6 +1177,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     let color = match status {
                         Some(s) if s.ok => theme().green,
+                        Some(s) if s.skipped => theme().amber,
                         Some(_) => theme().red,
                         None => theme().muted,
                     };
@@ -1187,7 +1190,7 @@ impl App {
                     small(ui, when);
                 });
                 if let Some(s) = status {
-                    truncated(ui, s.message.clone(), if s.ok { theme().muted } else { theme().red }, 12.0);
+                    truncated(ui, s.message.clone(), if s.ok || s.skipped { theme().muted } else { theme().red }, 12.0);
                 }
             }
             ui.add_space(4.0);
@@ -1199,25 +1202,70 @@ impl App {
                     update_clicked = primary_button(ui, "Update now").clicked();
                 }
             });
-            small(ui, "Sources: YARA Forge (licences vary per rule) and abuse.ch MalwareBazaar, ThreatFox and URLhaus (CC0). Only feeds with new data are downloaded, and downloads are validated before they replace your current signatures. Web protection picks up new web rules automatically.");
+            small(ui, "Sources: YARA Forge (licences vary per rule), malware-filter's URLhaus host list (CC0), StevenBlack hosts (MIT) and, with an Auth-Key, abuse.ch MalwareBazaar, ThreatFox and URLhaus (CC0). Only feeds with new data are downloaded, and downloads are validated before they replace your current signatures. Web protection picks up new web rules automatically.");
         });
         if update_clicked {
             self.start_update(ctx, false);
         }
         ui.add_space(14.0);
+        self.abuse_key_card(ui, ctx);
+    }
 
+    /// The free abuse.ch Auth-Key that MalwareBazaar, ThreatFox and URLhaus
+    /// need for their known-bad hashes and malware sites.
+    fn abuse_key_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let saved = self.abuse_key_saved;
+        let from_env = !saved && std::env::var(update::AUTH_KEY_ENV).is_ok_and(|k| !k.trim().is_empty());
+        let (mut save, mut remove) = (false, false);
         card(ui, |ui| {
-            group_title(ui, "Your own signatures", "These are never scanned, since they contain the patterns they detect.");
-            path_setting(ui, "Extra YARA rules folder", &mut self.settings.rules_dir, true, reload);
-            row_divider(ui);
-            path_setting(ui, "Extra hash list file", &mut self.settings.hashes_file, false, reload);
-            row_divider(ui);
-            setting_row(ui, "Reload", "Compile the rules again, for example after editing your own rule files.", |ui| {
-                if small_button(ui, "Reload signatures").clicked() {
-                    *reload = true;
+            group_title(ui, "abuse.ch Auth-Key", "");
+            let (state, color) = match (saved, from_env) {
+                (true, _) => ("Saved", theme().green),
+                (false, true) => ("From environment", theme().green),
+                _ => ("Not set", theme().amber),
+            };
+            setting_row(
+                ui,
+                "Known-bad hashes and malware sites",
+                "MalwareBazaar, ThreatFox and URLhaus only share their data with a free personal key (sign in at abuse.ch with a GitHub, Google or Microsoft account and copy your Auth-Key). Without it those feeds are skipped; YARA rules and the other feeds still update. The key is stored encrypted by Windows, so only your account on this PC can read it.",
+                |ui| badge(ui, state, color),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.abuse_key_input)
+                        .password(true)
+                        .hint_text(if saved { "Paste a new key to replace the saved one" } else { "Paste your Auth-Key" })
+                        .desired_width(300.0),
+                );
+                let has_input = !self.abuse_key_input.trim().is_empty();
+                save = ui.add_enabled_ui(has_input, |ui| primary_button(ui, "Save key").clicked()).inner;
+                if saved {
+                    remove = secondary_button(ui, "Remove key").clicked();
                 }
             });
+            ui.hyperlink_to(RichText::new("Get a free Auth-Key at auth.abuse.ch").size(12.5), update::AUTH_KEY_PORTAL);
         });
+        let sig_dir = update::signature_dir(&self.data_dir);
+        if save {
+            match update::save_auth_key(&sig_dir, Some(self.abuse_key_input.trim())) {
+                Ok(()) => {
+                    self.abuse_key_input.clear();
+                    self.abuse_key_saved = true;
+                    self.notify("Auth-Key saved; downloading the abuse.ch feeds", true);
+                    self.start_update(ctx, false);
+                }
+                Err(e) => self.notify(format!("Could not save the Auth-Key: {e:#}"), false),
+            }
+        }
+        if remove {
+            match update::save_auth_key(&sig_dir, None) {
+                Ok(()) => {
+                    self.abuse_key_saved = false;
+                    self.notify("Auth-Key removed; the abuse.ch feeds will be skipped", true);
+                }
+                Err(e) => self.notify(format!("Could not remove the Auth-Key: {e:#}"), false),
+            }
+        }
     }
 
     fn settings_ai(&mut self, ui: &mut Ui, ctx: &egui::Context) {
@@ -1331,12 +1379,13 @@ impl App {
         }
     }
 
-    /// Windows Security settings that block threats as they run (read-only).
+    /// Windows Security settings that block threats as they run, with the
+    /// switches and administrator fixes Phalanx can apply.
     fn security_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        self.fix_confirmation(ui, ctx);
         let mut recheck = false;
         let mut open = None;
         let mut confirm = None;
+        let mut toggle = None;
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 section_title(ui, "Windows protection status");
@@ -1390,6 +1439,7 @@ impl App {
                 match check_row(ui, check, false) {
                     Some(CheckAction::OpenSettings) => open = Some(check.link),
                     Some(CheckAction::ApplyFix) => confirm = check.fix,
+                    Some(CheckAction::Toggle(protective)) => toggle = check.toggle.map(|t| (t, protective)),
                     None => {}
                 }
             }
@@ -1415,48 +1465,40 @@ impl App {
         if confirm.is_some() {
             self.pending_fix = confirm;
         }
+        if let Some((t, protective)) = toggle {
+            self.apply_toggle(ctx, t, protective);
+        }
     }
 
-    /// Confirmation for an administrator fix: shows the exact command first.
-    fn fix_confirmation(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        if let Some(note) = &self.fix_note {
-            notice(ui, theme().amber, note);
-            ui.add_space(10.0);
-        }
-        if self.fix_rx.is_some() {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    spinner(ui);
-                    muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
-                });
+    /// The administrator fix popup: asks first (with the exact command),
+    /// stays up while it runs, and explains when Windows accepted the
+    /// command but the setting did not change.
+    fn fix_dialog(&mut self, ctx: &egui::Context) {
+        let running = self.fix_rx.as_ref().map(|_| ());
+        if let Some(note) = self.fix_note.clone().filter(|_| running.is_none() && self.pending_fix.is_none()) {
+            let choice = dialog(ctx, "fix-note", "The setting did not change", false, |ui| {
+                ui.add(egui::Label::new(RichText::new(note).color(theme().text)).wrap());
+                ui.add_space(10.0);
+                primary_button(ui, "OK").clicked().then_some(DialogChoice::Confirm)
             });
-            ui.add_space(14.0);
+            if choice.is_some() {
+                self.fix_note = None;
+            }
             return;
         }
-        let Some(fix) = self.pending_fix else { return };
+        let Some(fix) = self.pending_fix.or(self.running_fix) else { return };
         let restarts = fix == posture::OFFLINE_SCAN;
-        let (mut run, mut cancel) = (false, false);
-        card(ui, |ui| {
-            section_title(ui, if restarts { "Run Microsoft Defender Offline scan?" } else { "Change this Windows setting?" });
-            ui.add(egui::Label::new(RichText::new(fix.effect).color(theme().text)).wrap());
-            ui.add_space(4.0);
-            muted(ui, "Phalanx runs exactly this command as administrator. Windows asks for your permission first:");
-            egui::Frame::new().fill(theme().bg).corner_radius(6.0).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
-                ui.label(RichText::new(fix.command).monospace().color(theme().text));
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                run = if restarts { ui.add(danger_button("Restart and scan")).clicked() } else { primary_button(ui, "Run as administrator").clicked() };
-                cancel = secondary_button(ui, "Cancel").clicked();
-            });
-        });
-        ui.add_space(14.0);
-        if cancel {
-            self.pending_fix = None;
-        }
-        if run {
-            self.pending_fix = None;
-            self.apply_fix(ctx, fix);
+        let title = if restarts { "Run Microsoft Defender Offline scan?" } else { "Change this Windows setting?" };
+        let run = if restarts { danger_button("Restart and scan") } else { egui::Button::new(RichText::new("Run as administrator").strong()) };
+        let busy = running.is_some();
+        let choice = dialog(ctx, "fix-confirm", title, busy, |ui| admin_command_body(ui, fix.effect, Some(fix.command), run, busy));
+        match choice {
+            Some(DialogChoice::Confirm) => {
+                self.pending_fix = None;
+                self.apply_fix(ctx, fix);
+            }
+            Some(DialogChoice::Cancel) => self.pending_fix = None,
+            None => {}
         }
     }
 
@@ -1473,6 +1515,8 @@ impl App {
         };
         let mut recheck = false;
         let mut open = None;
+        let mut confirm = None;
+        let mut toggle = None;
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 match posture::score(&checks) {
@@ -1483,7 +1527,7 @@ impl App {
                             let private = checks.iter().filter(|c| c.status == Status::Good && c.weight > 0).count();
                             let unknown = if score.unknown > 0 { format!(" {} could not be read.", score.unknown) } else { String::new() };
                             muted(ui, format!("{private} of {} scored settings are private.{unknown}", score.scored));
-                            small(ui, "More important settings count for more. Each one links to the Windows page where you can change it.");
+                            small(ui, "More important settings count for more. Phalanx can switch most of them for you; each also links to the Windows page where you can change it.");
                         });
                     }
                     None => {
@@ -1526,8 +1570,11 @@ impl App {
                     if i > 0 {
                         row_divider(ui);
                     }
-                    if check_row(ui, check, true) == Some(CheckAction::OpenSettings) {
-                        open = Some(check.link);
+                    match check_row(ui, check, true) {
+                        Some(CheckAction::OpenSettings) => open = Some(check.link),
+                        Some(CheckAction::ApplyFix) => confirm = check.fix,
+                        Some(CheckAction::Toggle(protective)) => toggle = check.toggle.map(|t| (t, protective)),
+                        None => {}
                     }
                 }
             });
@@ -1537,6 +1584,12 @@ impl App {
         }
         if let Some(link) = open {
             self.open_link(link);
+        }
+        if confirm.is_some() {
+            self.pending_fix = confirm;
+        }
+        if let Some((t, protective)) = toggle {
+            self.apply_toggle(ctx, t, protective);
         }
     }
 
@@ -1866,27 +1919,6 @@ fn detection_card(ui: &mut Ui, row: &mut ResultRow, ai_enabled: bool) -> bool {
             }
         });
     inspect
-}
-
-fn path_setting(ui: &mut Ui, label: &str, value: &mut Option<PathBuf>, folder: bool, changed: &mut bool) {
-    let shown = value.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "None".into());
-    setting_row(ui, label, &shown, |ui| {
-        if small_button(ui, "Choose…").clicked() {
-            let picked = if folder {
-                rfd::FileDialog::new().pick_folder()
-            } else {
-                rfd::FileDialog::new().add_filter("Hash list", &["txt"]).pick_file()
-            };
-            if picked.is_some() {
-                *value = picked;
-                *changed = true;
-            }
-        }
-        if value.is_some() && small_button(ui, "Clear").clicked() {
-            *value = None;
-            *changed = true;
-        }
-    });
 }
 
 /// Scans recorded by real-time protection rather than started by the user.

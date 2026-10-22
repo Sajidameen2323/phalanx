@@ -1,8 +1,14 @@
-//! Read-only checks of Windows security and privacy settings.
+//! Checks of Windows security and privacy settings.
 //!
-//! Nothing here changes a setting. Each check reports what it read, or
+//! Reading never changes a setting. Each check reports what it read, or
 //! `Unknown` with the reason when a value could not be read, and names the
-//! Windows page where the user can change it themselves.
+//! Windows page where the user can change it themselves. Where Phalanx can
+//! change it directly, a check also offers a [`Toggle`] (a per-user setting,
+//! written the way Windows Settings writes it) or a [`Fix`] (an administrator
+//! command shown word for word and run only after Windows' prompt).
+//!
+//! Windows 10 and 11 keep some settings in different places; the checks read
+//! and link to the right one for the running version.
 
 use serde::Serialize;
 
@@ -36,6 +42,9 @@ pub struct Check {
     /// A one-step fix Phalanx can apply (as administrator, after the user
     /// confirms), when the setting is not already as it should be.
     pub fix: Option<Fix>,
+    /// A per-user switch Phalanx can flip both ways without administrator
+    /// rights. `Good` status means it is in its protective position.
+    pub toggle: Option<Toggle>,
 }
 
 /// A fixed administrator command that switches one protection on. Shown to
@@ -76,6 +85,27 @@ pub const FIX_CLOUD: Fix = Fix {
     effect: "Microsoft Defender checks unknown files with Microsoft's cloud, catching brand-new threats.",
 };
 
+pub const FIX_FIREWALL: Fix = Fix {
+    label: "Turn on",
+    command: "Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True",
+    effect: "Windows Firewall blocks unsolicited connections on every kind of network (domain, private and public).",
+};
+pub const FIX_CONTROLLED_FOLDERS: Fix = Fix {
+    label: "Turn on",
+    command: "Set-MpPreference -EnableControlledFolderAccess Enabled",
+    effect: "Only trusted apps can change files in Documents, Pictures and other protected folders. If an app you use is blocked, allow it under Windows Security > Ransomware protection.",
+};
+pub const FIX_DIAGNOSTICS: Fix = Fix {
+    label: "Send required data only",
+    command: r"Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' -Name AllowTelemetry -Value 1 -Type DWord",
+    effect: "Windows sends only required diagnostic data, the same as turning off \"Send optional diagnostic data\" in Settings.",
+};
+pub const FIX_WEB_SEARCH: Fix = Fix {
+    label: "Turn off",
+    command: r"$k = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'; if (-not (Test-Path $k)) { New-Item -Path $k | Out-Null }; Set-ItemProperty -Path $k -Name DisableSearchBoxSuggestions -Value 1 -Type DWord",
+    effect: "Start search stops sending what you type to Bing and shows only results from this PC. Windows Settings has no switch for this: it is the policy Windows reads, set for the account that approves the prompt (yours, if you are an administrator). It applies after you sign out and back in.",
+};
+
 /// Scans from outside Windows after a restart: reaches malware that hides
 /// from scans while Windows runs. Not a check, so it has no status.
 pub const OFFLINE_SCAN: Fix = Fix {
@@ -86,25 +116,98 @@ pub const OFFLINE_SCAN: Fix = Fix {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Link {
+    /// Empty when there is no page to open.
     pub label: &'static str,
-    /// A `windowsdefender:` or `ms-settings:` URI, a program in System32,
+    /// A `windowsdefender:` or `ms-settings:` URI, a program in System32 with
+    /// optional arguments (`control.exe folders`), an `https:` page,
     /// `start:<browser> <settings page>`, or empty for a page inside Phalanx.
     pub target: &'static str,
 }
 
 impl Link {
-    /// Opens the Windows page. Targets are fixed constants, never user input.
+    /// Opens the page. Targets are fixed constants, never user input.
     pub fn open(&self) -> std::io::Result<()> {
-        // `start:<program> <page>`: a browser's own settings page, which only
-        // that browser can open (found through Windows' App Paths).
+        self.open_in_profile(None)
+    }
+
+    /// Like [`Link::open`]; a browser page opens in the given profile folder
+    /// (`Default`, `Profile 1`) of that browser.
+    pub fn open_in_profile(&self, profile: Option<&str>) -> std::io::Result<()> {
         if let Some(rest) = self.target.strip_prefix("start:") {
-            let (program, page) = rest.split_once(' ').unwrap_or((rest, ""));
-            return std::process::Command::new("cmd").args(["/c", "start", "", program, &browser_page_address(page)]).spawn().map(drop);
+            let (browser, page) = rest.split_once(' ').unwrap_or((rest, ""));
+            return crate::web::hardening::open_browser_page(browser, page, profile);
         }
-        if self.target.ends_with(".exe") {
-            std::process::Command::new(self.target).spawn().map(drop)
-        } else {
-            std::process::Command::new("explorer.exe").arg(self.target).spawn().map(drop)
+        let mut command = match self.target.split_once(".exe ") {
+            Some((program, args)) => {
+                let mut c = std::process::Command::new(format!("{program}.exe"));
+                c.args(args.split_whitespace());
+                c
+            }
+            None if self.target.ends_with(".exe") => std::process::Command::new(self.target),
+            None => {
+                let mut c = std::process::Command::new("explorer.exe");
+                c.arg(self.target);
+                c
+            }
+        };
+        command.spawn().map(drop)
+    }
+}
+
+/// For checks with no Windows page to open (Phalanx changes them itself).
+const NO_PAGE: Link = Link { label: "", target: "" };
+
+/// A per-user Windows setting Phalanx switches directly, writing the same
+/// values the Windows Settings page writes (under HKEY_CURRENT_USER: no
+/// administrator rights, nothing system-wide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Toggle {
+    AdvertisingId,
+    Tailored,
+    LanguageList,
+    TrackLaunches,
+    SuggestedContent,
+    /// Windows 10: "Show suggestions occasionally in Start".
+    StartSuggestions,
+    /// Windows 11: "Show recommendations for tips, shortcuts, new apps, and more".
+    StartRecommendations,
+    OnlineSpeech,
+    Typing,
+    CloudSearch,
+    Location,
+    Camera,
+    Microphone,
+    Feedback,
+    FileExtensions,
+}
+
+impl Toggle {
+    /// Button text: to the protective position, or back.
+    pub fn label(self, protective: bool) -> &'static str {
+        match (self, protective) {
+            (Toggle::Location | Toggle::Camera | Toggle::Microphone, true) => "Block apps",
+            (Toggle::Location | Toggle::Camera | Toggle::Microphone, false) => "Let apps ask",
+            (Toggle::Feedback, true) => "Never ask",
+            (Toggle::Feedback, false) => "Let Windows ask",
+            (Toggle::FileExtensions, true) => "Show extensions",
+            (Toggle::FileExtensions, false) => "Hide extensions",
+            (_, true) => "Turn off",
+            (_, false) => "Turn on",
+        }
+    }
+
+    /// Switches the setting to its protective position, or back to Windows'
+    /// usual one.
+    pub fn apply(self, protective: bool) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            reg::apply_toggle(self, protective)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = protective;
+            anyhow::bail!("only available on Windows")
         }
     }
 }
@@ -212,6 +315,99 @@ mod reg {
     pub fn string(hive: Hive, path: &str, name: &str) -> Reg<String> {
         read(hive, path, name)
     }
+
+    /// The Windows build number (22000 and later is Windows 11).
+    pub fn build() -> Option<u32> {
+        match string(Hive::Machine, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber") {
+            Reg::Value(v) => v.trim().parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn set_dword(path: &str, name: &str, value: u32) -> std::io::Result<()> {
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(path)?;
+        key.set_value(name, &value)
+    }
+
+    fn set_string(path: &str, name: &str, value: &str) -> std::io::Result<()> {
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(path)?;
+        key.set_value(name, &value.to_string())
+    }
+
+    fn delete(path: &str, name: &str) -> std::io::Result<()> {
+        let key = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(path, winreg::enums::KEY_SET_VALUE) {
+            Ok(key) => key,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match key.delete_value(name) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Writes what Windows Settings writes for each switch (per user). `on`
+    /// is the protective position.
+    pub fn apply_toggle(toggle: super::Toggle, on: bool) -> anyhow::Result<()> {
+        use super::Toggle::*;
+        // Most switches are "enabled = 1"; protective means disabled.
+        let enabled = u32::from(!on);
+        let consent = |name: &str| set_string(&format!(r"{CONSENT}\{name}"), "Value", if on { "Deny" } else { "Allow" });
+        match toggle {
+            AdvertisingId => set_dword(r"Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo", "Enabled", enabled)?,
+            Tailored => set_dword(r"Software\Microsoft\Windows\CurrentVersion\Privacy", "TailoredExperiencesWithDiagnosticDataEnabled", enabled)?,
+            LanguageList => set_dword(r"Control Panel\International\User Profile", "HttpAcceptLanguageOptOut", u32::from(on))?,
+            TrackLaunches => set_dword(EXPLORER_ADVANCED, "Start_TrackProgs", enabled)?,
+            SuggestedContent => {
+                for name in SUGGESTED {
+                    set_dword(CDM, name, enabled)?;
+                }
+            }
+            StartSuggestions => set_dword(CDM, START_SUGGESTIONS, enabled)?,
+            StartRecommendations => set_dword(EXPLORER_ADVANCED, "Start_IrisRecommendations", enabled)?,
+            OnlineSpeech => set_dword(r"Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy", "HasAccepted", enabled)?,
+            Typing => {
+                set_dword(r"Software\Microsoft\InputPersonalization", "RestrictImplicitTextCollection", u32::from(on))?;
+                set_dword(r"Software\Microsoft\InputPersonalization", "RestrictImplicitInkCollection", u32::from(on))?;
+                set_dword(r"Software\Microsoft\InputPersonalization\TrainedDataStore", "HarvestContacts", enabled)?;
+                set_dword(r"Software\Microsoft\Personalization\Settings", "AcceptedPrivacyPolicy", enabled)?;
+                // "Improve inking and typing" (Diagnostics & feedback) is only switched off.
+                if on {
+                    set_dword(r"Software\Microsoft\Input\TIPC", "Enabled", 0)?;
+                }
+            }
+            CloudSearch => {
+                set_dword(SEARCH_SETTINGS, "IsMSACloudSearchEnabled", enabled)?;
+                set_dword(SEARCH_SETTINGS, "IsAADCloudSearchEnabled", enabled)?;
+            }
+            Location => consent("location")?,
+            Camera => consent("webcam")?,
+            Microphone => consent("microphone")?,
+            Feedback => {
+                // "Never" is zero requests per period; Windows' automatic
+                // default has neither value.
+                if on {
+                    set_dword(SIUF, "NumberOfSIUFInPeriod", 0)?;
+                } else {
+                    delete(SIUF, "NumberOfSIUFInPeriod")?;
+                }
+                delete(SIUF, "PeriodInNanoSeconds")?;
+            }
+            FileExtensions => {
+                set_dword(EXPLORER_ADVANCED, "HideFileExt", u32::from(!on))?;
+                crate::system::refresh_explorer_settings();
+            }
+        }
+        Ok(())
+    }
+
+    pub const CONSENT: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore";
+    pub const CDM: &str = r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager";
+    pub const EXPLORER_ADVANCED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced";
+    pub const SEARCH_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\SearchSettings";
+    pub const SIUF: &str = r"Software\Microsoft\Siuf\Rules";
+    pub const SUGGESTED: [&str; 3] = ["SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled", "SubscribedContent-353696Enabled"];
+    pub const START_SUGGESTIONS: &str = "SubscribedContent-338388Enabled";
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +523,8 @@ pub struct SecurityRegistry {
     pub uac_enabled: Reg<u32>,
     pub uac_admin_prompt: Reg<u32>,
     pub hide_file_ext: Reg<u32>,
+    /// Windows 11 (build 22000 or later).
+    pub windows11: bool,
 }
 
 fn off_windows<T>() -> Reg<T> {
@@ -343,8 +541,14 @@ impl SecurityRegistry {
             uac_enabled: off_windows(),
             uac_admin_prompt: off_windows(),
             hide_file_ext: off_windows(),
+            windows11: false,
         }
     }
+}
+
+#[cfg(windows)]
+fn is_windows11() -> bool {
+    reg::build().is_some_and(|b| b >= 22000)
 }
 
 #[cfg(windows)]
@@ -366,16 +570,24 @@ fn read_security_registry() -> SecurityRegistry {
             "ConsentPromptBehaviorAdmin",
         ),
         hide_file_ext: dword(User, r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "HideFileExt"),
+        windows11: is_windows11(),
     }
 }
 
 const VIRUS_SETTINGS: Link = Link { label: "Open virus & threat protection settings", target: "windowsdefender://threatsettings" };
-const APP_BROWSER: Link = Link { label: "Open app & browser control", target: "windowsdefender://appbrowser" };
-const DEVICE_SECURITY: Link = Link { label: "Open device security", target: "windowsdefender://devicesecurity" };
+/// Windows 10 (2004 and later) and 11: Reputation-based protection settings are here.
+const APP_BROWSER: Link = Link { label: "Open App & browser control (Reputation-based protection settings)", target: "windowsdefender://appbrowser" };
+const DEVICE_SECURITY: Link = Link { label: "Open Device security (Core isolation details)", target: "windowsdefender://devicesecurity" };
 const FIREWALL: Link = Link { label: "Open firewall & network protection", target: "windowsdefender://network" };
-const RANSOMWARE: Link = Link { label: "Open virus & threat protection", target: "windowsdefender://threat" };
+const RANSOMWARE: Link = Link { label: "Open Virus & threat protection (Manage ransomware protection)", target: "windowsdefender://threat" };
+/// Windows Security has no switch for network protection on any version.
+const NETWORK_PROTECTION: Link = Link {
+    label: "About network protection (Windows Security has no switch for it)",
+    target: "https://learn.microsoft.com/defender-endpoint/network-protection",
+};
 const UAC: Link = Link { label: "Open User Account Control settings", target: "UserAccountControlSettings.exe" };
-const FILE_EXTENSIONS: Link = Link { label: "Open File Explorer settings", target: "ms-settings:developers" };
+/// Folder Options is the same on Windows 10 and 11 (Settings moved the switch between versions).
+const FILE_EXTENSIONS: Link = Link { label: "Open Folder Options (View > Hide extensions for known file types)", target: "control.exe folders" };
 
 fn unknown(reason: impl Into<String>) -> (Status, String) {
     (Status::Unknown, format!("Could not read: {}", reason.into()))
@@ -440,6 +652,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 5,
         link: VIRUS_SETTINGS,
         fix: None,
+        toggle: None,
     });
 
     let (status, detail) = if replaced {
@@ -460,12 +673,16 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 3,
         link: VIRUS_SETTINGS,
         fix: None,
+        toggle: None,
     });
 
+    // Tamper protection also guards cloud protection: commands cannot change it.
+    let tamper_on = mp.and_then(|m| m.is_tamper_protected) == Some(true);
     let (status, detail) = if replaced {
         (Status::Info, "Not applicable: another antivirus is active".to_string())
     } else {
         match pref.and_then(|p| p.maps_reporting) {
+            Some(0) if tamper_on => (Status::Risk, "Off. Tamper protection stops Phalanx from changing it: turn it on in Windows Security".to_string()),
             Some(0) => (Status::Risk, "Off".to_string()),
             Some(_) => (Status::Good, "On".to_string()),
             None => unknown(pref_reason()),
@@ -479,7 +696,8 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 2,
         link: VIRUS_SETTINGS,
-        fix: (status == Status::Risk).then_some(FIX_CLOUD),
+        fix: (status == Status::Risk && !tamper_on).then_some(FIX_CLOUD),
+        toggle: None,
     });
 
     let (status, detail) = if replaced {
@@ -501,6 +719,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 2,
         link: APP_BROWSER,
         fix: matches!(status, Status::Risk | Status::Attention).then_some(FIX_PUA),
+        toggle: None,
     });
 
     let (status, detail) = if replaced {
@@ -520,8 +739,9 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         status,
         detail,
         weight: 4,
-        link: VIRUS_SETTINGS,
+        link: NETWORK_PROTECTION,
         fix: matches!(status, Status::Risk | Status::Attention).then_some(FIX_NETWORK_PROTECTION),
+        toggle: None,
     });
 
     let (status, detail) = match (&reg.smartscreen_policy, &reg.smartscreen) {
@@ -545,14 +765,16 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 3,
         link: APP_BROWSER,
         fix: None,
+        toggle: None,
     });
 
     let (status, detail) = match &reg.smart_app_control {
         Reg::Value(1) => (Status::Good, "On".to_string()),
         Reg::Value(2) => (Status::Info, "Evaluation: Windows is deciding whether it suits this PC".to_string()),
-        Reg::Value(0) => (Status::Info, "Off. Once off it can only be turned on again by reinstalling Windows".to_string()),
+        Reg::Value(0) => (Status::Info, "Off. On most Windows 11 versions it can only be turned on again by resetting or reinstalling Windows".to_string()),
         Reg::Value(v) => (Status::Unknown, format!("Unrecognised state {v}")),
-        Reg::Missing => (Status::Info, "Not available on this version of Windows".to_string()),
+        Reg::Missing if reg.windows11 => (Status::Info, "Not available on this PC".to_string()),
+        Reg::Missing => (Status::Info, "Windows 11 only".to_string()),
         r => reg_unknown(r),
     };
     checks.push(Check {
@@ -564,6 +786,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 0,
         link: APP_BROWSER,
         fix: None,
+        toggle: None,
     });
 
     let (status, detail) = match &reg.memory_integrity {
@@ -580,6 +803,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 2,
         link: DEVICE_SECURITY,
         fix: None,
+        toggle: None,
     });
 
     let profiles = state.and_then(|s| s.fw.as_ref());
@@ -613,13 +837,15 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 4,
         link: FIREWALL,
-        fix: None,
+        fix: (status == Status::Risk).then_some(FIX_FIREWALL),
+        toggle: None,
     });
 
+    let folders = (!replaced).then(|| pref.and_then(|p| p.enable_controlled_folder_access)).flatten();
     let (status, detail) = if replaced {
         (Status::Info, "Not applicable: another antivirus is active".to_string())
     } else {
-        match pref.and_then(|p| p.enable_controlled_folder_access) {
+        match folders {
             Some(1) => (Status::Good, "On".to_string()),
             Some(2) => (Status::Info, "Audit only".to_string()),
             Some(_) => (Status::Info, "Off (optional)".to_string()),
@@ -634,7 +860,8 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         detail,
         weight: 0,
         link: RANSOMWARE,
-        fix: None,
+        fix: folders.filter(|&v| v != 1).map(|_| FIX_CONTROLLED_FOLDERS),
+        toggle: None,
     });
 
     let (status, detail) = match (&reg.uac_enabled, &reg.uac_admin_prompt) {
@@ -653,6 +880,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 3,
         link: UAC,
         fix: None,
+        toggle: None,
     });
 
     let (status, detail) = match &reg.hide_file_ext {
@@ -669,6 +897,7 @@ pub fn build_security_checks(defender: &Result<DefenderState, String>, reg: &Sec
         weight: 2,
         link: FILE_EXTENSIONS,
         fix: None,
+        toggle: (status != Status::Unknown).then_some(Toggle::FileExtensions),
     });
 
     checks
@@ -689,7 +918,10 @@ pub struct PrivacyRegistry {
     pub language_opt_out: Reg<u32>,
     pub track_launches: Reg<u32>,
     pub suggested: [Reg<u32>; 3],
+    /// Windows 10: suggestions in Start.
     pub start_suggestions: Reg<u32>,
+    /// Windows 11: recommendations in Start.
+    pub start_recommendations: Reg<u32>,
     pub online_speech: Reg<u32>,
     pub typing_collection: Reg<u32>,
     pub typing_improve: Reg<u32>,
@@ -700,6 +932,7 @@ pub struct PrivacyRegistry {
     pub camera: Reg<String>,
     pub microphone: Reg<String>,
     pub feedback_frequency: Reg<u32>,
+    pub windows11: bool,
 }
 
 pub fn privacy_checks() -> Vec<Check> {
@@ -722,6 +955,7 @@ impl PrivacyRegistry {
             track_launches: off_windows(),
             suggested: [off_windows(), off_windows(), off_windows()],
             start_suggestions: off_windows(),
+            start_recommendations: off_windows(),
             online_speech: off_windows(),
             typing_collection: off_windows(),
             typing_improve: off_windows(),
@@ -732,6 +966,7 @@ impl PrivacyRegistry {
             camera: off_windows(),
             microphone: off_windows(),
             feedback_frequency: off_windows(),
+            windows11: false,
         }
     }
 }
@@ -757,12 +992,9 @@ fn read_privacy_registry() -> PrivacyRegistry {
         telemetry_policy: dword(Machine, r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry"),
         language_opt_out: dword(User, r"Control Panel\International\User Profile", "HttpAcceptLanguageOptOut"),
         track_launches: dword(User, r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "Start_TrackProgs"),
-        suggested: [
-            dword(User, CDM, "SubscribedContent-338393Enabled"),
-            dword(User, CDM, "SubscribedContent-353694Enabled"),
-            dword(User, CDM, "SubscribedContent-353696Enabled"),
-        ],
-        start_suggestions: dword(User, CDM, "SubscribedContent-338388Enabled"),
+        suggested: reg::SUGGESTED.map(|name| dword(User, CDM, name)),
+        start_suggestions: dword(User, CDM, reg::START_SUGGESTIONS),
+        start_recommendations: dword(User, reg::EXPLORER_ADVANCED, "Start_IrisRecommendations"),
         online_speech: dword(User, r"Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy", "HasAccepted"),
         typing_collection: dword(User, r"Software\Microsoft\InputPersonalization", "RestrictImplicitTextCollection"),
         typing_improve: dword(User, r"Software\Microsoft\Input\TIPC", "Enabled"),
@@ -772,7 +1004,8 @@ fn read_privacy_registry() -> PrivacyRegistry {
         location: access("location"),
         camera: access("webcam"),
         microphone: access("microphone"),
-        feedback_frequency: dword(User, r"Software\Microsoft\Siuf\Rules", "NumberOfSIUFInPeriod"),
+        feedback_frequency: dword(User, reg::SIUF, "NumberOfSIUFInPeriod"),
+        windows11: is_windows11(),
     }
 }
 
@@ -811,15 +1044,16 @@ fn access_status(r: &Reg<String>, sensitive: bool) -> (Status, String) {
 
 pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
     let mut checks = Vec::new();
-    let mut add = |id, title, why, (status, detail): (Status, String), weight, link| {
-        checks.push(Check { id, title, why, status, detail, weight, link, fix: None });
+    // A switch is offered once its value could be read; `None` where a
+    // policy or a device-wide setting decides instead.
+    let switch_for = |(status, _): &(Status, String), toggle| (*status != Status::Unknown).then_some(toggle);
+    let mut add = |id, title, why, (status, detail): (Status, String), weight, link, toggle: Option<Toggle>, fix: Option<Fix>| {
+        checks.push(Check { id, title, why, status, detail, weight, link, fix, toggle });
     };
 
-    let ad = if reg.advertising_policy.value() == Some(1) {
-        (Status::Good, "Off (set by policy)".to_string())
-    } else {
-        switch(&reg.advertising_id, true, "On", "Off")
-    };
+    let by_policy = reg.advertising_policy.value() == Some(1);
+    let ad = if by_policy { (Status::Good, "Off (set by policy)".to_string()) } else { switch(&reg.advertising_id, true, "On", "Off") };
+    let toggle = if by_policy { None } else { switch_for(&ad, Toggle::AdvertisingId) };
     add(
         "advertising_id",
         "Advertising ID",
@@ -827,6 +1061,8 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         ad,
         3,
         PRIVACY_GENERAL,
+        toggle,
+        None,
     );
 
     // 0 = security only, 1 = required, 3 = optional (full) diagnostic data.
@@ -838,6 +1074,8 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         (_, Reg::Missing) => (Status::Unknown, "Could not read: not set".to_string()),
         (_, Reg::Error(e)) => unknown(e.clone()),
     };
+    // A system-wide setting (administrator); a policy decides it outright.
+    let fix = (telemetry.0 == Status::Risk && !matches!(reg.telemetry_policy, Reg::Value(_))).then_some(FIX_DIAGNOSTICS);
     add(
         "diagnostics",
         "Optional diagnostic data",
@@ -845,15 +1083,21 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         telemetry,
         3,
         DIAGNOSTICS,
+        None,
+        fix,
     );
 
+    let tailored = switch(&reg.tailored, true, "On", "Off");
+    let toggle = switch_for(&tailored, Toggle::Tailored);
     add(
         "tailored",
         "Tailored experiences",
         "Lets Microsoft use your diagnostic data for personalised tips, ads and recommendations.",
-        switch(&reg.tailored, true, "On", "Off"),
+        tailored,
         2,
         DIAGNOSTICS,
+        toggle,
+        None,
     );
 
     // HttpAcceptLanguageOptOut: 1 = opted out (private).
@@ -863,6 +1107,7 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         Reg::Missing => (Status::Risk, "On (Windows default)".to_string()),
         Reg::Error(e) => unknown(e.clone()),
     };
+    let toggle = switch_for(&language, Toggle::LanguageList);
     add(
         "language_list",
         "Websites can read your language list",
@@ -870,15 +1115,21 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         language,
         1,
         PRIVACY_GENERAL,
+        toggle,
+        None,
     );
 
+    let launches = switch(&reg.track_launches, true, "On", "Off");
+    let toggle = switch_for(&launches, Toggle::TrackLaunches);
     add(
         "track_launches",
         "Track app launches",
         "Windows records which apps you start to personalise Start and search.",
-        switch(&reg.track_launches, true, "On", "Off"),
+        launches,
         1,
         PRIVACY_GENERAL,
+        toggle,
+        None,
     );
 
     let suggested = {
@@ -891,6 +1142,7 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
             (Status::Risk, "On".to_string())
         }
     };
+    let toggle = switch_for(&suggested, Toggle::SuggestedContent);
     add(
         "suggested_content",
         "Suggested content in Settings",
@@ -898,33 +1150,60 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         suggested,
         1,
         PRIVACY_GENERAL,
+        toggle,
+        None,
     );
 
-    add(
-        "start_suggestions",
-        "Suggestions and ads in Start",
-        "Shows recommended apps and promotions in Start.",
-        switch(&reg.start_suggestions, true, "On", "Off"),
-        1,
-        START,
-    );
+    // Windows 11 replaced "suggestions" in Start with "recommendations".
+    if reg.windows11 {
+        let start = switch(&reg.start_recommendations, true, "On", "Off");
+        let toggle = switch_for(&start, Toggle::StartRecommendations);
+        add(
+            "start_suggestions",
+            "Recommendations in Start",
+            "Shows tips, app promotions and recommended files in Start.",
+            start,
+            1,
+            START,
+            toggle,
+            None,
+        );
+    } else {
+        let start = switch(&reg.start_suggestions, true, "On", "Off");
+        let toggle = switch_for(&start, Toggle::StartSuggestions);
+        add(
+            "start_suggestions",
+            "Suggestions and ads in Start",
+            "Shows recommended apps and promotions in Start.",
+            start,
+            1,
+            START,
+            toggle,
+            None,
+        );
+    }
 
+    let speech = switch(&reg.online_speech, false, "On", "Off");
+    let toggle = switch_for(&speech, Toggle::OnlineSpeech);
     add(
         "online_speech",
         "Online speech recognition",
         "Sends your voice to Microsoft's cloud to recognise speech.",
-        switch(&reg.online_speech, false, "On", "Off"),
+        speech,
         2,
         SPEECH,
+        toggle,
+        None,
     );
 
     // RestrictImplicitTextCollection: 1 = not collected (private).
     let typing = match (&reg.typing_collection, &reg.typing_improve) {
         (Reg::Value(1), Reg::Value(0) | Reg::Missing) => (Status::Good, "Off".to_string()),
-        (Reg::Value(1), Reg::Value(_)) => (Status::Attention, "Personal dictionary off, but typing data is sent to improve Windows".to_string()),
+        (Reg::Value(1), Reg::Value(_)) => (Status::Attention, "Personal dictionary off, but typing data is sent to improve Windows (Diagnostics & feedback)".to_string()),
         (Reg::Value(_) | Reg::Missing, _) => (Status::Risk, "On: words you type and ink are collected".to_string()),
         (Reg::Error(e), _) => unknown(e.clone()),
     };
+    let toggle = switch_for(&typing, Toggle::Typing);
     add(
         "typing",
         "Inking and typing personalisation",
@@ -932,54 +1211,78 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         typing,
         2,
         TYPING,
+        toggle,
+        None,
     );
 
-    let bing = if reg.search_box_policy.value() == Some(1) {
-        (Status::Good, "Off (set by policy)".to_string())
-    } else {
-        switch(&reg.bing_search, true, "On: what you type in Start search goes to Bing", "Off")
+    // Windows Settings has no switch for web results in Start, and current
+    // Windows 10 and 11 ignore the old per-user value: only the search box
+    // policy reliably turns them off.
+    let bing = match (reg.search_box_policy.value(), &reg.bing_search) {
+        (Some(1), _) => (Status::Good, "Off (search box policy)".to_string()),
+        (_, Reg::Value(0)) => (
+            Status::Attention,
+            "Turned off with the older setting, which current Windows versions ignore: what you type in Start search may still go to Bing".to_string(),
+        ),
+        (_, Reg::Error(e)) => unknown(e.clone()),
+        _ => (Status::Risk, "On: what you type in Start search goes to Bing (Windows default)".to_string()),
     };
+    let fix = matches!(bing.0, Status::Risk | Status::Attention).then_some(FIX_WEB_SEARCH);
     add(
         "web_search",
         "Web results in Start search",
-        "Sends what you type in the Start menu search box to Bing.",
+        "Sends what you type in the Start menu search box to Bing. Windows Settings has no switch for it.",
         bing,
         2,
-        SEARCH,
+        NO_PAGE,
+        None,
+        fix,
     );
 
+    let cloud = switch(&reg.cloud_search, true, "On", "Off");
+    let toggle = switch_for(&cloud, Toggle::CloudSearch);
     add(
         "cloud_search",
         "Cloud content search",
         "Includes your Microsoft account content (OneDrive, Outlook, Bing) in Windows search.",
-        switch(&reg.cloud_search, true, "On", "Off"),
+        cloud,
         1,
         SEARCH,
+        toggle,
+        None,
     );
 
-    add(
-        "location",
-        "Location access",
-        "Apps that are allowed can see where you are.",
-        access_status(&reg.location, true),
-        2,
-        LOCATION,
-    );
+    // A device-wide "off" (administrator) is final; per-user switches are offered otherwise.
+    let per_user = |r: &Reg<String>, status: &(Status, String), toggle| match r {
+        Reg::Value(v) if v == "DenyDevice" => None,
+        _ => switch_for(status, toggle),
+    };
+    let location = access_status(&reg.location, true);
+    let toggle = per_user(&reg.location, &location, Toggle::Location);
+    add("location", "Location access", "Apps that are allowed can see where you are.", location, 2, LOCATION, toggle, None);
+    let camera = access_status(&reg.camera, false);
+    let toggle = per_user(&reg.camera, &camera, Toggle::Camera);
     add(
         "camera",
         "Camera access",
         "Apps that are allowed can use the camera. Fine for video calls; review the list of apps.",
-        access_status(&reg.camera, false),
+        camera,
         0,
         CAMERA,
+        toggle,
+        None,
     );
+    let microphone = access_status(&reg.microphone, false);
+    let toggle = per_user(&reg.microphone, &microphone, Toggle::Microphone);
     add(
         "microphone",
         "Microphone access",
         "Apps that are allowed can listen through the microphone. Review the list of apps.",
-        access_status(&reg.microphone, false),
+        microphone,
         0,
         MICROPHONE,
+        toggle,
+        None,
     );
 
     let feedback = match &reg.feedback_frequency {
@@ -987,14 +1290,8 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
         Reg::Value(_) | Reg::Missing => (Status::Info, "Windows may ask for feedback".to_string()),
         Reg::Error(e) => unknown(e.clone()),
     };
-    add(
-        "feedback",
-        "Feedback requests",
-        "How often Windows asks you for feedback.",
-        feedback,
-        0,
-        DIAGNOSTICS,
-    );
+    let toggle = switch_for(&feedback, Toggle::Feedback);
+    add("feedback", "Feedback requests", "How often Windows asks you for feedback.", feedback, 0, DIAGNOSTICS, toggle, None);
 
     checks
 }
@@ -1022,7 +1319,7 @@ mod tests {
     fn scripts_are_valid_powershell() {
         assert!(!crate::system::powershell_syntax_errors("if ($x { 1").is_empty(), "the checker reports errors");
         assert_eq!(crate::system::powershell_syntax_errors(DEFENDER_SCRIPT), Vec::<String>::new());
-        for fix in [FIX_NETWORK_PROTECTION, FIX_PUA, FIX_CLOUD, OFFLINE_SCAN] {
+        for fix in [FIX_NETWORK_PROTECTION, FIX_PUA, FIX_CLOUD, FIX_FIREWALL, FIX_CONTROLLED_FOLDERS, FIX_DIAGNOSTICS, FIX_WEB_SEARCH, OFFLINE_SCAN] {
             assert_eq!(crate::system::powershell_syntax_errors(fix.command), Vec::<String>::new(), "{}", fix.command);
         }
     }
@@ -1036,6 +1333,7 @@ mod tests {
             uac_enabled: Reg::Missing,
             uac_admin_prompt: Reg::Missing,
             hide_file_ext: Reg::Missing,
+            windows11: true,
         }
     }
 
@@ -1118,6 +1416,76 @@ mod tests {
     }
 
     #[test]
+    fn windows_10_and_11_read_their_own_start_setting() {
+        let mut reg = PrivacyRegistry::unavailable();
+        reg.start_suggestions = Reg::Value(1);
+        reg.start_recommendations = Reg::Value(0);
+        let win10 = build_privacy_checks(&reg);
+        assert_eq!(find(&win10, "start_suggestions").status, Status::Risk);
+        assert_eq!(find(&win10, "start_suggestions").toggle, Some(Toggle::StartSuggestions));
+        reg.windows11 = true;
+        let win11 = build_privacy_checks(&reg);
+        assert_eq!(find(&win11, "start_suggestions").status, Status::Good);
+        assert_eq!(find(&win11, "start_suggestions").toggle, Some(Toggle::StartRecommendations));
+    }
+
+    #[test]
+    fn switches_are_offered_only_where_the_user_decides() {
+        let mut reg = PrivacyRegistry::unavailable();
+        // Unreadable: no switch.
+        assert!(build_privacy_checks(&reg).iter().all(|c| c.toggle.is_none()));
+        reg.advertising_id = Reg::Value(1);
+        reg.location = Reg::Value("DenyDevice".into());
+        reg.camera = Reg::Missing;
+        reg.bing_search = Reg::Value(0);
+        reg.search_box_policy = Reg::Missing;
+        reg.telemetry = Reg::Value(3);
+        reg.telemetry_policy = Reg::Missing;
+        let checks = build_privacy_checks(&reg);
+        assert_eq!(find(&checks, "advertising_id").toggle, Some(Toggle::AdvertisingId));
+        assert_eq!(find(&checks, "location").toggle, None, "turned off for the whole device");
+        assert_eq!(find(&checks, "camera").toggle, Some(Toggle::Camera));
+        // The old Bing switch alone is not trusted; the policy fix is offered.
+        assert_eq!(find(&checks, "web_search").status, Status::Attention);
+        assert_eq!(find(&checks, "web_search").fix, Some(FIX_WEB_SEARCH));
+        assert!(find(&checks, "web_search").link.label.is_empty(), "Settings has no page for it");
+        assert_eq!(find(&checks, "diagnostics").fix, Some(FIX_DIAGNOSTICS));
+        reg.advertising_policy = Reg::Value(1);
+        reg.search_box_policy = Reg::Value(1);
+        reg.telemetry_policy = Reg::Value(3);
+        let managed = build_privacy_checks(&reg);
+        assert_eq!(find(&managed, "advertising_id").toggle, None, "a policy decides");
+        assert_eq!(find(&managed, "web_search").status, Status::Good);
+        assert_eq!(find(&managed, "diagnostics").fix, None, "a policy decides");
+    }
+
+    #[test]
+    fn security_fixes_respect_tamper_protection_and_versions() {
+        let json = r#"{"mp":{"RealTimeProtectionEnabled":true,"IsTamperProtected":true,"AMRunningMode":"Normal"},
+            "pref":{"PUAProtection":1,"EnableControlledFolderAccess":0,"MAPSReporting":0,"EnableNetworkProtection":1},
+            "fw":[{"name":"Public","enabled":"False"}]}"#;
+        let mut reg = registry_all_missing();
+        let checks = build_security_checks(&parse_defender_state(json), &reg);
+        assert_eq!(find(&checks, "cloud").fix, None, "tamper protection blocks the command");
+        assert!(find(&checks, "cloud").detail.contains("Tamper protection"));
+        assert_eq!(find(&checks, "firewall").fix, Some(FIX_FIREWALL));
+        assert_eq!(find(&checks, "controlled_folders").fix, Some(FIX_CONTROLLED_FOLDERS));
+        assert_eq!(find(&checks, "file_extensions").toggle, Some(Toggle::FileExtensions));
+        assert_eq!(find(&checks, "smart_app_control").detail, "Not available on this PC");
+        reg.windows11 = false;
+        let win10 = build_security_checks(&parse_defender_state(json), &reg);
+        assert_eq!(find(&win10, "smart_app_control").detail, "Windows 11 only");
+    }
+
+    #[test]
+    fn toggle_labels_read_as_actions() {
+        assert_eq!(Toggle::AdvertisingId.label(true), "Turn off");
+        assert_eq!(Toggle::AdvertisingId.label(false), "Turn on");
+        assert_eq!(Toggle::Camera.label(true), "Block apps");
+        assert_eq!(Toggle::FileExtensions.label(true), "Show extensions");
+    }
+
+    #[test]
     fn score_weights_and_levels() {
         let c = |status, weight| Check {
             id: "x",
@@ -1128,6 +1496,7 @@ mod tests {
             weight,
             link: PRIVACY_GENERAL,
             fix: None,
+            toggle: None,
         };
         let s = score(&[c(Status::Good, 3), c(Status::Risk, 1), c(Status::Info, 5)]).unwrap();
         assert_eq!(s.percent, 75);

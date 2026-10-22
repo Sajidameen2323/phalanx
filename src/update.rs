@@ -9,6 +9,10 @@
 //! list is a full snapshot instead (entries its maintainers drop are usually
 //! false positives), saved as `feed-ads.txt` and only loaded when ad blocking
 //! is switched on.
+//!
+//! abuse.ch (MalwareBazaar, ThreatFox, URLhaus) only serves its data to
+//! callers with a free personal Auth-Key since mid-2025. Without one, those
+//! sources are skipped (not failed), and the key-free sources still update.
 
 use crate::engine::{encode_rules, parse_digest};
 use anyhow::{anyhow, bail, Context, Result};
@@ -29,14 +33,29 @@ pub const MAX_FEED_WEB: usize = 500_000;
 const MANIFEST_FILE: &str = "manifest.json";
 /// Fewest names an ad list download must have to replace the current one.
 const MIN_ADS: usize = 1000;
+/// The saved abuse.ch Auth-Key, encrypted for this Windows user (DPAPI, hex).
+const AUTH_KEY_FILE: &str = "abuse-ch-key";
+/// Used when no key is saved.
+pub const AUTH_KEY_ENV: &str = "ABUSE_CH_AUTH_KEY";
+/// Where users get a free abuse.ch Auth-Key.
+pub const AUTH_KEY_PORTAL: &str = "https://auth.abuse.ch/";
+/// API sources cannot be asked cheaply whether they changed; they count as
+/// changed once this long has passed since they were last fetched.
+const API_REFRESH: Duration = Duration::from_secs(6 * 3600);
 
 pub struct Source {
     pub name: &'static str,
+    /// For abuse.ch exports, `{key}` stands for the Auth-Key.
     pub url: &'static str,
     pub kind: SourceKind,
+    /// Needs an abuse.ch Auth-Key.
+    pub needs_key: bool,
 }
 
 pub enum SourceKind {
+    /// ThreatFox's `get_iocs` API (key sent as a header): hashes go to the
+    /// hash list, domains, URLs and C2 addresses to the web rules.
+    ThreatFoxApi { days: u32 },
     /// A zip containing one YARA file ending in `entry_suffix`, saved as `file`.
     YaraZip { entry_suffix: &'static str, file: &'static str },
     /// abuse.ch-style quoted CSV with SHA-256 and malware-family columns.
@@ -78,25 +97,37 @@ pub const SOURCES: &[Source] = &[
             entry_suffix: "yara-rules-core.yar",
             file: "yara-forge-core.rules",
         },
+        needs_key: false,
+    },
+    Source {
+        // CC0; malicious hosts from URLhaus, republished without a key twice a day.
+        name: "URLhaus malware hosts (malware-filter)",
+        url: "https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-hosts.txt",
+        kind: SourceKind::WebHostfile { category: "malware", threat: "URLhaus.MalwareHost" },
+        needs_key: false,
+    },
+    Source {
+        // MIT licensed; adware and malware names merged from several lists.
+        name: "StevenBlack hosts (ads and trackers)",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        kind: SourceKind::AdsHostfile { threat: "StevenBlack.Ads" },
+        needs_key: false,
     },
     Source {
         name: "MalwareBazaar (recent samples)",
-        url: "https://bazaar.abuse.ch/export/csv/recent/",
+        url: "https://mb-api.abuse.ch/v2/files/exports/{key}/recent.csv",
         kind: SourceKind::HashCsv { hash_column: 1, family_column: 8 },
+        needs_key: true,
     },
     Source {
-        name: "ThreatFox (recent SHA-256 IOCs)",
-        url: "https://threatfox.abuse.ch/export/csv/sha256/recent/",
-        kind: SourceKind::HashCsv { hash_column: 2, family_column: 7 },
+        name: "ThreatFox (hashes, domains, URLs, C2 of the last 7 days)",
+        url: "https://threatfox-api.abuse.ch/api/v1/",
+        kind: SourceKind::ThreatFoxApi { days: 7 },
+        needs_key: true,
     },
     Source {
-        name: "URLhaus (malware hosts)",
-        url: "https://urlhaus.abuse.ch/downloads/hostfile/",
-        kind: SourceKind::WebHostfile { category: "malware", threat: "URLhaus.MalwareHost" },
-    },
-    Source {
-        name: "URLhaus (online malware URLs)",
-        url: "https://urlhaus.abuse.ch/downloads/csv_online/",
+        name: "URLhaus (malware URLs of the last 30 days)",
+        url: "https://urlhaus-api.abuse.ch/v2/files/exports/{key}/recent.csv",
         kind: SourceKind::WebCsv(WebCsv {
             kind: WebIoc::Url,
             value_column: 2,
@@ -105,51 +136,60 @@ pub const SOURCES: &[Source] = &[
             compromised_column: None,
             confidence: None,
         }),
-    },
-    Source {
-        name: "ThreatFox (recent domains)",
-        url: "https://threatfox.abuse.ch/export/csv/domains/recent/",
-        kind: SourceKind::WebCsv(WebCsv {
-            kind: WebIoc::Domain,
-            value_column: 2,
-            threat_column: Some(7),
-            threat_prefix: "ThreatFox",
-            compromised_column: Some(10),
-            confidence: None,
-        }),
-    },
-    Source {
-        name: "ThreatFox (recent URLs)",
-        url: "https://threatfox.abuse.ch/export/csv/urls/recent/",
-        kind: SourceKind::WebCsv(WebCsv {
-            kind: WebIoc::Url,
-            value_column: 2,
-            threat_column: Some(7),
-            threat_prefix: "ThreatFox",
-            compromised_column: Some(10),
-            confidence: None,
-        }),
-    },
-    Source {
-        name: "ThreatFox (recent C2 addresses)",
-        url: "https://threatfox.abuse.ch/export/csv/ip-port/recent/",
-        kind: SourceKind::WebCsv(WebCsv {
-            kind: WebIoc::IpPort,
-            value_column: 2,
-            threat_column: Some(7),
-            threat_prefix: "ThreatFox",
-            compromised_column: Some(10),
-            // Addresses can be shared hosting; only take confident ones.
-            confidence: Some((9, 75)),
-        }),
-    },
-    Source {
-        // MIT licensed; adware and malware names merged from several lists.
-        name: "StevenBlack hosts (ads and trackers)",
-        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-        kind: SourceKind::AdsHostfile { threat: "StevenBlack.Ads" },
+        needs_key: true,
     },
 ];
+
+/// ThreatFox C2 addresses can be shared hosting; only confident ones are taken.
+const MIN_IP_CONFIDENCE: u64 = 75;
+
+/// The abuse.ch Auth-Key: the saved one, else `ABUSE_CH_AUTH_KEY`. A saved
+/// key that cannot be decrypted (copied from another account) is an error.
+pub fn auth_key(sig_dir: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(sig_dir.join(AUTH_KEY_FILE)) {
+        Ok(stored) => crate::system::unprotect_secret(&stored)
+            .map(Some)
+            .context("the saved abuse.ch Auth-Key could not be decrypted; enter it again"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::env::var(AUTH_KEY_ENV).ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()))
+        }
+        Err(e) => Err(e).context("reading the saved abuse.ch Auth-Key"),
+    }
+}
+
+/// Whether a key is saved (not counting the environment variable).
+pub fn auth_key_saved(sig_dir: &Path) -> bool {
+    sig_dir.join(AUTH_KEY_FILE).is_file()
+}
+
+/// Saves (encrypted for this Windows user) or, with `None`, removes the key.
+pub fn save_auth_key(sig_dir: &Path, key: Option<&str>) -> Result<()> {
+    let path = sig_dir.join(AUTH_KEY_FILE);
+    match key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(key) => {
+            // Keys are hex/alphanumeric; anything else would break the URL.
+            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                bail!("that does not look like an abuse.ch Auth-Key (letters and digits only)");
+            }
+            fs::create_dir_all(sig_dir).with_context(|| format!("creating {}", sig_dir.display()))?;
+            write_atomic(&path, crate::system::protect_secret(key)?.as_bytes())
+        }
+        None => match fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context("removing the saved Auth-Key"),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Why a source that needs a key was not asked.
+const NO_KEY: &str = "skipped: needs a free abuse.ch Auth-Key (Settings > Signatures)";
+
+impl Source {
+    /// The address to request, with the key filled in.
+    fn address(&self, key: Option<&str>) -> String {
+        self.url.replace("{key}", key.unwrap_or_default())
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
@@ -177,6 +217,16 @@ pub struct SourceStatus {
     /// The last update found nothing new, so nothing was installed.
     #[serde(default)]
     pub unchanged: bool,
+    /// Not asked: it needs an abuse.ch Auth-Key and none is set.
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+impl SourceStatus {
+    /// Asked, and it failed (a skipped source has not failed).
+    pub fn failed(&self) -> bool {
+        !self.ok && !self.skipped
+    }
 }
 
 impl Manifest {
@@ -208,7 +258,7 @@ impl Manifest {
 fn installed_file(sig_dir: &Path, source: &Source) -> PathBuf {
     match &source.kind {
         SourceKind::YaraZip { file, .. } => sig_dir.join(file),
-        SourceKind::HashCsv { .. } => sig_dir.join(FEED_HASH_FILE),
+        SourceKind::HashCsv { .. } | SourceKind::ThreatFoxApi { .. } => sig_dir.join(FEED_HASH_FILE),
         SourceKind::WebHostfile { .. } | SourceKind::WebCsv(_) => sig_dir.join(crate::web::config::FEED_FILE),
         SourceKind::AdsHostfile { .. } => sig_dir.join(crate::web::config::ADS_FILE),
     }
@@ -237,13 +287,23 @@ pub struct CheckResult {
 pub fn check_for_updates(sig_dir: &Path) -> CheckResult {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30))).build().into();
     let previous = load_manifest(sig_dir);
+    let key = auth_key(sig_dir).ok().flatten();
     let mut result = CheckResult::default();
     for source in SOURCES {
+        if source.needs_key && key.is_none() {
+            continue;
+        }
+        if let SourceKind::ThreatFoxApi { .. } = source.kind {
+            if api_due(previous.source(source.name)) {
+                result.changed.push(source.name.to_string());
+            }
+            continue;
+        }
         let Some(known) = validators(sig_dir, source, &previous) else {
             result.changed.push(source.name.to_string());
             continue;
         };
-        let mut request = agent.head(source.url).header("User-Agent", USER_AGENT);
+        let mut request = agent.head(source.address(key.as_deref())).header("User-Agent", USER_AGENT);
         if let Some(etag) = &known.etag {
             request = request.header("If-None-Match", etag);
         }
@@ -265,6 +325,18 @@ pub fn check_for_updates(sig_dir: &Path) -> CheckResult {
         }
     }
     result
+}
+
+/// Whether an API source was last fetched successfully long enough ago.
+fn api_due(status: Option<&SourceStatus>) -> bool {
+    let fetched = status
+        .filter(|s| s.ok)
+        .and_then(|s| s.checked_at.as_deref())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    fetched.is_none_or(|t| {
+        let age = chrono::Utc::now().signed_duration_since(t);
+        age.to_std().map_or(true, |age| age >= API_REFRESH)
+    })
 }
 
 pub fn signature_dir(data_dir: &Path) -> PathBuf {
@@ -296,12 +368,48 @@ pub fn update_all(sig_dir: &Path, force: bool, on_progress: &mut dyn FnMut(&str)
     let mut web = FeedWeb::load(&web_path)?;
     let web_before = web.len();
     let mut statuses = Vec::new();
+    // An unreadable saved key fails the sources that need it, with the reason.
+    let key = auth_key(sig_dir).map_err(|e| format!("{e:#}"));
 
     for source in SOURCES {
         let earlier = previous.source(source.name);
+        let key = match (&key, source.needs_key) {
+            (_, false) => None,
+            (Ok(Some(key)), true) => Some(key.as_str()),
+            (Ok(None), true) => {
+                statuses.push(SourceStatus {
+                    name: source.name.into(),
+                    url: source.url.into(),
+                    updated_at: earlier.and_then(|s| s.updated_at.clone()),
+                    ok: false,
+                    message: NO_KEY.into(),
+                    etag: None,
+                    last_modified: None,
+                    checked_at: Some(now.clone()),
+                    unchanged: false,
+                    skipped: true,
+                });
+                continue;
+            }
+            (Err(e), true) => {
+                statuses.push(SourceStatus {
+                    name: source.name.into(),
+                    url: source.url.into(),
+                    updated_at: earlier.and_then(|s| s.updated_at.clone()),
+                    ok: false,
+                    message: e.clone(),
+                    etag: None,
+                    last_modified: None,
+                    checked_at: Some(now.clone()),
+                    unchanged: false,
+                    skipped: false,
+                });
+                continue;
+            }
+        };
         let known = if force { None } else { validators(sig_dir, source, &previous) };
         on_progress(&format!("Checking {} for new data…", source.name));
-        let fetched = match download(&agent, source.url, known) {
+        let fetched = match download(&agent, source, key, known) {
             Ok(Fetched::NotModified) => {
                 let mut status = earlier.cloned().expect("validators come from the previous manifest");
                 status.checked_at = Some(now.clone());
@@ -334,6 +442,7 @@ pub fn update_all(sig_dir: &Path, force: bool, on_progress: &mut dyn FnMut(&str)
                     Ok(format!("{seen} indicators in feed, {added} new"))
                 }
                 SourceKind::AdsHostfile { threat } => install_ads(&bytes, threat, &sig_dir.join(crate::web::config::ADS_FILE)),
+                SourceKind::ThreatFoxApi { .. } => merge_threatfox(&bytes, &mut feed, &mut web),
             }
         });
         statuses.push(match result {
@@ -349,6 +458,7 @@ pub fn update_all(sig_dir: &Path, force: bool, on_progress: &mut dyn FnMut(&str)
                     last_modified,
                     checked_at: Some(now.clone()),
                     unchanged: false,
+                    skipped: false,
                 }
             }
             // Validators are dropped so the next update downloads it again.
@@ -362,6 +472,7 @@ pub fn update_all(sig_dir: &Path, force: bool, on_progress: &mut dyn FnMut(&str)
                 last_modified: None,
                 checked_at: Some(now.clone()),
                 unchanged: false,
+                skipped: false,
             },
         });
     }
@@ -390,18 +501,36 @@ enum Fetched {
     Body { bytes: Vec<u8>, etag: Option<String>, last_modified: Option<String> },
 }
 
-/// Downloads `url`; with `known` validators the server may answer 304.
-fn download(agent: &ureq::Agent, url: &str, known: Option<&SourceStatus>) -> Result<Fetched> {
-    let mut request = agent.get(url).header("User-Agent", USER_AGENT);
-    if let Some(known) = known {
-        if let Some(etag) = &known.etag {
-            request = request.header("If-None-Match", etag);
+/// Downloads a source; with `known` validators the server may answer 304.
+fn download(agent: &ureq::Agent, source: &Source, key: Option<&str>, known: Option<&SourceStatus>) -> Result<Fetched> {
+    let failed = |e: ureq::Error| match e {
+        ureq::Error::StatusCode(401 | 403) if source.needs_key => {
+            anyhow!("abuse.ch did not accept the Auth-Key (check it in Settings > Signatures, or get a new one at {AUTH_KEY_PORTAL})")
         }
-        if let Some(modified) = &known.last_modified {
-            request = request.header("If-Modified-Since", modified);
+        ureq::Error::StatusCode(410) => anyhow!("download failed: the feed has moved (HTTP 410); a newer Phalanx is needed"),
+        // Never the address: it can contain the key.
+        e => anyhow!("download failed: {e}"),
+    };
+    let response = if let SourceKind::ThreatFoxApi { days } = source.kind {
+        agent
+            .post(source.url)
+            .header("User-Agent", USER_AGENT)
+            .header("Auth-Key", key.unwrap_or_default())
+            .header("Content-Type", "application/json")
+            .send(serde_json::json!({ "query": "get_iocs", "days": days }).to_string())
+            .map_err(failed)?
+    } else {
+        let mut request = agent.get(source.address(key)).header("User-Agent", USER_AGENT);
+        if let Some(known) = known {
+            if let Some(etag) = &known.etag {
+                request = request.header("If-None-Match", etag);
+            }
+            if let Some(modified) = &known.last_modified {
+                request = request.header("If-Modified-Since", modified);
+            }
         }
-    }
-    let response = request.call().map_err(|e| anyhow!("download failed: {e}"))?;
+        request.call().map_err(failed)?
+    };
     if response.status().as_u16() == 304 {
         return Ok(Fetched::NotModified);
     }
@@ -502,30 +631,41 @@ impl FeedHashes {
         self.lines.len()
     }
 
+    /// Adds a SHA-256 hash: `None` if it is not one, else whether it was new.
+    fn add(&mut self, hash: &str, family: Option<&str>) -> Option<bool> {
+        let hash = hash.trim().to_ascii_lowercase();
+        let digest = parse_digest(&hash)?;
+        if !self.known.insert(digest) {
+            return Some(false);
+        }
+        let family = family
+            .map(str::trim)
+            .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("n/a") && !f.eq_ignore_ascii_case("none") && !f.eq_ignore_ascii_case("unknown malware"))
+            .map(|f| f.replace(char::is_whitespace, "-"))
+            .unwrap_or_else(|| "KnownHash".into());
+        self.lines.push(format!("{hash} malware Malware.{family}"));
+        Some(true)
+    }
+
     /// Returns (hashes in this feed, newly added).
     fn merge_csv(&mut self, text: &str, hash_column: usize, family_column: usize) -> Result<(usize, usize)> {
         let (mut seen, mut added) = (0, 0);
         for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
             let fields = split_csv_line(line);
             let Some(hash) = fields.get(hash_column) else { continue };
-            let hash = hash.to_ascii_lowercase();
-            let Some(digest) = parse_digest(&hash) else { continue };
+            let Some(new) = self.add(hash, fields.get(family_column).map(String::as_str)) else { continue };
             seen += 1;
-            if !self.known.insert(digest) {
-                continue;
-            }
-            let family = fields
-                .get(family_column)
-                .map(|f| f.trim())
-                .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("n/a") && !f.eq_ignore_ascii_case("none"))
-                .map(|f| f.replace(char::is_whitespace, "-"))
-                .unwrap_or_else(|| "KnownHash".into());
-            self.lines.push(format!("{hash} malware Malware.{family}"));
-            added += 1;
+            added += new as usize;
         }
         if seen == 0 {
             bail!("feed contained no SHA-256 hashes (format changed?)");
         }
+        self.trim();
+        Ok((seen, added))
+    }
+
+    /// Drops the oldest hashes past the cap.
+    fn trim(&mut self) {
         if self.lines.len() > MAX_FEED_HASHES {
             let excess = self.lines.len() - MAX_FEED_HASHES;
             for line in self.lines.drain(..excess) {
@@ -535,7 +675,6 @@ impl FeedHashes {
             }
             self.trimmed = true;
         }
-        Ok((seen, added))
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -661,6 +800,12 @@ impl FeedWeb {
         if seen == 0 {
             bail!("feed contained no usable entries (format changed?)");
         }
+        self.trim();
+        Ok((seen, added))
+    }
+
+    /// Drops the oldest rules past the cap.
+    fn trim(&mut self) {
         if self.lines.len() > MAX_FEED_WEB {
             let excess = self.lines.len() - MAX_FEED_WEB;
             for line in self.lines.drain(..excess) {
@@ -670,7 +815,6 @@ impl FeedWeb {
             }
             self.trimmed = true;
         }
-        Ok((seen, added))
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -681,6 +825,59 @@ impl FeedWeb {
         }
         write_atomic(path, text.as_bytes())
     }
+}
+
+/// Merges a ThreatFox `get_iocs` reply: SHA-256 hashes into the hash list;
+/// domains, URLs and confident C2 addresses into the web rules.
+fn merge_threatfox(bytes: &[u8], feed: &mut FeedHashes, web: &mut FeedWeb) -> Result<String> {
+    let reply: serde_json::Value = serde_json::from_slice(bytes).context("ThreatFox did not answer with JSON")?;
+    match reply["query_status"].as_str() {
+        Some("ok") => {}
+        // Nothing new in the period: not an error.
+        Some("no_result") => return Ok("no new indicators".into()),
+        Some(status) => bail!("ThreatFox answered `{status}`"),
+        None => bail!("ThreatFox answered without a status (format changed?)"),
+    }
+    let (mut hashes, mut new_hashes, mut rules, mut new_rules) = (0, 0, 0, 0);
+    for ioc in reply["data"].as_array().into_iter().flatten() {
+        let (Some(value), Some(kind)) = (ioc["ioc"].as_str(), ioc["ioc_type"].as_str()) else { continue };
+        let family = ioc["malware_printable"].as_str();
+        let threat = family
+            .map(str::trim)
+            .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("unknown malware"))
+            .map_or_else(|| "ThreatFox".to_string(), |f| format!("ThreatFox.{}", f.replace(char::is_whitespace, "-")));
+        let category = if ioc["is_compromised"].as_bool() == Some(true) { "compromised" } else { "malware" };
+        let rule = match kind {
+            "sha256_hash" => {
+                if let Some(new) = feed.add(value, family) {
+                    hashes += 1;
+                    new_hashes += new as usize;
+                }
+                continue;
+            }
+            "domain" => crate::web::url::normalize_host(value)
+                .filter(|h| h.contains('.') && h.parse::<std::net::IpAddr>().is_err())
+                .map(|h| ("domain", h)),
+            "url" => crate::web::url::WebAddress::parse(value).filter(|_| value.contains("://")).map(|a| ("url", a.normalized())),
+            "ip:port" => {
+                let confident = ioc["confidence_level"].as_u64().is_some_and(|c| c >= MIN_IP_CONFIDENCE);
+                let address = value.rsplit_once(':').map_or(value, |(a, _)| a);
+                let ip = address.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().ok();
+                ip.filter(|_| confident).map(|ip| ("ip", ip.to_string()))
+            }
+            _ => None,
+        };
+        if let Some((kind, value)) = rule {
+            rules += 1;
+            new_rules += web.add(kind, &value, category, &threat) as usize;
+        }
+    }
+    if hashes + rules == 0 {
+        bail!("ThreatFox's reply contained no usable indicators (format changed?)");
+    }
+    feed.trim();
+    web.trim();
+    Ok(format!("{hashes} hashes ({new_hashes} new) and {rules} web indicators ({new_rules} new)"))
 }
 
 /// Splits one line of quoted CSV (`"a", "b, with comma", "c ""quoted"""`).
@@ -799,7 +996,77 @@ mod tests {
         assert!(install_ads(b"0.0.0.0 one.example\n", "x", &target).is_err());
         assert!(install_ads(b"<html>rate limited</html>", "x", &target).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap().lines().count(), MIN_ADS + 1);
-        assert!(installed_file(tmp.path(), SOURCES.last().unwrap()).ends_with(crate::web::config::ADS_FILE));
+        let ads = SOURCES.iter().find(|s| matches!(s.kind, SourceKind::AdsHostfile { .. })).unwrap();
+        assert!(installed_file(tmp.path(), ads).ends_with(crate::web::config::ADS_FILE));
+    }
+
+    #[test]
+    fn threatfox_reply_feeds_hashes_and_web_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut feed = FeedHashes::load(&tmp.path().join("h.txt")).unwrap();
+        let mut web = FeedWeb::load(&tmp.path().join("w.txt")).unwrap();
+        let sha = "c".repeat(64);
+        let reply = serde_json::json!({"query_status": "ok", "data": [
+            {"ioc": sha, "ioc_type": "sha256_hash", "malware_printable": "Lumma Stealer", "confidence_level": 100},
+            {"ioc": "d41d8cd98f00b204e9800998ecf8427e", "ioc_type": "md5_hash", "malware_printable": "X", "confidence_level": 100},
+            {"ioc": "C2.Example", "ioc_type": "domain", "malware_printable": "Unknown malware", "confidence_level": 50},
+            {"ioc": "http://drop.example/a.exe", "ioc_type": "url", "malware_printable": "Vidar", "confidence_level": 100},
+            {"ioc": "203.0.113.9:443", "ioc_type": "ip:port", "malware_printable": "Vidar", "confidence_level": 100},
+            {"ioc": "198.51.100.9:80", "ioc_type": "ip:port", "malware_printable": "Vidar", "confidence_level": 50},
+        ]});
+        let message = merge_threatfox(reply.to_string().as_bytes(), &mut feed, &mut web).unwrap();
+        assert_eq!(message, "1 hashes (1 new) and 3 web indicators (3 new)");
+        assert!(feed.lines[0].ends_with("Malware.Lumma-Stealer"));
+        assert!(web.lines.iter().any(|l| l == "domain c2.example malware ThreatFox"));
+        assert!(!web.lines.iter().any(|l| l.contains("198.51.100.9")), "low confidence skipped");
+
+        let none = serde_json::json!({"query_status": "no_result", "data": "Your search did not yield any results"});
+        assert!(merge_threatfox(none.to_string().as_bytes(), &mut feed, &mut web).is_ok());
+        let denied = serde_json::json!({"query_status": "unknown_auth_key"});
+        assert!(merge_threatfox(denied.to_string().as_bytes(), &mut feed, &mut web).unwrap_err().to_string().contains("unknown_auth_key"));
+        assert!(merge_threatfox(b"<html>", &mut feed, &mut web).is_err());
+    }
+
+    #[test]
+    fn keyed_sources_are_skipped_without_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Only sources that need a key are touched; with none they are skipped
+        // without a request.
+        assert!(SOURCES.iter().filter(|s| s.needs_key).all(|s| s.url.contains("abuse.ch")));
+        assert!(SOURCES.iter().filter(|s| s.url.contains("{key}")).all(|s| s.needs_key));
+        assert_eq!(SOURCES[3].address(Some("abc123")), "https://mb-api.abuse.ch/v2/files/exports/abc123/recent.csv");
+        assert!(save_auth_key(tmp.path(), Some("bad key/../")).is_err(), "keys go into a URL path");
+        if std::env::var(AUTH_KEY_ENV).is_err() {
+            assert_eq!(auth_key(tmp.path()).unwrap(), None);
+        }
+        assert!(api_due(None));
+        let mut fresh = SourceStatus {
+            name: String::new(),
+            url: String::new(),
+            updated_at: None,
+            ok: true,
+            message: String::new(),
+            etag: None,
+            last_modified: None,
+            checked_at: Some(crate::store::now()),
+            unchanged: false,
+            skipped: false,
+        };
+        assert!(!api_due(Some(&fresh)));
+        fresh.checked_at = Some("2020-01-01T00:00:00+00:00".into());
+        assert!(api_due(Some(&fresh)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auth_key_round_trips_encrypted() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_auth_key(tmp.path(), Some(" 0123abcd ")).unwrap();
+        assert!(auth_key_saved(tmp.path()));
+        assert!(!fs::read_to_string(tmp.path().join(AUTH_KEY_FILE)).unwrap().contains("0123abcd"), "stored encrypted");
+        assert_eq!(auth_key(tmp.path()).unwrap().as_deref(), Some("0123abcd"));
+        save_auth_key(tmp.path(), None).unwrap();
+        assert!(!auth_key_saved(tmp.path()));
     }
 
     #[test]

@@ -747,7 +747,8 @@ impl App {
             self.start_hardening_check(ctx);
         }
         let mut recheck = false;
-        let mut open = None;
+        // The link and the profile folder it should open in.
+        let mut open: Option<(posture::Link, Option<String>)> = None;
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 section_title(ui, "Browser hardening");
@@ -759,13 +760,13 @@ impl App {
                     }
                 });
             });
-            muted(ui, "Updates and the settings that matter most against exploits from a just-opened page and against stealers copying saved data. Read-only: each item links to the browser's own setting.");
+            muted(ui, "Updates and the settings that matter most against exploits from a just-opened page and against stealers copying saved data. Read-only: each item opens the browser's own setting, in that profile.");
             let Some(report) = &self.web.hardening else { return };
             for v in &report.versions {
                 row_divider(ui);
                 ui.label(RichText::new(&v.browser).strong().color(theme().text));
                 if check_row(ui, &v.check, false) == Some(CheckAction::OpenSettings) {
-                    open = Some(v.check.link);
+                    open = Some((v.check.link, None));
                 }
             }
             for p in &report.profiles {
@@ -773,7 +774,7 @@ impl App {
                 ui.label(RichText::new(format!("{} · {}", p.browser, p.profile)).strong().color(theme().text));
                 for c in p.checks.iter().filter(|c| c.status != threat_scanner::posture::Status::Info || c.id == "secure_dns") {
                     if check_row(ui, c, false) == Some(CheckAction::OpenSettings) {
-                        open = Some(c.link);
+                        open = Some((c.link, Some(p.profile_dir.clone())));
                     }
                 }
             }
@@ -785,8 +786,8 @@ impl App {
             self.start_hardening_check(ctx);
         }
         match open {
-            Some(link) if link.target.is_empty() => {} // already on this page (Browser Guard card above)
-            Some(link) => self.open_link(link),
+            Some((link, _)) if link.target.is_empty() => {} // already on this page (Browser Guard card above)
+            Some((link, profile)) => self.open_link_in_profile(link, profile.as_deref()),
             None => {}
         }
     }
@@ -812,6 +813,33 @@ impl App {
         }
     }
 
+    /// The Windows DNS change popup: asks first, and stays up while it runs.
+    pub(super) fn dns_dialog(&mut self, ctx: &egui::Context) {
+        let busy = self.web.dns_rx.is_some();
+        let Some(change) = self.web.dns_confirm else { return };
+        let (title, text) = match change {
+            DnsChange::Apply => (
+                "Point Windows' DNS at the Phalanx filter?",
+                if self.web.dns_fallback {
+                    "Every connected adapter will use 127.0.0.1 and ::1 (Phalanx), with its current first server as a fallback. The current settings are saved first."
+                } else {
+                    "Every connected adapter will use only 127.0.0.1 and ::1 (Phalanx). If Phalanx is not running, websites will not load until you restore. The current settings are saved first."
+                },
+            ),
+            DnsChange::Restore => (
+                "Restore the DNS settings saved before?",
+                "Each adapter goes back to exactly what it used before (automatic from the router, or the servers it had).",
+            ),
+        };
+        let risky = change == DnsChange::Apply && !self.web.dns_fallback;
+        let run = if risky { danger_button("Run as administrator") } else { egui::Button::new(RichText::new("Run as administrator").strong()) };
+        match dialog(ctx, "dns-confirm", title, busy, |ui| admin_command_body(ui, text, None, run, busy)) {
+            Some(DialogChoice::Confirm) => self.start_dns_change(change),
+            Some(DialogChoice::Cancel) => self.web.dns_confirm = None,
+            None => {}
+        }
+    }
+
     fn start_dns_change(&mut self, change: DnsChange) {
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
@@ -831,6 +859,7 @@ impl App {
         let Some(rx) = &self.web.dns_rx else { return };
         let Ok((change, result)) = rx.try_recv() else { return };
         self.web.dns_rx = None;
+        self.web.dns_confirm = None;
         self.web.windows_dns = self.web.config.dns_listen_addr().is_ok_and(|a| web_config::windows_uses_filter(&a));
         use threat_scanner::system::Elevated;
         match (change, result) {
@@ -844,7 +873,6 @@ impl App {
     }
 
     fn web_dns_card(&mut self, ui: &mut Ui) {
-        let mut start_dns_change = None;
         let running = self.web.filter.is_some();
         let upstreams: Vec<String> = self.web.config.upstreams().iter().map(ToString::to_string).collect();
         let mut apply_upstream = false;
@@ -920,43 +948,13 @@ impl App {
                 "Keep a fallback DNS server",
                 "Recommended. Your previous DNS server stays second in line, so the internet keeps working when Phalanx is closed. Without it, nothing resolves unless Phalanx runs, but no lookup can slip past the filter.",
             );
-            match self.web.dns_confirm {
-                Some(change) if !busy => {
-                    let (title, text) = match change {
-                        DnsChange::Apply => (
-                            "Point Windows' DNS at the Phalanx filter?",
-                            if self.web.dns_fallback {
-                                "Every connected adapter will use 127.0.0.1 and ::1 (Phalanx), with its current first server as a fallback. The current settings are saved first. Windows asks for administrator permission."
-                            } else {
-                                "Every connected adapter will use only 127.0.0.1 and ::1 (Phalanx). If Phalanx is not running, websites will not load until you restore. The current settings are saved first. Windows asks for administrator permission."
-                            },
-                        ),
-                        DnsChange::Restore => ("Restore the DNS settings saved before?", "Each adapter goes back to exactly what it used before (automatic from the router, or the servers it had). Windows asks for administrator permission."),
-                    };
-                    ui.add_space(6.0);
-                    notice(ui, if change == DnsChange::Apply && !self.web.dns_fallback { theme().red } else { theme().amber }, &format!("{title} {text}"));
-                    ui.horizontal(|ui| {
-                        if primary_button(ui, "Run as administrator").clicked() {
-                            self.web.dns_confirm = None;
-                            start_dns_change = Some(change);
-                        }
-                        if secondary_button(ui, "Cancel").clicked() {
-                            self.web.dns_confirm = None;
-                        }
-                    });
-                }
-                _ if busy => {
-                    ui.horizontal(|ui| {
-                        spinner(ui);
-                        muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
-                    });
-                }
-                _ => {}
+            if busy {
+                ui.horizontal(|ui| {
+                    spinner(ui);
+                    muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
+                });
             }
         });
-        if let Some(change) = start_dns_change {
-            self.start_dns_change(change);
-        }
         if apply_upstream {
             let entries: Vec<String> = self.web.upstream_input.split([',', ' ']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
             let bad: Vec<&String> = entries.iter().filter(|s| web_config::parse_resolver(s).is_none()).collect();

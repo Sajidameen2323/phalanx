@@ -59,7 +59,7 @@ The app has these pages:
   scan** (every file on the internal drives) or a **custom scan** (folders or
   files you pick); then live progress with a cancel button, and the detections.
   Select detections and quarantine them.
-* **Protection**: a read-only **Windows protection status** card (see below), and
+* **Protection**: a **Windows protection status** card (see below), and
   **real-time protection**: new files in watched folders (for example Downloads) and
   every program that starts are scanned automatically, threats that are running are
   stopped, and you get a Windows notification for each threat.
@@ -67,7 +67,8 @@ The app has these pages:
   Guard) and for the whole PC (DNS filter), check a site, manage allowed and
   blocked sites, and find dangerous browser extensions (see below).
 * **AI Inspect**: ask Google Gemini whether a file looks safe (see below).
-* **Privacy**: a read-only privacy checklist with a score (see below).
+* **Privacy**: a privacy checklist with a score; Phalanx can switch most items for
+  you (see below).
 * **Quarantine**: restore or permanently delete isolated files.
 * **History**: every scan with its type, duration, files, data, threads, skipped
   and unreadable files, quarantined files and signature date. Expand a scan to see
@@ -136,9 +137,11 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
   Right-click the tray icon and choose **Quit** to stop it.
 * **Start with Windows.** This setting adds a per-user sign-in entry
   (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, no administrator rights
-  needed). It starts the app hidden in
-  the tray with protection on.
-* **One copy at a time.** Launching it again brings the running window to the front.
+  needed). It starts the app hidden in the tray with protection on: the window
+  never appears or takes the focus until you open it from the tray. An existing
+  entry for this program that lacks `--background` is corrected on start.
+* **One copy at a time.** Launching it again brings the running window to the
+  front. A second start-up entry (`--background`) never does.
 * **Warns about programs and scripts before you open them.** When an `.exe`, `.msi`,
   `.ps1`, `.py`, `.bat`, `.js`, `.lnk`, `.iso` or similar file lands in a watched
   folder, a notification appears within about a second, before the file has
@@ -316,8 +319,10 @@ exists (from Google's and Microsoft's public version feeds; nothing about the PC
 sent), Safe Browsing (standard or enhanced), the JavaScript optimizer (turning it off
 removes the part of the browser most zero-day exploits target), secure DNS, whether
 Browser Guard is installed, and how many passwords the profile stores (rows are
-counted from a copy of the database; nothing is read or decrypted). Each item links
-to the browser's own setting. `phalanx-cli browsers` prints the same.
+counted from a copy of the database; nothing is read or decrypted). Each item opens
+the browser's own setting in that browser and in that profile (`--profile-directory`),
+so a profile's settings never open in another profile or browser.
+`phalanx-cli browsers` prints the same.
 
 **Browser extensions.** **Check browsers** reads every Chrome, Edge, Brave and
 Vivaldi profile. It reports an extension as:
@@ -364,19 +369,29 @@ resetting Windows if malware is confirmed.
 
 ### Windows protection status
 
-The Protection page checks, without changing anything: real-time antivirus
-(Microsoft Defender or another registered product), tamper protection,
-cloud-delivered protection, potentially unwanted app blocking, SmartScreen (Check
-apps and files), Smart App Control, memory integrity, firewall profiles, controlled
-folder access, User Account Control and whether file extensions are shown. Each
-check says what it read and links to the Windows Security or Settings page where you
-can change it. **Network protection** (Microsoft Defender blocking connections to
-malicious sites for every program, inside Windows' network stack) is checked too.
-Network protection, potentially unwanted app blocking and cloud-delivered protection
-have a **Turn on** button when they are off: it shows the exact `Set-MpPreference`
-command and runs it as administrator only after you confirm and approve Windows'
-prompt, then reads the setting again (some Windows editions accept the command
-without the setting changing; the page says so). **Run offline scan** starts a
+The Protection page checks: real-time antivirus (Microsoft Defender or another
+registered product), tamper protection, cloud-delivered protection, potentially
+unwanted app blocking, SmartScreen (Check apps and files), Smart App Control
+(Windows 11 only), memory integrity, firewall profiles, controlled folder access,
+User Account Control and whether file extensions are shown. Each check says what it
+read and links to the Windows Security or Settings page where you can change it; the
+pages are the ones that exist on both Windows 10 and Windows 11 (for example Folder
+Options for file extensions, which Settings moved between versions). **Network
+protection** (Microsoft Defender blocking connections to malicious sites for every
+program, inside Windows' network stack) is checked too; Windows Security has no
+switch for it, so it links to Microsoft's documentation.
+
+Phalanx can change some of these itself:
+
+* **Show extensions** switches file extensions on (or back off) for your account
+  directly, no administrator rights needed, and refreshes open File Explorer windows.
+* Network protection, potentially unwanted app blocking, cloud-delivered protection,
+  the firewall and controlled folder access have a **Turn on** button when they are
+  off. It shows the exact PowerShell command and runs it as administrator only after
+  you confirm and approve Windows' prompt, then reads the setting again (some
+  editions or policies accept the command without the setting changing; the page
+  says so). Cloud-delivered protection has no button while tamper protection is on,
+  because tamper protection blocks the command; use Windows Security for it. **Run offline scan** starts a
 Microsoft Defender Offline scan, which restarts the PC and scans before Windows
 starts. Values that cannot be read are shown as *Unknown*, never as off.
 Defender settings are marked not applicable when another antivirus is active.
@@ -391,8 +406,19 @@ websites can read, app-launch tracking, suggested content and Start suggestions,
 online speech recognition, inking and typing personalisation, web results and cloud
 content in search, and location, camera and microphone access. More important
 settings weigh more; camera, microphone and feedback frequency are shown for
-information only. It only reads the registry, and links each item to its Settings
-page.
+information only. Windows 11 reads "Recommendations in Start" where Windows 10 reads
+"Suggestions in Start".
+
+Each item links to its Settings page, and most also have a button (**Turn off**,
+**Block apps**, **Never ask**, and the matching button to undo it) that switches the
+setting directly. These are per-user settings: Phalanx writes the same values the
+Settings page writes, under your account, with no administrator rights. A switch is
+not offered where a policy or a device-wide setting decides instead. Two items need
+an administrator: optional diagnostic data (a system-wide setting) and **web results
+in Start search**, for which Windows Settings has no switch and current Windows
+versions ignore the old per-user value; Phalanx sets the search box policy Windows
+reads, after showing the command and Windows' prompt (it takes effect after you sign
+out and back in).
 
 ### AI inspection (Google Gemini)
 
@@ -503,18 +529,29 @@ without a restart. You can also click **Update now** (Dashboard or Settings), or
 phalanx-cli update            # download feeds that changed
 phalanx-cli update --check    # only report which feeds have new data
 phalanx-cli update --force    # download everything again
+phalanx-cli update --set-key <KEY>   # save your abuse.ch Auth-Key (`none` removes it)
 ```
 
 The feeds are:
 
-| Source | What | Licence |
-| --- | --- | --- |
-| [YARA Forge](https://github.com/YARAHQ/yara-forge) core package | about 5,100 curated YARA rules | varies per rule (see each rule's `license_url`) |
-| [MalwareBazaar](https://bazaar.abuse.ch/) recent samples | SHA-256 hashes with malware family names | CC0 |
-| [ThreatFox](https://threatfox.abuse.ch/) recent SHA-256 IOCs | SHA-256 hashes with malware family names | CC0 |
-| [URLhaus](https://urlhaus.abuse.ch/) host file and online URLs | malware-distribution hosts and download links (web protection) | CC0 |
-| [ThreatFox](https://threatfox.abuse.ch/) recent domains, URLs and C2 addresses | malware sites and command-and-control servers (web protection; addresses only at confidence 75 or more) | CC0 |
-| [StevenBlack hosts](https://github.com/StevenBlack/hosts) base list | ad, tracker and adware names (used only when ad blocking is on) | MIT |
+| Source | What | Licence | Needs |
+| --- | --- | --- | --- |
+| [YARA Forge](https://github.com/YARAHQ/yara-forge) core package | about 5,100 curated YARA rules | varies per rule (see each rule's `license_url`) | nothing |
+| [malware-filter](https://gitlab.com/malware-filter/urlhaus-filter) URLhaus host list | malware-distribution hosts from URLhaus, republished twice a day (web protection) | CC0 | nothing |
+| [StevenBlack hosts](https://github.com/StevenBlack/hosts) base list | ad, tracker and adware names (used only when ad blocking is on) | MIT | nothing |
+| [MalwareBazaar](https://bazaar.abuse.ch/) recent samples | SHA-256 hashes with malware family names | CC0 | abuse.ch Auth-Key |
+| [ThreatFox](https://threatfox.abuse.ch/) indicators of the last 7 days | SHA-256 hashes; malware domains, URLs and command-and-control addresses (addresses only at confidence 75 or more) | CC0 | abuse.ch Auth-Key |
+| [URLhaus](https://urlhaus.abuse.ch/) URLs of the last 30 days | malware download links (web protection) | CC0 | abuse.ch Auth-Key |
+
+**abuse.ch Auth-Key.** Since mid-2025 abuse.ch (MalwareBazaar, ThreatFox, URLhaus)
+only serves its data to callers with a free personal Auth-Key; requests without
+one fail with HTTP 401. Get a key at [auth.abuse.ch](https://auth.abuse.ch/)
+(sign in with a GitHub, Google or Microsoft account) and paste it under
+Settings > Signatures, or run `phalanx-cli update --set-key <KEY>`. It is stored
+encrypted for your Windows account (DPAPI), never in plain text. The
+`ABUSE_CH_AUTH_KEY` environment variable is used when no key is saved. Without a
+key, those three feeds are shown as **skipped** (not failed), and the other feeds
+still update; the known-bad hash list then only grows once a key is added.
 
 How updates work:
 
@@ -522,6 +559,8 @@ How updates work:
   a hash feed must contain hashes. Only then does it atomically replace the local
   copy. A source that fails keeps its previous version, so an update never leaves
   you worse off.
+* **ThreatFox is asked through its API** (no `HEAD` check is possible), at most
+  every 6 hours during automatic checks.
 * **Hash feeds accumulate.** abuse.ch publishes a rolling window of recent samples,
   so each update merges new hashes into `signatures/feed-hashes.txt`. The list is
   capped at 750,000 entries, oldest dropped first. Update regularly to build up
@@ -550,16 +589,19 @@ The rules include a harmless marker for end-to-end tests. Use a file containing 
 uppercase text `threat-scanner-test-marker-7f3a`. The industry-standard EICAR test
 file is also detected, but your installed antivirus will probably remove it first.
 
-## Adding your own signatures
+## Adding your own signatures (command line only)
+
+The app only uses the bundled and downloaded signatures. For your own, pass them to
+`phalanx-cli` scans with `--rules <file or folder>` and `--hashes <file>`:
 
 * Hash lists use `<sha256> [<category>] [<threat name>]`, one per line. Plain
   one-hash-per-line exports work too; the category defaults to `malware`.
   Categories are `malware`, `pup`, `hacktool` and `suspicious`.
 * YARA rules can set `meta: threat = "..."` and `category = "..."`. Without them,
   the category is derived as described above.
-* Your own rule folder and hash file are never scanned, because they contain the
-  patterns they detect. The built-in rules use hex and `\xHH` escapes for the same
-  reason.
+* Keep your own rule folder and hash file outside the scanned folders (or exclude
+  them): they contain the patterns they detect. The built-in rules use hex and
+  `\xHH` escapes for the same reason.
 
 ## Limitations
 

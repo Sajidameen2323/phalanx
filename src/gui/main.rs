@@ -47,9 +47,13 @@ fn main() -> eframe::Result {
         .map(PathBuf::from)
         .collect();
 
-    // One copy only: a second launch brings the running one to the front.
+    // One copy only: a second launch brings the running one to the front,
+    // unless it is another start-up entry (`--background`): that one must
+    // never pop the window up at sign-in.
     let Some(instance) = desktop::SingleInstance::acquire() else {
-        desktop::show_existing_window();
+        if !background {
+            desktop::show_existing_window();
+        }
         return Ok(());
     };
 
@@ -67,8 +71,12 @@ fn main() -> eframe::Result {
         APP_TITLE,
         options,
         Box::new(move |cc| {
+            // Started at sign-in: stay in the tray until the user opens it.
+            if background {
+                desktop::hold_hidden(cc);
+            }
             instance.listen_for_show_requests(cc.egui_ctx.clone());
-            Ok(Box::new(App::new(&cc.egui_ctx, scan_paths, background)))
+            Ok(Box::new(App::new(&cc.egui_ctx, scan_paths)))
         }),
     )
 }
@@ -123,8 +131,6 @@ struct Settings {
     auto_quarantine: bool,
     quarantine_suspicious: bool,
     max_size_mb: u64,
-    rules_dir: Option<PathBuf>,
-    hashes_file: Option<PathBuf>,
     performance: Performance,
     exclusions: Vec<PathBuf>,
     watch_enabled: bool,
@@ -168,8 +174,6 @@ impl Default for Settings {
             auto_quarantine: false,
             quarantine_suspicious: false,
             max_size_mb: 100,
-            rules_dir: None,
-            hashes_file: None,
             performance: Performance::LowImpact,
             exclusions: Vec::new(),
             watch_enabled: false,
@@ -222,21 +226,13 @@ impl Settings {
     }
     fn engine_config(&self, data_dir: &Path) -> EngineConfig {
         EngineConfig {
-            rule_paths: self.rules_dir.iter().cloned().collect(),
-            hash_files: self.hashes_file.iter().cloned().collect(),
             signature_dir: Some(update::signature_dir(data_dir)),
             heuristics: self.heuristics,
+            ..Default::default()
         }
     }
-    /// User exclusions, plus the user's own signature files (they contain
-    /// what they detect).
     fn exclude(&self) -> Vec<PathBuf> {
-        self.exclusions
-            .iter()
-            .chain(self.rules_dir.iter())
-            .chain(self.hashes_file.iter())
-            .cloned()
-            .collect()
+        self.exclusions.clone()
     }
     fn quarantine_floor(&self) -> Option<Category> {
         if self.quarantine_suspicious {
@@ -477,12 +473,9 @@ struct App {
     quitting: Arc<AtomicBool>,
     hidden_notice_shown: bool,
     autostart: bool,
-    /// Started by Windows at sign-in: stay in the tray. eframe shows the
-    /// window after its first frame, so it is hidden again there.
-    start_hidden: bool,
     /// Whether notifications carry the app's own name, or why not.
     notification_identity: Result<(), String>,
-    // Windows security and privacy checks (read-only)
+    // Windows security and privacy checks
     security: Option<Vec<Check>>,
     privacy: Option<Vec<Check>>,
     posture_rx: Option<Receiver<(Vec<Check>, Vec<Check>)>>,
@@ -491,6 +484,8 @@ struct App {
     /// the last one applied (checked when the settings are re-read) and a
     /// note about its outcome.
     pending_fix: Option<posture::Fix>,
+    /// The fix being run, kept on screen until it finishes.
+    running_fix: Option<posture::Fix>,
     fix_rx: Option<Receiver<(posture::Fix, Result<system::Elevated, String>)>>,
     applied_fix: Option<posture::Fix>,
     fix_note: Option<String>,
@@ -502,6 +497,9 @@ struct App {
     settings_tab: SettingsTab,
     key_input: String,
     key_visible: bool,
+    /// The abuse.ch Auth-Key being typed, and whether one is saved.
+    abuse_key_input: String,
+    abuse_key_saved: bool,
     ai_models: Vec<String>,
     ai_models_rx: Option<Receiver<Result<Vec<String>, String>>>,
     audit: audit_page::AuditState,
@@ -551,14 +549,26 @@ fn write_versioned(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> Result<Pa
     Ok(path)
 }
 
-/// Whether the program a start-up command names (quoted first, as written
-/// by [`autostart_command`]) is still there.
-fn autostart_program_exists(command: &str) -> bool {
-    let program = match command.trim().strip_prefix('"') {
+/// The program a start-up command names (quoted first, as written by
+/// [`autostart_command`]).
+fn autostart_program(command: &str) -> &str {
+    match command.trim().strip_prefix('"') {
         Some(rest) => rest.split('"').next().unwrap_or(""),
         None => command.split_whitespace().next().unwrap_or(""),
-    };
+    }
+}
+
+/// Whether the program a start-up command names is still there.
+fn autostart_program_exists(command: &str) -> bool {
+    let program = autostart_program(command);
     !program.is_empty() && Path::new(program).is_file()
+}
+
+/// Whether a start-up command runs this very program.
+fn autostart_names_this_program(command: &str) -> bool {
+    let program = autostart_program(command);
+    let same = |a: &Path, b: &Path| a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b);
+    std::env::current_exe().is_ok_and(|exe| same(Path::new(program), &exe))
 }
 
 /// The command the "start with Windows" entry should run.
@@ -568,7 +578,7 @@ fn autostart_command() -> String {
 }
 
 impl App {
-    fn new(ctx: &egui::Context, scan_paths: Vec<PathBuf>, start_hidden: bool) -> Self {
+    fn new(ctx: &egui::Context, scan_paths: Vec<PathBuf>) -> Self {
         widgets::apply_style(ctx);
         let data_dir = scan::default_data_dir();
         let _ = std::fs::create_dir_all(&data_dir);
@@ -582,11 +592,14 @@ impl App {
         // exists (the app was renamed or moved) is pointed at this program.
         // An entry that still names a working Phalanx is the user's choice and
         // is left alone, even when another copy (a test build) starts.
+        // An entry for this program without `--background` (written by hand or
+        // by an old version) would open the window at every sign-in.
         if let Some(command) = system::autostart_command() {
-            if !autostart_program_exists(&command) {
+            if !autostart_program_exists(&command) || (autostart_names_this_program(&command) && !command.contains(BACKGROUND_FLAG)) {
                 let _ = system::set_autostart(true, &autostart_command());
             }
         }
+        let abuse_key_saved = update::auth_key_saved(&update::signature_dir(&data_dir));
         let mut app = Self {
             page: Page::Dashboard,
             data_dir,
@@ -620,13 +633,13 @@ impl App {
             quitting,
             hidden_notice_shown: false,
             autostart: system::autostart_enabled(),
-            start_hidden,
             notification_identity,
             security: None,
             privacy: None,
             posture_rx: None,
             posture_checked: None,
             pending_fix: None,
+            running_fix: None,
             fix_rx: None,
             applied_fix: None,
             fix_note: None,
@@ -635,6 +648,8 @@ impl App {
             settings_tab: SettingsTab::General,
             key_input: String::new(),
             key_visible: false,
+            abuse_key_input: String::new(),
+            abuse_key_saved,
             ai_models: Vec::new(),
             ai_models_rx: None,
             audit: audit_page::AuditState::default(),
@@ -792,7 +807,7 @@ impl App {
                 let failed: Vec<String> = manifest
                     .sources
                     .iter()
-                    .filter(|s| !s.ok)
+                    .filter(|s| s.failed())
                     .map(|s| s.name.clone())
                     .collect();
                 let updated: Vec<String> = manifest
@@ -1069,10 +1084,12 @@ impl App {
         // Did the fix just applied take effect? Windows can accept a command
         // without the setting changing (managed PCs, unsupported editions).
         if let Some(fix) = self.applied_fix.take() {
-            let still_needed = security.iter().any(|c| c.fix == Some(fix));
+            let still_needed = security.iter().chain(&privacy).any(|c| c.fix == Some(fix));
             self.fix_note = still_needed.then(|| {
                 if fix == posture::FIX_NETWORK_PROTECTION {
                     "Windows accepted the command, but Network protection still reads as off. It may not be available on this edition of Windows (it is documented for Pro and Enterprise). Phalanx's browser and DNS blocking still protect you.".to_string()
+                } else if fix == posture::FIX_WEB_SEARCH {
+                    "Windows accepted the command, but your account's setting has not changed. The Windows prompt was probably approved with another administrator account, so the policy went to that account instead. Run it from your own administrator account.".to_string()
                 } else {
                     format!("Windows accepted `{}`, but the setting has not changed. Another policy or security product may control it.", fix.command)
                 }
@@ -1089,6 +1106,7 @@ impl App {
             return;
         }
         self.fix_note = None;
+        self.running_fix = Some(fix);
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -1103,6 +1121,7 @@ impl App {
         let Some(rx) = &self.fix_rx else { return };
         let Ok((fix, result)) = rx.try_recv() else { return };
         self.fix_rx = None;
+        self.running_fix = None;
         match result {
             Ok(system::Elevated::Exited(0)) if fix == posture::OFFLINE_SCAN => {
                 self.notify("Offline scan scheduled: Windows restarts shortly", true)
@@ -1119,9 +1138,30 @@ impl App {
     }
 
     fn open_link(&mut self, link: posture::Link) {
-        if let Err(e) = link.open() {
-            self.notify(format!("Could not open Windows settings: {e}"), false);
+        self.open_link_in_profile(link, None);
+    }
+
+    /// Opens a link; a browser page opens in that browser profile.
+    fn open_link_in_profile(&mut self, link: posture::Link, profile: Option<&str>) {
+        if let Err(e) = link.open_in_profile(profile) {
+            self.notify(format!("Could not open {}: {e}", if link.target.starts_with("start:") { "the browser" } else { "Windows settings" }), false);
         }
+    }
+
+    /// Flips a per-user Windows setting (no administrator rights), then
+    /// re-reads the settings to show the result.
+    fn apply_toggle(&mut self, ctx: &egui::Context, toggle: posture::Toggle, protective: bool) {
+        match toggle.apply(protective) {
+            Ok(()) => {
+                let note = match toggle {
+                    posture::Toggle::StartSuggestions | posture::Toggle::StartRecommendations | posture::Toggle::TrackLaunches => " (Start may update after you sign out and back in)",
+                    _ => "",
+                };
+                self.notify(format!("Changed{note}. Checking the setting again…"), true);
+            }
+            Err(e) => self.notify(format!("Could not change the setting: {e:#}"), false),
+        }
+        self.refresh_posture(ctx);
     }
 
     // ---------- AI inspection ----------
@@ -1640,10 +1680,6 @@ impl eframe::App for App {
         if let Some(previous) = widgets::sync_theme(&ctx) {
             self.theme_fade = Some((previous, ctx.input(|i| i.time)));
         }
-        if std::mem::take(&mut self.start_hidden) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-
         // Closing hides to the tray (protection keeps running) unless quitting.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.quitting.load(Ordering::Relaxed)

@@ -593,10 +593,13 @@ pub fn check_label(status: Status, privacy: bool) -> &'static str {
 pub enum CheckAction {
     OpenSettings,
     ApplyFix,
+    /// Flip the check's switch: to its protective position (`true`) or back.
+    Toggle(bool),
 }
 
 /// One check: status badge, title, what was read, why it matters, a link to
-/// the Windows page and, when the check offers one, a fix button.
+/// the Windows page and, when the check offers them, a switch Phalanx flips
+/// itself or an administrator fix.
 pub fn check_row(ui: &mut Ui, check: &Check, privacy: bool) -> Option<CheckAction> {
     let mut action = None;
     ui.horizontal(|ui| {
@@ -610,12 +613,20 @@ pub fn check_row(ui: &mut Ui, check: &Check, privacy: bool) -> Option<CheckActio
             ui.add(egui::Label::new(RichText::new(&check.detail).size(13.0).color(check_color(check.status).lerp_to_gamma(theme().text, 0.35))).wrap());
             ui.add(egui::Label::new(RichText::new(check.why).size(12.0).color(theme().muted)).wrap());
             ui.horizontal_wrapped(|ui| {
+                if let Some(toggle) = check.toggle {
+                    // In its protective position the switch offers the way back.
+                    let protective = check.status != Status::Good;
+                    if small_button(ui, toggle.label(protective)).clicked() {
+                        action = Some(CheckAction::Toggle(protective));
+                    }
+                }
                 if let Some(fix) = &check.fix {
                     if small_button(ui, fix.label).clicked() {
                         action = Some(CheckAction::ApplyFix);
                     }
                 }
-                if (check.status != Status::Good || privacy)
+                if !check.link.label.is_empty()
+                    && (check.status != Status::Good || privacy)
                     && ui.add(egui::Link::new(RichText::new(check.link.label).size(12.5).color(theme().accent))).clicked()
                 {
                     action = Some(CheckAction::OpenSettings);
@@ -624,6 +635,71 @@ pub fn check_row(ui: &mut Ui, check: &Check, privacy: bool) -> Option<CheckActio
         });
     });
     action
+}
+
+/// What the user chose in a [`dialog`].
+#[derive(Clone, Copy, PartialEq)]
+pub enum DialogChoice {
+    Confirm,
+    Cancel,
+}
+
+/// A popup over the whole window (the page behind is dimmed and blocked), so
+/// it is seen wherever the user clicked. `content` draws the body and returns
+/// a choice when a button is pressed; clicking outside or Escape cancels
+/// unless `busy` (something is already running and must finish first).
+pub fn dialog(ctx: &egui::Context, id: &str, title: &str, busy: bool, content: impl FnOnce(&mut Ui) -> Option<DialogChoice>) -> Option<DialogChoice> {
+    let response = egui::Modal::new(egui::Id::new(id))
+        .frame(
+            egui::Frame::new()
+                .fill(theme().card)
+                .stroke(Stroke::new(1.0, theme().hairline))
+                .corner_radius(16.0)
+                .inner_margin(Margin::same(22)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(440.0_f32.min(ctx.content_rect().width() - 80.0));
+            section_title(ui, title);
+            ui.add_space(6.0);
+            content(ui)
+        });
+    match response.inner {
+        Some(choice) => Some(choice),
+        None if !busy && response.should_close() => Some(DialogChoice::Cancel),
+        None => None,
+    }
+}
+
+/// The body of a dialog that runs a fixed administrator command: what
+/// changes, the exact command, and the buttons. While `running`, a spinner
+/// replaces the buttons.
+pub fn admin_command_body(ui: &mut Ui, effect: &str, command: Option<&str>, run: egui::Button<'static>, running: bool) -> Option<DialogChoice> {
+    ui.add(egui::Label::new(RichText::new(effect).color(theme().text)).wrap());
+    ui.add_space(6.0);
+    if let Some(command) = command {
+        muted(ui, "Phalanx runs exactly this command as administrator. Windows asks for your permission first:");
+        egui::Frame::new().fill(theme().bg).corner_radius(6.0).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(command).monospace().color(theme().text)).wrap());
+        });
+    } else {
+        muted(ui, "Windows asks for administrator permission first.");
+    }
+    ui.add_space(10.0);
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        if running {
+            spinner(ui);
+            muted(ui, "Waiting for the administrator command (approve the Windows prompt)…");
+        } else {
+            if ui.add(run).clicked() {
+                choice = Some(DialogChoice::Confirm);
+            }
+            if secondary_button(ui, "Cancel").clicked() {
+                choice = Some(DialogChoice::Cancel);
+            }
+        }
+    });
+    choice
 }
 
 /// Score ring: percentage and level in a ring of dots.

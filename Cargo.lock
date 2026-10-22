@@ -5441,7 +5441,7 @@ dependencies = [
 
 [[package]]
 name = "threat-scanner"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5451,6 +5451,7 @@ dependencies = [
  "hex",
  "notify",
  "notify-rust",
+ "raw-window-handle",
  "rfd",
  "rusqlite",
  "serde",

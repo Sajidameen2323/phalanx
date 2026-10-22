@@ -84,8 +84,55 @@ pub struct Tray {
     _icon: TrayIcon,
 }
 
+/// The main window while it is held hidden (see [`hold_hidden`]), else 0.
+#[cfg(windows)]
+static HELD_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Keeps the main window hidden until the user opens it (started at
+/// sign-in). eframe shows a new window as soon as it has painted a frame,
+/// and on Windows it paints hidden windows too, so the window would pop up
+/// and take the focus at every sign-in. A minimized window is never painted,
+/// so the hidden window is marked minimized (the style bit only: nothing is
+/// shown or animated) until [`show_window`] lifts it.
+pub fn hold_hidden(cc: &eframe::CreationContext<'_>) {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, IsWindowVisible, SetWindowLongPtrW, GWL_STYLE, WS_MINIMIZE};
+        let Ok(handle) = cc.window_handle() else { return };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else { return };
+        let hwnd = win32.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+        unsafe {
+            if IsWindowVisible(hwnd) != 0 {
+                return;
+            }
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_MINIMIZE as isize);
+        }
+        HELD_WINDOW.store(hwnd as usize, Ordering::Relaxed);
+    }
+    #[cfg(not(windows))]
+    let _ = cc;
+}
+
+/// Ends the hold, so the window can be shown and painted again.
+fn release_hold() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_MINIMIZE};
+        let hwnd = HELD_WINDOW.swap(0, Ordering::Relaxed) as windows_sys::Win32::Foundation::HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_MINIMIZE as isize));
+            }
+        }
+    }
+}
+
 /// Shows and focuses the main window (it may be hidden in the tray).
 pub fn show_window(ctx: &egui::Context) {
+    release_hold();
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
