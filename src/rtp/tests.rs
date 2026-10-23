@@ -224,11 +224,20 @@ fn a_detected_program_is_stopped_and_quarantined() {
     // Let the first look at running programs pass, so this one counts as new.
     std::thread::sleep(Duration::from_millis(1500));
 
-    let mut child = std::process::Command::new(&exe)
-        .args(["-n", "60", "127.0.0.1"])
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    // Windows' own on-access scan of the new program can hold it for a
+    // moment, longer while the whole suite runs in parallel.
+    let start = || std::process::Command::new(&exe).args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn();
+    let mut started = start();
+    for _ in 0..20 {
+        match &started {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(Duration::from_millis(250));
+                started = start();
+            }
+            _ => break,
+        }
+    }
+    let mut child = started.unwrap();
     assert!(run.until(|m| m.starts_with("detected")), "{:?}", run.seen);
     let detection = run.seen.last().unwrap().clone();
     let status = child.wait().unwrap();
