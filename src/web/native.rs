@@ -718,18 +718,16 @@ fn write_extension(dir: &Path, firefox: bool) -> Result<()> {
     Ok(())
 }
 
-/// The bundled manifest names both background forms. Chromium runs the
-/// service worker and warns about `background.scripts`; Firefox runs the
-/// scripts and has no use for Chromium's `key`. Each copy keeps its own.
+/// The bundled manifest is Chromium's, so the source folder loads as is.
+/// Firefox runs background scripts instead of a service worker (Chromium
+/// warns about `background.scripts`) and has no use for Chromium's `key`.
 fn extension_manifest(firefox: bool) -> Vec<u8> {
-    let mut manifest: Value = serde_json::from_slice(EXTENSION_FILES[0].1).expect("the bundled manifest is JSON");
-    let background = manifest["background"].as_object_mut().expect("the bundled manifest has a background");
-    if firefox {
-        background.remove("service_worker");
-        manifest.as_object_mut().map(|m| m.remove("key"));
-    } else {
-        background.remove("scripts");
+    if !firefox {
+        return EXTENSION_FILES[0].1.to_vec();
     }
+    let mut manifest: Value = serde_json::from_slice(EXTENSION_FILES[0].1).expect("the bundled manifest is JSON");
+    manifest["background"] = json!({ "scripts": ["background.js"] });
+    manifest.as_object_mut().map(|m| m.remove("key"));
     serde_json::to_vec_pretty(&manifest).expect("JSON serializes")
 }
 
@@ -1122,6 +1120,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_extensions(tmp.path()).unwrap();
         let read = |dir: PathBuf| -> Value { serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap() };
+        assert_eq!(std::fs::read(extension_dir(tmp.path()).join("manifest.json")).unwrap(), EXTENSION_FILES[0].1, "Chromium gets the source manifest");
         let chromium = read(extension_dir(tmp.path()));
         assert_eq!(chromium["background"], json!({ "service_worker": "background.js" }), "Chromium warns about background.scripts");
         assert!(chromium["key"].is_string(), "the key fixes the Chromium extension ID");
