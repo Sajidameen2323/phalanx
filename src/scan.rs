@@ -11,10 +11,9 @@ use crate::engine::Engine;
 use crate::engine::Verdict;
 use crate::quarantine::Quarantine;
 use crate::store::{ScanMeta, ScanStats, Store, MAX_STORED_ERRORS};
-use crate::{system, trust, Category, Finding, Source};
+use crate::{contents, system, trust, Category, Finding, Source};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +65,8 @@ pub struct ScanOptions {
     /// Keep the history entry of a scan that found nothing. Real-time
     /// protection turns this off for programs, which are checked constantly.
     pub keep_clean_history: bool,
+    /// Look inside ZIP and 7z archives (see [`crate::contents`]).
+    pub archives: bool,
 }
 
 impl ScanOptions {
@@ -81,6 +82,7 @@ impl ScanOptions {
             signatures: None,
             trust_signed: true,
             keep_clean_history: true,
+            archives: true,
         }
     }
 }
@@ -125,6 +127,7 @@ enum WorkerMsg {
         bytes: u64,
         verdict: Verdict,
         /// Kept only for detections, for quarantine without a second read.
+        /// `None` for a padded program, which was not read whole.
         data: Option<Vec<u8>>,
     },
 }
@@ -210,7 +213,11 @@ pub fn run(
                             continue;
                         }
                     }
-                    if entry.metadata().map(|m| m.len()).unwrap_or(0) > options.max_size_bytes {
+                    // A large program may be a small one padded past the
+                    // limit; the worker checks.
+                    if entry.metadata().map(|m| m.len()).unwrap_or(0) > options.max_size_bytes
+                        && !contents::starts_like_program(entry.path())
+                    {
                         let _ = walker_tx.send(WorkerMsg::Skipped);
                         continue;
                     }
@@ -230,24 +237,26 @@ pub fn run(
                     system::enter_background_mode();
                 }
                 let mut scanner = engine.scanner();
+                let look = contents::Options { max_size: options.max_size_bytes, archives: options.archives };
                 loop {
                     let next = path_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
                     let Ok(path) = next else { break };
                     if stopping() {
                         continue; // drain the queue quickly
                     }
-                    let msg = match fs::read(&path) {
+                    let msg = match contents::examine_file(&mut scanner, &path, &look) {
                         Err(e) => WorkerMsg::Error(path.display().to_string(), e.to_string()),
-                        Ok(data) => {
-                            let mut verdict = scanner.scan(&data);
+                        Ok(None) => WorkerMsg::Skipped,
+                        Ok(Some(examined)) => {
+                            let mut verdict = examined.verdict;
                             let heuristic_only = !verdict.findings.is_empty()
                                 && verdict.findings.iter().all(|f| f.source == Source::Heuristic);
                             if options.trust_signed && heuristic_only && trust::verify(&path).is_signed() {
                                 verdict.findings.clear();
                             }
                             WorkerMsg::Scanned {
-                                bytes: data.len() as u64,
-                                data: (!verdict.findings.is_empty()).then_some(data),
+                                bytes: examined.bytes,
+                                data: if verdict.findings.is_empty() { None } else { examined.data },
                                 path,
                                 verdict,
                             }
@@ -287,9 +296,14 @@ pub fn run(
                         return Ok(());
                     };
                     stats.detections += 1;
-                    let action = match (&quarantine, options.quarantine_floor, &data) {
-                        (Some(q), Some(floor), Some(data)) if worst.category >= floor => {
-                            match q.isolate(&path, data, &verdict.sha256, &worst.threat) {
+                    let action = match (&quarantine, options.quarantine_floor) {
+                        (Some(q), Some(floor)) if worst.category >= floor => {
+                            let isolated = match &data {
+                                Some(data) => q.isolate(&path, data, &verdict.sha256, &worst.threat),
+                                // Not read whole (a padded program): copied from disk.
+                                None => q.isolate_file(&path, &verdict.sha256, &worst.threat),
+                            };
+                            match isolated {
                                 Ok(id) => {
                                     stats.quarantined += 1;
                                     format!("quarantined ({id})")
@@ -354,12 +368,8 @@ pub fn quarantine_reported(store: &Store, data_dir: &Path, report: &FileReport) 
 /// Quarantines `path` under `threat` if its SHA-256 is still `sha256`, so a
 /// file replaced since it was examined is never isolated by mistake.
 pub fn quarantine_file(store: &Store, data_dir: &Path, path: &Path, sha256: &str, threat: &str) -> Result<String> {
-    let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    if hex::encode(Sha256::digest(&data)) != sha256 {
-        bail!("{} changed since it was examined; check it again", path.display());
-    }
     let q = Quarantine::new(quarantine_dir(data_dir), store)?;
-    q.isolate(path, &data, sha256, threat)
+    q.isolate_file(path, sha256, threat)
 }
 
 #[cfg(test)]
@@ -472,5 +482,48 @@ mod tests {
 
         options.paths = vec![tmp.path().join("missing")];
         assert!(run(&engine(), &store, &data_dir, &options, &AtomicBool::new(false), &mut |_| {}).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn padded_programs_and_archives_are_scanned_and_quarantined() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("downloads");
+        fs::create_dir_all(&target).unwrap();
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let program = fs::read(Path::new(&root).join(r"System32\PING.EXE")).unwrap();
+        let mut padded = program.clone();
+        padded.resize(program.len() + 12 * 1024 * 1024, 0);
+        let setup = target.join("setup.exe");
+        fs::write(&setup, &padded).unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("docs/invoice.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut zip, format!("x {} y", marker()).as_bytes()).unwrap();
+        fs::write(target.join("invoice.zip"), zip.finish().unwrap().into_inner()).unwrap();
+
+        let hashes = tmp.path().join("hashes.txt");
+        fs::write(&hashes, format!("{} malware Test.Padded\n", hex::encode(Sha256::digest(&program)))).unwrap();
+        let engine = Engine::new(&EngineConfig { hash_files: vec![hashes.clone()], ..Default::default() }).unwrap();
+        let data_dir = tmp.path().join("data");
+        let store = open_store(&data_dir).unwrap();
+        let mut options = ScanOptions::new(vec![target.clone()], "custom");
+        options.max_size_bytes = 1 << 20;
+        options.quarantine_floor = Some(Category::Pup);
+        let report = run(&engine, &store, &data_dir, &options, &AtomicBool::new(false), &mut |_| {}).unwrap();
+
+        assert_eq!(report.stats.files_scanned, 2);
+        assert_eq!(report.stats.files_skipped, 0, "the padded program is scanned, not skipped");
+        let threats: Vec<(&str, &str)> = report.infected.iter().map(|r| (r.path.rsplit('\\').next().unwrap(), r.worst().threat.as_str())).collect();
+        assert!(threats.contains(&("setup.exe", "Test.Padded")), "{threats:?}");
+        assert!(threats.contains(&("invoice.zip", "Test.ThreatScanner.Marker")), "{threats:?}");
+        assert_eq!(report.stats.quarantined, 2);
+        assert!(!setup.exists());
+
+        // The padded file was quarantined whole, and comes back unchanged.
+        let item = store.quarantine_items(false).unwrap().into_iter().find(|q| q.original_path.ends_with("setup.exe")).unwrap();
+        assert_eq!(item.size as usize, padded.len());
+        Quarantine::new(quarantine_dir(&data_dir), &store).unwrap().restore(&item.id, false).unwrap();
+        assert_eq!(fs::read(&setup).unwrap(), padded);
     }
 }

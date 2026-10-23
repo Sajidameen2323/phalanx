@@ -35,6 +35,7 @@
 mod cache;
 pub mod commands;
 mod dirwatch;
+mod drives;
 mod files;
 pub mod process;
 
@@ -96,6 +97,11 @@ pub struct RtpConfig {
     pub stop_running_threats: bool,
     /// Ignore heuristic-only findings on files with a valid signature.
     pub trust_signed: bool,
+    /// Look inside ZIP and 7z archives.
+    pub scan_archives: bool,
+    /// Check the files at the top of a drive when one appears: a mounted
+    /// disk image (ISO, VHD) or a USB drive (Windows).
+    pub scan_new_drives: bool,
     /// Hold back non-urgent scans while a full-screen game or presentation runs.
     pub defer_when_fullscreen: bool,
 }
@@ -116,6 +122,8 @@ impl RtpConfig {
             command_rules: true,
             stop_running_threats: true,
             trust_signed: true,
+            scan_archives: true,
+            scan_new_drives: true,
             defer_when_fullscreen: true,
         }
     }
@@ -171,6 +179,9 @@ pub enum RtpEvent {
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
     /// A command line matched the command-line rules (reported only).
     Command(CommandHit),
+    /// A drive appeared (a mounted disk image or a USB drive); `files` near
+    /// its top are being scanned.
+    DriveAdded { root: PathBuf, files: usize },
     /// Part of protection failed; everything restarts after `retry_in`.
     Restarting { error: String, retry_in: Duration },
     Error(String),
@@ -359,6 +370,10 @@ fn run_once(ctx: &Ctx<'_>, catch_up: Option<SystemTime>) -> Result<(), String> {
         } else {
             drop(sweep_rx);
         }
+        if ctx.config.scan_new_drives && cfg!(windows) {
+            let urgent = urgent_tx.clone();
+            add(spawn_part(s, ctx, "drive-monitor", true, move || drives::run(ctx, &urgent)), "drive-monitor");
+        }
         add(
             spawn_part(s, ctx, "folder-monitor", true, move || files::run(ctx, &urgent_tx, &bulk_tx, catch_up)),
             "folder-monitor",
@@ -511,7 +526,7 @@ fn scan_files(ctx: &Ctx<'_>, store: &Store, items: Vec<(PathBuf, bool)>, urgent:
             ctx.emit(RtpEvent::RiskyChecked { path, outcome });
         }
     }
-    let Some(report) = scan_batch(ctx, store, targets, "watch", ctx.config.quarantine_floor, true, urgent) else {
+    let Some((report, scanned)) = scan_batch(ctx, store, targets, "watch", ctx.config.quarantine_floor, true, urgent) else {
         for path in announced {
             let outcome = RiskyOutcome::NotScanned("the scan could not run".into());
             ctx.emit(RtpEvent::RiskyChecked { path, outcome });
@@ -522,7 +537,7 @@ fn scan_files(ctx: &Ctx<'_>, store: &Store, items: Vec<(PathBuf, bool)>, urgent:
         ctx.emit(RtpEvent::Detection { report: found.clone(), processes: Vec::new() });
     }
     for path in announced {
-        let outcome = risky_outcome(&path, &report, ctx.config.max_size_bytes);
+        let outcome = risky_outcome(&path, &report, &scanned, ctx.config.max_size_bytes);
         ctx.emit(RtpEvent::RiskyChecked { path, outcome });
     }
     ctx.emit(RtpEvent::Scanned { origin: Origin::Folder, report });
@@ -551,7 +566,7 @@ fn scan_programs(ctx: &Ctx<'_>, store: &Store, list: Vec<ProcessInfo>, urgent: b
             }
         }
     }
-    let Some(report) = scan_batch(ctx, store, targets, "process", None, false, urgent) else { return };
+    let Some((report, _)) = scan_batch(ctx, store, targets, "process", None, false, urgent) else { return };
     for found in &report.infected {
         let running = by_image.get(Path::new(&found.path)).map(Vec::as_slice).unwrap_or_default();
         let (processes, action) = respond(ctx, store, running, found, true);
@@ -604,7 +619,8 @@ fn respond(ctx: &Ctx<'_>, store: &Store, running: &[ProcessInfo], report: &FileR
 
 /// Scans `targets`, records the batch in history (clean program batches are
 /// not kept: they would flood it), and caches each verdict under the file
-/// version that was scanned. `None` if nothing could be scanned.
+/// version that was scanned. Returns the report and the files that were
+/// scanned; `None` if nothing could be scanned.
 fn scan_batch(
     ctx: &Ctx<'_>,
     store: &Store,
@@ -613,7 +629,7 @@ fn scan_batch(
     quarantine_floor: Option<Category>,
     keep_clean_history: bool,
     urgent: bool,
-) -> Option<ScanReport> {
+) -> Option<(ScanReport, HashSet<PathBuf>)> {
     let keys: HashMap<PathBuf, FileKey> = targets.into_iter().filter(|(p, _)| p.is_file()).collect();
     if keys.is_empty() {
         return None;
@@ -626,6 +642,7 @@ fn scan_batch(
     options.quarantine_floor = quarantine_floor;
     options.signatures = ctx.config.signatures.clone();
     options.trust_signed = ctx.config.trust_signed;
+    options.archives = ctx.config.scan_archives;
     options.keep_clean_history = keep_clean_history;
     options.threads = 1;
     options.background = !urgent;
@@ -643,8 +660,8 @@ fn scan_batch(
         }
     };
     let mut cache = ctx.cache.lock().unwrap_or_else(PoisonError::into_inner);
-    for path in scanned {
-        let Some(key) = keys.get(&path) else { continue };
+    for path in &scanned {
+        let Some(key) = keys.get(path) else { continue };
         let shown = path.display().to_string();
         let disposition = match report.infected.iter().find(|r| r.path == shown) {
             Some(found) => Disposition::Threat(Arc::new(found.clone())),
@@ -652,14 +669,19 @@ fn scan_batch(
         };
         cache.insert(key.clone(), disposition);
     }
-    Some(report)
+    Some((report, scanned.into_iter().collect()))
 }
 
 /// How the scan of one announced file ended, from the batch report.
-fn risky_outcome(path: &Path, report: &ScanReport, max_size_bytes: u64) -> RiskyOutcome {
+fn risky_outcome(path: &Path, report: &ScanReport, scanned: &HashSet<PathBuf>, max_size_bytes: u64) -> RiskyOutcome {
     let shown = path.display().to_string();
     if let Some(found) = report.infected.iter().find(|r| r.path == shown) {
         return RiskyOutcome::Threat(found.worst().threat.clone());
+    }
+    // Scanned, perhaps with a warning (an archive it could not fully open),
+    // or past the size limit as a padded program.
+    if scanned.contains(path) {
+        return RiskyOutcome::NoThreatFound;
     }
     if let Some(error) = report.errors.iter().find(|e| e.starts_with(&shown)) {
         return RiskyOutcome::NotScanned(error[shown.len()..].trim_start_matches(':').trim().to_string());

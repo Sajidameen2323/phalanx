@@ -8,6 +8,10 @@ admin-only pieces in Phase 4.
 
 ## Phase 1: Command-line rules on the current process monitor (about 1 week, highest priority)
 
+**Status:** done, in report-only mode (`src/cmdline.rs`, `src/rtp/commands.rs`).
+Stopping high-confidence matches waits for a few days of real use without false
+positives.
+
 **Why first:** ClickFix and attacks that misuse Windows' own tools are today's main
 way infostealers get in. Right now Phalanx sees a Microsoft-signed `powershell.exe`
 and marks it clean. This phase uses the existing twice-a-second process monitor, so
@@ -52,6 +56,10 @@ started from the Run box is reported with the rule name, and test cases in
 `src/rtp/tests.rs` cover each rule.
 
 ## Phase 2: Close the scanner's blind spots (about 1 week)
+
+**Status:** done on `feat/scan-blind-spots` (`src/contents.rs`, `src/rtp/drives.rs`).
+ISO and VHD files are handled by checking each drive as it appears rather than by
+parsing the image; RAR archives are not opened.
 
 1. **Size padding.** Today, files over `max_size_bytes` are skipped (`src/scan.rs`,
    `src/rtp/mod.rs`). Instead, for a PE file, find where its sections end using

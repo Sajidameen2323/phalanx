@@ -145,6 +145,10 @@ struct Settings {
     stop_running_threats: bool,
     /// Ignore heuristic-only findings on validly signed files.
     trust_signed: bool,
+    /// Look inside ZIP and 7z archives.
+    scan_archives: bool,
+    /// Real-time protection checks drives that appear (disk images, USB).
+    scan_new_drives: bool,
     /// Hold back non-urgent protection scans during full-screen games.
     defer_when_fullscreen: bool,
     close_to_tray: bool,
@@ -184,6 +188,8 @@ impl Default for Settings {
             program_protection: true,
             stop_running_threats: true,
             trust_signed: true,
+            scan_archives: true,
+            scan_new_drives: true,
             defer_when_fullscreen: true,
             close_to_tray: true,
             watch_checkpoint: None,
@@ -256,6 +262,7 @@ impl Settings {
         options.background = self.performance.background();
         options.signatures = signatures;
         options.trust_signed = self.trust_signed;
+        options.archives = self.scan_archives;
         options
     }
     /// Everything the running watcher depends on; a change restarts it.
@@ -271,6 +278,8 @@ impl Settings {
             self.program_protection,
             self.stop_running_threats,
             self.trust_signed,
+            self.scan_archives,
+            self.scan_new_drives,
             self.defer_when_fullscreen,
         ))
         .unwrap_or_default()
@@ -353,6 +362,7 @@ enum WatchMsg {
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
     Command(CommandHit),
+    DriveAdded { root: PathBuf, files: usize },
     Error(String),
 }
 
@@ -1333,6 +1343,8 @@ impl App {
         config.process_protection = self.settings.program_protection;
         config.stop_running_threats = self.settings.stop_running_threats;
         config.trust_signed = self.settings.trust_signed;
+        config.scan_archives = self.settings.scan_archives;
+        config.scan_new_drives = self.settings.scan_new_drives;
         config.defer_when_fullscreen = self.settings.defer_when_fullscreen;
         let (tx, rx) = mpsc::channel();
         let notifications = self.settings.notifications;
@@ -1391,6 +1403,7 @@ impl App {
                     }
                     WatchMsg::Command(hit)
                 }
+                RtpEvent::DriveAdded { root, files } => WatchMsg::DriveAdded { root, files },
                 RtpEvent::Restarting { error, retry_in } => WatchMsg::Restarting { error, retry_in },
                 RtpEvent::Error(e) => WatchMsg::Error(e),
             };
@@ -1559,6 +1572,11 @@ impl App {
                     self.log_activity(kind, text, detail.join(" · "));
                     changed_history |= hit.in_history();
                 }
+                WatchMsg::DriveAdded { root, files } => self.log_activity(
+                    ActivityKind::Info,
+                    format!("New drive {}", root.display()),
+                    format!("A disk image was opened or a drive was connected; checking {files} file(s) near its top."),
+                ),
                 WatchMsg::Restarting { error, retry_in } => {
                     self.watch.restarts += 1;
                     self.log_activity(

@@ -8,6 +8,8 @@ fn marker() -> String {
 
 fn config(folder: &Path) -> RtpConfig {
     let mut config = RtpConfig::new(vec![folder.to_path_buf()]);
+    // Tests run in parallel; only the drive test watches for new drives.
+    config.scan_new_drives = false;
     config.max_size_bytes = 1 << 20;
     config.settle = Duration::from_millis(400);
     config.defer_when_fullscreen = false;
@@ -36,6 +38,7 @@ fn describe(event: RtpEvent) -> String {
             let rules: Vec<&str> = hit.matches.iter().map(|m| m.rule.as_str()).collect();
             format!("command {:?} {} {}", hit.source, hit.program.to_ascii_lowercase(), rules.join(","))
         }
+        RtpEvent::DriveAdded { root, files } => format!("drive {} {files}", root.display()),
         RtpEvent::Restarting { error, .. } => format!("restarting {error}"),
         RtpEvent::Error(e) => format!("error {e}"),
     }
@@ -206,6 +209,8 @@ fn a_detected_program_is_stopped_and_quarantined() {
     fs::write(&exe, &program).unwrap();
 
     let mut cfg = RtpConfig::new(Vec::new());
+    // Tests run in parallel; only the drive test watches for new drives.
+    cfg.scan_new_drives = false;
     cfg.process_protection = true;
     // Command lines of whatever else runs on this PC are not this test's business.
     cfg.command_rules = false;
@@ -312,6 +317,8 @@ fn a_suspicious_command_line_is_reported_and_left_running() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let mut cfg = RtpConfig::new(Vec::new());
+    // Tests run in parallel; only the drive test watches for new drives.
+    cfg.scan_new_drives = false;
     cfg.process_protection = true;
     // Tests run in parallel: never stop another test's programs.
     cfg.stop_running_threats = false;
@@ -413,4 +420,62 @@ fn only_confident_commands_are_kept_and_repeats_are_collapsed() {
     let kept = store.recent_scans(10, Some("command")).unwrap();
     assert_eq!(kept.len(), 1, "only the high-confidence match is kept");
     assert_eq!(store.scan_detections(kept[0].id).unwrap()[0].threat, "CommandLine.clickfix.run-box");
+}
+
+#[test]
+fn files_near_the_top_of_a_drive_are_picked_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("a/b/c")).unwrap();
+    for (i, path) in ["top.exe", "a/one.txt", "a/b/two.txt", "a/b/c/deep.txt"].iter().enumerate() {
+        fs::write(root.join(path), format!("{i}")).unwrap();
+    }
+    let found: Vec<String> = drives::top_files(root, 2, 10).iter().map(|p| name(p)).collect();
+    assert_eq!(found, ["top.exe", "one.txt", "two.txt"], "two folder levels, not deeper");
+    assert_eq!(drives::top_files(root, 2, 1).len(), 1);
+}
+
+/// A drive letter mapped to a folder with `subst` for the length of a test.
+#[cfg(windows)]
+struct Subst(char);
+
+#[cfg(windows)]
+impl Subst {
+    fn new(folder: &Path) -> Option<Self> {
+        let free = ('M'..='Y').rev().find(|c| !Path::new(&format!("{c}:\\")).exists())?;
+        let ok = std::process::Command::new("subst").arg(format!("{free}:")).arg(folder).status().ok()?.success();
+        ok.then_some(Self(free))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Subst {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("subst").arg(format!("{}:", self.0)).arg("/d").status();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_new_drive_is_checked_when_it_appears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("image");
+    fs::create_dir_all(&image).unwrap();
+    fs::write(image.join("setup.exe"), format!("x {} y", marker())).unwrap();
+    fs::write(image.join("readme.txt"), "fine").unwrap();
+
+    let mut cfg = RtpConfig::new(Vec::new());
+    cfg.defer_when_fullscreen = false;
+    let mut run = Run::start(&tmp.path().join("data"), cfg);
+    assert!(run.until(|m| m.starts_with("started")));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Like double-clicking an ISO: a new drive letter appears.
+    let Some(drive) = Subst::new(&image) else { return };
+    let root = format!("{}:\\", drive.0);
+    let found = run.until(|m| m.starts_with("detected") && m.contains("setup.exe"));
+    drop(drive);
+    run.handle.stop();
+    assert!(run.seen.contains(&format!("drive {root} 2")), "{:?}", run.seen);
+    assert!(found, "{:?}", run.seen);
 }
