@@ -10,8 +10,8 @@ account, and shows you exactly what it found and why.
 
 | Area | What Phalanx does |
 | --- | --- |
-| **Scanning** | Quick, full and custom scans with hash signatures, YARA rules and Windows-program heuristics, plus a reversible quarantine and a complete history. |
-| **Real-time protection** | Scans new downloads and every program that starts, and stops running malware. It also reads the command lines of PowerShell and other Windows tools, and the commands pasted into the Run box, to catch attacks that never drop a file, such as fake CAPTCHA (ClickFix) pages. This part only reports for now. |
+| **Scanning** | Quick, full and custom scans with hash signatures, YARA rules and Windows-program heuristics, plus a reversible quarantine and a complete history. It also looks inside ZIP and 7z archives, scans programs padded past the size limit, and checks what shortcuts run. |
+| **Real-time protection** | Scans new downloads, every program that starts, and the files on a disk image or USB drive as soon as it appears, and stops running malware. It also reads the command lines of PowerShell and other Windows tools, and the commands pasted into the Run box, to catch attacks that never drop a file, such as fake CAPTCHA (ClickFix) pages. This part only reports for now. |
 | **Web protection** | Browser Guard blocks malware and phishing sites before your browser sends them a single request, marks dangerous search results, and can block ads and trackers. A DNS filter extends the blocking to every program on the PC. It also finds malicious browser extensions and checks each browser's security settings. |
 | **Stealer check** | Looks for the start-up entries, scheduled tasks, browser switches, policies, proxies and hosts-file changes that infostealers use. |
 | **Windows protection and privacy** | Checks Microsoft Defender, SmartScreen, the firewall, memory integrity and more, and can switch on what is off. A privacy checklist does the same for Windows privacy settings. |
@@ -38,6 +38,30 @@ Detection layers, in order:
    section names), writable+executable code, injection/hollowing/keylogging API
    combinations and runtime API resolution. A score of 60 or more is reported as
    `suspicious`. Heuristics never report `malware`.
+4. **What the file holds** (`src/contents.rs`), the usual ways past a scanner:
+   * **Archives.** ZIP and 7z files are opened and every file inside goes through the
+     layers above, up to 3 archives deep. A finding names where it was found
+     (`… · inside invoice.zip > docs/setup.exe`) and is reported on the archive,
+     which is what gets quarantined. Limits keep decompression bombs harmless: at
+     most 512 MB unpacked and 10,000 files per archive, and a file that unpacks to
+     over 100 times its packed size is not unpacked. A **password-protected archive
+     holding a program, script, shortcut or disk image** is reported as
+     `Suspicious.LockedArchive`: no scanner can look inside, which is why attackers
+     use them. The PE heuristics are not applied inside archives, where a
+     publisher signature cannot be checked. Turn this off under Settings >
+     Scanning > Scan inside archives (`--no-archives`). RAR is not opened.
+   * **Padded programs.** Stealers are often padded with hundreds of megabytes of
+     zeros to exceed scanners' size limits. A Windows program larger than the limit
+     is no longer skipped: if what follows its last section is padding (one
+     repeated byte or a short repeated pattern), the program itself is read and
+     scanned, so signatures and hash lists that know the original sample still
+     match, and the file is reported as `Suspicious.PaddedExecutable`. Large
+     installers with real compressed payloads are still skipped. A padded file is
+     quarantined whole, streamed from disk rather than read into memory.
+   * **Shortcuts.** A `.lnk` file's target and arguments are read and checked with
+     the command-line rules, so a shortcut named like a document that starts
+     PowerShell to download something is reported (`Suspicious.Shortcut.<rule>`),
+     as is one whose arguments are pushed out of view with spaces.
 
 Results are recorded in a local SQLite history. Detections can be moved into a
 reversible quarantine.
@@ -67,11 +91,29 @@ The icon assets in `assets/` come from the Phalanx logo:
 
 The first build takes several minutes, mostly compiling YARA-X's WebAssembly JIT.
 
+### Installer
+
+```
+cargo build --release
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\phalanx.iss
+```
+
+This needs [Inno Setup](https://jrsoftware.org/isinfo.php) 6.7 or later and produces
+`target\installer\Phalanx-Setup-<version>.exe`, with the version read from the built
+`phalanx.exe` (so it always matches `Cargo.toml`). Setup installs per user, without
+administrator rights, into `%LOCALAPPDATA%\Programs\Phalanx`, and ships a short user
+guide (`installer\README.txt`) rather than this file. A running Phalanx, even one
+hidden in the tray, is asked to quit before files are replaced. The uninstaller puts
+Windows' DNS settings back if the DNS filter was set up (`phalanx-cli web
+restore-dns`), and asks before deleting the data folder. The setup program is not
+code-signed, so SmartScreen warns about it until it is.
+
 ## Desktop app
 
 ```
 target\release\phalanx.exe            # open the app
 target\release\phalanx.exe D:\folder  # open and scan immediately
+target\release\phalanx.exe --quit     # quit the running copy (also from the tray)
 ```
 
 The app has these pages:
@@ -156,6 +198,12 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
   it runs. **Nothing is stopped yet**: this release only
   reports, so false positives surface before any rule acts. Programs that Phalanx
   itself starts are not checked.
+* **Disk images and USB drives are checked as they appear.** Opening an ISO or VHD
+  adds a drive letter, and the files inside carry no Mark of the Web, so Windows'
+  download warnings stay quiet. When a local drive appears (a mounted image or a USB
+  drive), the files on it up to two folders deep (at most 500, top level first) are
+  scanned in the urgent lane, and the activity log notes the new drive. Network drives
+  are left out. Turn this off on the Protection page (`--no-new-drives`).
 * **Signed software is trusted by heuristics.** A heuristic-only finding on a file
   with a valid Authenticode signature, embedded or through a Windows security catalog
   (how most of Windows is signed), is dropped. Revocation is not checked and nothing

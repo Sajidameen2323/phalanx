@@ -8,7 +8,7 @@ use crate::store::{now, QuarantineRow, Store};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"TSQ1";
@@ -29,26 +29,75 @@ impl<'a> Quarantine<'a> {
         self.dir.join(format!("{id}.qtn"))
     }
 
+    fn new_id(sha256: &str) -> String {
+        format!("{}-{}", chrono::Local::now().format("%Y%m%d%H%M%S%3f"), &sha256[..12])
+    }
+
     /// Moves `path` (whose bytes are `data`) into quarantine and returns its id.
     pub fn isolate(&self, path: &Path, data: &[u8], sha256: &str, threat: &str) -> Result<String> {
-        let id = format!(
-            "{}-{}",
-            chrono::Local::now().format("%Y%m%d%H%M%S%3f"),
-            &sha256[..12]
-        );
+        let id = Self::new_id(sha256);
         let stored = self.stored_path(&id);
         let mut encoded = Vec::with_capacity(MAGIC.len() + data.len());
         encoded.extend_from_slice(MAGIC);
         encoded.extend(data.iter().map(|b| b ^ KEY));
         write_new(&stored, &encoded)?;
+        self.commit(id, path, data.len() as u64, sha256, threat)
+    }
 
+    /// Moves the file at `path` into quarantine a piece at a time (it may
+    /// be too large to hold in memory) and returns its id. Refuses, leaving
+    /// it in place, if its SHA-256 is no longer `sha256`: a file replaced
+    /// since it was examined is never isolated by mistake.
+    pub fn isolate_file(&self, path: &Path, sha256: &str, threat: &str) -> Result<String> {
+        let id = Self::new_id(sha256);
+        let stored = self.stored_path(&id);
+        let copied = (|| -> Result<(u64, String)> {
+            let mut source = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+            let mut target = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&stored)
+                .with_context(|| format!("creating {}", stored.display()))?;
+            target.write_all(MAGIC)?;
+            let (mut hasher, mut size) = (Sha256::new(), 0u64);
+            let mut buf = vec![0; 1024 * 1024];
+            loop {
+                let n = source.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                size += n as u64;
+                let encoded: Vec<u8> = buf[..n].iter().map(|b| b ^ KEY).collect();
+                target.write_all(&encoded)?;
+            }
+            target.sync_all()?;
+            Ok((size, hex::encode(hasher.finalize())))
+        })();
+        let size = match copied {
+            Ok((size, actual)) if actual == sha256 => size,
+            Ok(_) => {
+                let _ = fs::remove_file(&stored);
+                bail!("{} changed since it was examined; check it again", path.display());
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&stored);
+                return Err(e);
+            }
+        };
+        self.commit(id, path, size, sha256, threat)
+    }
+
+    /// Records a copy already stored under `id`, then removes the original.
+    fn commit(&self, id: String, path: &Path, size: u64, sha256: &str, threat: &str) -> Result<String> {
+        let stored = self.stored_path(&id);
         let row = QuarantineRow {
             id: id.clone(),
             original_path: path.display().to_string(),
             quarantined_at: now(),
             sha256: sha256.to_string(),
             threat: threat.to_string(),
-            size: data.len() as i64,
+            size: size as i64,
             restored_at: None,
         };
         if let Err(e) = self.store.add_quarantine(&row) {

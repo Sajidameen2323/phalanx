@@ -191,6 +191,9 @@ enum WebCommand {
     },
     /// Put back an extension removed by `remove-extension`.
     RestoreExtension { backup: PathBuf },
+    /// Put back the Windows DNS settings saved when the DNS filter was set up
+    /// (asks for administrator). The uninstaller runs this.
+    RestoreDns,
     /// Serve the browser connector on stdin/stdout (browsers start this).
     #[command(hide = true)]
     NativeHost,
@@ -258,9 +261,13 @@ struct ScanArgs {
     /// Also quarantine heuristic/suspicious detections (implies --quarantine).
     #[arg(long)]
     quarantine_suspicious: bool,
-    /// Skip files larger than this many MiB.
+    /// Skip files larger than this many MiB (programs padded past it are
+    /// still scanned without the padding).
     #[arg(long, default_value_t = 100)]
     max_size_mb: u64,
+    /// Don't look inside ZIP and 7z archives.
+    #[arg(long)]
+    no_archives: bool,
     /// Print a JSON report instead of text.
     #[arg(long)]
     json: bool,
@@ -317,6 +324,12 @@ struct WatchArgs {
     /// Report heuristic findings even on validly signed files.
     #[arg(long)]
     no_trust_signed: bool,
+    /// Don't look inside ZIP and 7z archives.
+    #[arg(long)]
+    no_archives: bool,
+    /// Don't check drives that appear (mounted disk images, USB drives).
+    #[arg(long)]
+    no_new_drives: bool,
     #[command(flatten)]
     signatures: SignatureArgs,
     /// Quarantine malware, PUP and hacktool detections.
@@ -670,6 +683,7 @@ fn scan(args: &ScanArgs, dir: &Path, store: &Store) -> Result<ExitCode> {
     options.threads = args.load.threads();
     options.background = args.load.level().background();
     options.signatures = signatures_label(&args.signatures, dir);
+    options.archives = !args.no_archives;
     let json = args.json;
     let mut on_event = |event: ScanEvent<'_>| {
         if let (ScanEvent::Detection(file), false) = (event, json) {
@@ -727,6 +741,8 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
     config.process_protection = args.programs;
     config.stop_running_threats = !args.report_only;
     config.trust_signed = !args.no_trust_signed;
+    config.scan_archives = !args.no_archives;
+    config.scan_new_drives = !args.no_new_drives;
     let notify = args.notify;
     let _handle = rtp::start(engine, dir.to_path_buf(), config, move |event| match event {
         RtpEvent::Started { watching, failed, programs } => {
@@ -794,6 +810,7 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
                 system::notify(&format!("Suspicious command: {at}"), hit.headline());
             }
         }
+        RtpEvent::DriveAdded { root, files } => println!("new drive {}: checking {files} file(s) near its top", root.display()),
         RtpEvent::Restarting { error, retry_in } => {
             eprintln!("warning: {error}; restarting protection in {} s", retry_in.as_secs())
         }
@@ -1128,6 +1145,23 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
         WebCommand::RestoreExtension { backup } => {
             println!("{}", extensions::restore_extension(backup)?);
             Ok(ExitCode::SUCCESS)
+        }
+        WebCommand::RestoreDns => {
+            if !web::windows_dns::has_backup(dir) {
+                println!("Phalanx did not change Windows' DNS settings; nothing to restore.");
+                return Ok(ExitCode::SUCCESS);
+            }
+            match web::windows_dns::restore(dir)? {
+                system::Elevated::Exited(0) => {
+                    println!("Windows' previous DNS settings are back.");
+                    Ok(ExitCode::SUCCESS)
+                }
+                system::Elevated::Exited(code) => anyhow::bail!("restoring the DNS settings failed (exit code {code})"),
+                system::Elevated::Declined => {
+                    eprintln!("Cancelled at the administrator prompt; Windows still uses Phalanx's DNS filter.");
+                    Ok(ExitCode::from(2))
+                }
+            }
         }
         WebCommand::NativeHost => {
             web::native::run_host(dir, std::io::stdin().lock(), std::io::stdout().lock())?;

@@ -671,6 +671,13 @@ impl App {
             group_title(ui, "Behavior", "");
             setting_toggle(
                 ui,
+                &mut self.settings.scan_new_drives,
+                "Check drives as they appear",
+                "When a disk image (ISO, VHD) is opened or a USB drive is connected, scan the files near its top. Files inside disk images skip Windows' download warnings.",
+            );
+            row_divider(ui);
+            setting_toggle(
+                ui,
                 &mut self.settings.defer_when_fullscreen,
                 "Wait during games and presentations",
                 "Ordinary files are scanned after a full-screen game or presentation ends (at most 10 minutes later). New programs are always checked straight away.",
@@ -805,6 +812,8 @@ impl App {
                     badge(ui, &s.kind.to_uppercase(), kind_color);
                     ui.label(RichText::new(format!("#{} · {}", s.id, short_time(&s.started_at))).strong().color(theme().text));
                     let (status, color) = match (&s.finished_at, s.cancelled, s.detections) {
+                        // A command line, not a file scan; nothing was stopped.
+                        _ if s.kind == "command" => ("Suspicious command".to_string(), theme().amber),
                         (None, _, _) => ("Incomplete".to_string(), theme().amber),
                         (_, true, _) => ("Cancelled".to_string(), theme().amber),
                         (_, _, 0) => ("Clean".to_string(), theme().green),
@@ -812,19 +821,23 @@ impl App {
                     };
                     badge(ui, &status, color);
                 });
-                facts(
-                    ui,
-                    &[
-                        ("Took", s.elapsed_ms.map(|ms| fmt_duration(Duration::from_millis(ms as u64))).unwrap_or_else(|| "?".into())),
-                        ("Files", s.files_scanned.to_string()),
-                        ("Data", fmt_bytes(s.bytes_scanned)),
-                        ("Skipped", s.files_skipped.to_string()),
-                        ("Unreadable", s.errors.to_string()),
-                        ("Quarantined", s.quarantined.to_string()),
-                        ("Threads", s.threads.to_string()),
-                        ("Signatures", s.signatures.as_deref().map(short_time).unwrap_or_else(|| "built-in".into())),
-                    ],
-                );
+                if s.kind == "command" {
+                    facts(ui, &[("Action", "Reported only: command-line rules do not stop programs yet".to_string())]);
+                } else {
+                    facts(
+                        ui,
+                        &[
+                            ("Took", s.elapsed_ms.map(|ms| fmt_duration(Duration::from_millis(ms as u64))).unwrap_or_else(|| "?".into())),
+                            ("Files", s.files_scanned.to_string()),
+                            ("Data", fmt_bytes(s.bytes_scanned)),
+                            ("Skipped", s.files_skipped.to_string()),
+                            ("Unreadable", s.errors.to_string()),
+                            ("Quarantined", s.quarantined.to_string()),
+                            ("Threads", s.threads.to_string()),
+                            ("Signatures", s.signatures.as_deref().map(short_time).unwrap_or_else(|| "built-in".into())),
+                        ],
+                    );
+                }
                 truncated(ui, s.targets.clone(), theme().muted, 12.5);
                 let has_details = s.detections > 0 || s.errors > 0;
                 if has_details {
@@ -1033,10 +1046,17 @@ impl App {
                 "Don't report heuristic findings on programs with a valid publisher signature (including Windows' own). Signature and hash matches are always reported.",
             );
             row_divider(ui);
+            setting_toggle(
+                ui,
+                &mut self.settings.scan_archives,
+                "Scan inside archives",
+                "Open ZIP and 7z files (up to 3 levels deep, 512 MB unpacked) and scan what is inside. Password-protected archives holding programs are reported.",
+            );
+            row_divider(ui);
             setting_row(
                 ui,
                 "Skip files larger than",
-                "Larger files are counted as skipped. Applies to scans and real-time protection.",
+                "Larger files are counted as skipped, except programs padded past the limit: those are scanned without their padding. Applies to scans and real-time protection.",
                 |ui| {
                     ui.add(egui::DragValue::new(&mut self.settings.max_size_mb).range(1..=4096).suffix(" MiB"));
                 },
