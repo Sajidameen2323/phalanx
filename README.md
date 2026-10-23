@@ -91,11 +91,29 @@ The icon assets in `assets/` come from the Phalanx logo:
 
 The first build takes several minutes, mostly compiling YARA-X's WebAssembly JIT.
 
+### Installer
+
+```
+cargo build --release
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\phalanx.iss
+```
+
+This needs [Inno Setup](https://jrsoftware.org/isinfo.php) 6.7 or later and produces
+`target\installer\Phalanx-Setup-<version>.exe`, with the version read from the built
+`phalanx.exe` (so it always matches `Cargo.toml`). Setup installs per user, without
+administrator rights, into `%LOCALAPPDATA%\Programs\Phalanx`, and ships a short user
+guide (`installer\README.txt`) rather than this file. A running Phalanx, even one
+hidden in the tray, is asked to quit before files are replaced. The uninstaller puts
+Windows' DNS settings back if the DNS filter was set up (`phalanx-cli web
+restore-dns`), and asks before deleting the data folder. The setup program is not
+code-signed, so SmartScreen warns about it until it is.
+
 ## Desktop app
 
 ```
 target\release\phalanx.exe            # open the app
 target\release\phalanx.exe D:\folder  # open and scan immediately
+target\release\phalanx.exe --quit     # quit the running copy (also from the tray)
 ```
 
 The app has these pages:

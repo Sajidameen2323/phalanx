@@ -12,6 +12,12 @@ const MUTEX_NAME: &str = "Local\\ThreatScanner.SingleInstance";
 /// itself, so its own idea of "hidden in the tray" stays correct.
 #[cfg(windows)]
 const SHOW_EVENT_NAME: &str = "Local\\ThreatScanner.Show";
+/// Signalled by `--quit` (the installer and uninstaller): the running copy
+/// quits as the tray's Quit does, stopping protection cleanly.
+#[cfg(windows)]
+const QUIT_EVENT_NAME: &str = "Local\\ThreatScanner.Quit";
+/// A copy asked to quit that has not exited by then is ended.
+const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[cfg(windows)]
 fn wide(text: &str) -> Vec<u16> {
@@ -21,9 +27,11 @@ fn wide(text: &str) -> Vec<u16> {
 /// Held for the life of the process (the handles are never closed); a second
 /// copy sees the mutex and exits.
 pub struct SingleInstance {
-    /// Event handle as an integer so it can move to the listener thread.
+    /// Event handles as integers so they can move to the listener threads.
     #[cfg(windows)]
     show_event: usize,
+    #[cfg(windows)]
+    quit_event: usize,
 }
 
 impl SingleInstance {
@@ -39,7 +47,8 @@ impl SingleInstance {
             }
             // Auto-reset: each signal shows the window once.
             let show_event = CreateEventW(std::ptr::null(), 0, 0, wide(SHOW_EVENT_NAME).as_ptr());
-            Some(Self { show_event: show_event as usize })
+            let quit_event = CreateEventW(std::ptr::null(), 0, 0, wide(QUIT_EVENT_NAME).as_ptr());
+            Some(Self { show_event: show_event as usize, quit_event: quit_event as usize })
         }
         #[cfg(not(windows))]
         Some(Self {})
@@ -64,6 +73,70 @@ impl SingleInstance {
         #[cfg(not(windows))]
         let _ = ctx;
     }
+}
+
+impl SingleInstance {
+    /// Quits whenever `--quit` asks: `quitting` makes the close a real quit,
+    /// not hide-to-tray.
+    pub fn listen_for_quit_requests(&self, ctx: egui::Context, quitting: Arc<AtomicBool>) {
+        #[cfg(windows)]
+        {
+            let event = self.quit_event;
+            if event == 0 {
+                return;
+            }
+            let _ = std::thread::Builder::new().name("quit-requests".into()).spawn(move || {
+                use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+                use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+                if unsafe { WaitForSingleObject(event as _, INFINITE) } != WAIT_OBJECT_0 {
+                    return;
+                }
+                quitting.store(true, Ordering::Relaxed);
+                // A window held hidden is not painted, so it could not close.
+                release_hold();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ctx.request_repaint();
+                std::thread::sleep(QUIT_GRACE);
+                std::process::exit(0);
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = (ctx, quitting);
+    }
+}
+
+/// Asks the running copy to quit and waits for it to exit. `true` once no
+/// copy is running (also when none was).
+pub fn quit_existing() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenEventW, OpenMutexW, SetEvent, EVENT_MODIFY_STATE};
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let running = || {
+            let mutex = OpenMutexW(SYNCHRONIZE, 0, wide(MUTEX_NAME).as_ptr());
+            !mutex.is_null() && CloseHandle(mutex) != 0
+        };
+        if !running() {
+            return true;
+        }
+        let event = OpenEventW(EVENT_MODIFY_STATE, 0, wide(QUIT_EVENT_NAME).as_ptr());
+        if event.is_null() {
+            return false; // an older copy that cannot be asked
+        }
+        SetEvent(event);
+        CloseHandle(event);
+        let until = std::time::Instant::now() + QUIT_GRACE + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < until {
+            if !running() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 /// Asks the already-running copy to show its window.

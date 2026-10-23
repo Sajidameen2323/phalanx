@@ -35,12 +35,18 @@ use widgets::APP_TITLE;
 
 /// Passed by the "start with Windows" entry: start hidden in the tray.
 const BACKGROUND_FLAG: &str = "--background";
+/// Quit the running copy and exit (the installer and uninstaller use it).
+/// Exits with 0 once no copy is running, 1 if one could not be stopped.
+const QUIT_FLAG: &str = "--quit";
 /// How often the watcher's "still running" checkpoint is saved.
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(60);
 const MAX_ACTIVITY: usize = 100;
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == QUIT_FLAG) {
+        std::process::exit(if desktop::quit_existing() { 0 } else { 1 });
+    }
     let background = args.iter().any(|a| a == BACKGROUND_FLAG);
     let scan_paths: Vec<PathBuf> = args
         .iter()
@@ -77,7 +83,9 @@ fn main() -> eframe::Result {
                 desktop::hold_hidden(cc);
             }
             instance.listen_for_show_requests(cc.egui_ctx.clone());
-            Ok(Box::new(App::new(&cc.egui_ctx, scan_paths)))
+            let app = App::new(&cc.egui_ctx, scan_paths);
+            instance.listen_for_quit_requests(cc.egui_ctx.clone(), app.quitting.clone());
+            Ok(Box::new(app))
         }),
     )
 }

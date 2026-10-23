@@ -191,6 +191,9 @@ enum WebCommand {
     },
     /// Put back an extension removed by `remove-extension`.
     RestoreExtension { backup: PathBuf },
+    /// Put back the Windows DNS settings saved when the DNS filter was set up
+    /// (asks for administrator). The uninstaller runs this.
+    RestoreDns,
     /// Serve the browser connector on stdin/stdout (browsers start this).
     #[command(hide = true)]
     NativeHost,
@@ -1142,6 +1145,23 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
         WebCommand::RestoreExtension { backup } => {
             println!("{}", extensions::restore_extension(backup)?);
             Ok(ExitCode::SUCCESS)
+        }
+        WebCommand::RestoreDns => {
+            if !web::windows_dns::has_backup(dir) {
+                println!("Phalanx did not change Windows' DNS settings; nothing to restore.");
+                return Ok(ExitCode::SUCCESS);
+            }
+            match web::windows_dns::restore(dir)? {
+                system::Elevated::Exited(0) => {
+                    println!("Windows' previous DNS settings are back.");
+                    Ok(ExitCode::SUCCESS)
+                }
+                system::Elevated::Exited(code) => anyhow::bail!("restoring the DNS settings failed (exit code {code})"),
+                system::Elevated::Declined => {
+                    eprintln!("Cancelled at the administrator prompt; Windows still uses Phalanx's DNS filter.");
+                    Ok(ExitCode::from(2))
+                }
+            }
         }
         WebCommand::NativeHost => {
             web::native::run_host(dir, std::io::stdin().lock(), std::io::stdout().lock())?;
