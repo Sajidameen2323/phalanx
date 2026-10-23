@@ -281,7 +281,10 @@ logged) or **Off**.
 native-messaging connector (`phalanx-cli`) for Chrome, Edge, Brave, Chromium/Vivaldi
 and Firefox, per user under `HKCU`, so no administrator rights are needed. It also
 writes the extension to `<data folder>\browser-extension`. Load that folder once per
-browser with **Load unpacked** (Developer mode).
+Chromium browser with **Load unpacked** (Developer mode). Firefox gets its own copy in
+`<data folder>\browser-extension-firefox` (its manifest runs the background page as a
+script, where Chromium wants a service worker): load its `manifest.json` under
+**about:debugging > This Firefox > Load Temporary Add-on**.
 
 Malicious sites are blocked **before the browser sends any request** to them. The
 connector hands the malicious names (after allow lists) to the extension, which

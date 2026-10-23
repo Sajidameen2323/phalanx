@@ -130,7 +130,7 @@ impl WebState {
         // After an upgrade, the browsers load the new extension files from
         // here (on their next start, or Reload in the extensions page).
         if state.browsers.iter().any(|b| b.current) {
-            let _ = native::write_extension(&native::extension_dir(data_dir));
+            let _ = native::write_extensions(data_dir);
         }
         state.windows_dns = state.config.dns_listen_addr().is_ok_and(|a| web_config::windows_uses_filter(&a));
         (state, warning)
@@ -548,7 +548,8 @@ impl App {
                 muted(ui, "1. Open chrome://extensions (Edge: edge://extensions, Brave: brave://extensions) and turn on Developer mode.");
                 muted(ui, format!("2. Choose Load unpacked and pick {}", folder.display()));
                 if missing.contains(&"Firefox") {
-                    muted(ui, "Firefox: about:debugging > This Firefox > Load Temporary Add-on, and pick manifest.json in that folder (it is removed when Firefox restarts).");
+                    let manifest = native::firefox_extension_dir(&self.data_dir).join("manifest.json");
+                    muted(ui, format!("Firefox: about:debugging > This Firefox > Load Temporary Add-on, and pick {} (it is removed when Firefox restarts).", manifest.display()));
                 }
             }
             small(ui, "Connecting only lets the extension talk to Phalanx; the extension does the blocking. Its icon shows \"!\" when it cannot reach Phalanx.");
@@ -565,7 +566,7 @@ impl App {
         }
         if open_folder {
             let folder = native::extension_dir(&self.data_dir);
-            if let Err(e) = native::write_extension(&folder).and_then(|()| Ok(std::process::Command::new("explorer.exe").arg(&folder).spawn()?)) {
+            if let Err(e) = native::write_extensions(&self.data_dir).and_then(|()| Ok(std::process::Command::new("explorer.exe").arg(&folder).spawn()?)) {
                 self.notify(format!("Could not open {}: {e:#}", folder.display()), false);
             }
         }
