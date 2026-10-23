@@ -122,7 +122,7 @@ fn grouped(n: i64) -> String {
     let digits = n.max(0).to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -362,10 +362,8 @@ impl ScanStage {
         }
         let lens_before = self.lens;
         self.lens += (hover.is_some() as u8 as f32 - self.lens) * (1.0 - (-dt * 10.0).exp());
-        if response.clicked() {
-            if let Some(pt) = hover {
-                self.ripples.push(Ripple { at: pt - rect.min, born: now, color: rgb(theme().accent), strength: 0.8 });
-            }
+        if response.clicked() && let Some(pt) = hover {
+            self.ripples.push(Ripple { at: pt - rect.min, born: now, color: rgb(theme().accent), strength: 0.8 });
         }
         if still {
             self.lens = 0.0;
@@ -375,12 +373,10 @@ impl ScanStage {
 
         // ---- the closing glyph ----
         let glyph = self.done.map(|(outcome, since)| (outcome, (now - since) as f32));
-        if let Some((outcome, t)) = glyph {
-            if t > 0.8 && !self.landed {
-                self.landed = true;
-                let color = rgb(outcome_color(outcome));
-                self.ripples.push(Ripple { at: rect.center() - rect.min, born: now, color, strength: 0.6 });
-            }
+        if let Some((outcome, t)) = glyph && t > 0.8 && !self.landed {
+            self.landed = true;
+            let color = rgb(outcome_color(outcome));
+            self.ripples.push(Ripple { at: rect.center() - rect.min, born: now, color, strength: 0.6 });
         }
 
         // ---- draw ----
@@ -896,13 +892,11 @@ impl Hero {
 
         // ---- pointer, click, burst ----
         let pointer = response.hover_pos();
-        if response.clicked() {
-            if let Some(pt) = pointer {
-                if (pt - center).x.abs() < half && (pt - center).y.abs() < half && blend < 0.1 {
-                    self.burst = Some(now);
-                } else {
-                    self.ripples.push(Ripple { at: pt - rect.min, born: now, color: base, strength: 0.9 });
-                }
+        if response.clicked() && let Some(pt) = pointer {
+            if (pt - center).x.abs() < half && (pt - center).y.abs() < half && blend < 0.1 {
+                self.burst = Some(now);
+            } else {
+                self.ripples.push(Ripple { at: pt - rect.min, born: now, color: base, strength: 0.9 });
             }
         }
         if still {

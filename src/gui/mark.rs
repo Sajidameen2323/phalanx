@@ -156,10 +156,8 @@ pub fn mark_rgba(size: usize, style: Style) -> Vec<u8> {
                     }
                     // Light falls from the upper right, as in the logo.
                     let mut c = lerp(shield_low, shield_high, 0.55 * x + 0.45 * (1.0 - y / ASPECT));
-                    if let Some((edge, amount)) = rim {
-                        if edge_distance(&outline, p) < 0.022 * heavy {
-                            c = lerp(c, edge, amount);
-                        }
+                    if let Some((edge, amount)) = rim && edge_distance(&outline, p) < 0.022 * heavy {
+                        c = lerp(c, edge, amount);
                     }
                     let on_bowl = (0..path.len() - 1).any(|i| segment_distance(p, path[i], path[i + 1]) < BOWL_HALF_WIDTH * heavy);
                     let on_stem = inside(&STEM, p) || (heavy > 1.0 && segment_distance(p, [0.3, 0.27], [0.3, 0.86]) < 0.075);

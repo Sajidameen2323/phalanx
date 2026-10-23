@@ -253,10 +253,7 @@ mod imp {
         let u32_at = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
         let mut events = Vec::new();
         let mut offset = 0usize;
-        loop {
-            let (Some(next), Some(action), Some(name_len)) = (u32_at(offset), u32_at(offset + 4), u32_at(offset + 8)) else {
-                break;
-            };
+        while let (Some(next), Some(action), Some(name_len)) = (u32_at(offset), u32_at(offset + 4), u32_at(offset + 8)) {
             let start = offset + 12;
             let Some(name) = bytes.get(start..start + name_len as usize) else { break };
             let name: Vec<u16> = name.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();

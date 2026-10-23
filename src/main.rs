@@ -1076,7 +1076,8 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
             println!("\nNow add the Phalanx Browser Guard extension to each browser:");
             println!("  1. Open chrome://extensions (Edge: edge://extensions, Brave: brave://extensions).");
             println!("  2. Turn on Developer mode, choose \"Load unpacked\" and pick:\n       {}", ext.display());
-            println!("  Firefox: about:debugging > This Firefox > Load Temporary Add-on > {}", ext.join("manifest.json").display());
+            let firefox = web::native::firefox_extension_dir(dir);
+            println!("  Firefox: about:debugging > This Firefox > Load Temporary Add-on > {}", firefox.join("manifest.json").display());
             println!("The extension's icon shows \"!\" when it cannot reach Phalanx.");
             Ok(ExitCode::SUCCESS)
         }

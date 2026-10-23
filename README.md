@@ -16,7 +16,7 @@ account, and shows you exactly what it found and why.
 | **Stealer check** | Looks for the start-up entries, scheduled tasks, browser switches, policies, proxies and hosts-file changes that infostealers use. |
 | **Windows protection and privacy** | Checks Microsoft Defender, SmartScreen, the firewall, memory integrity and more, and can switch on what is off. A privacy checklist does the same for Windows privacy settings. |
 | **AI Inspect** | Asks Google Gemini for a second opinion on a file (optional, needs your own API key). |
-| **Signature updates** | Pulls fresh malware hashes, YARA rules and malicious web addresses from public threat-intelligence feeds (abuse.ch, YARA Forge, URLhaus). |
+| **Signature updates** | Pulls fresh malware hashes, YARA rules and malicious web addresses from public threat-intelligence feeds (abuse.ch, YARA Forge, URLhaus, HaGeZi, CERT Polska). |
 
 Phalanx works in user mode, without a kernel driver, so it is designed to run
 **alongside Microsoft Defender**, not instead of it. It adds the web blocking,
@@ -281,7 +281,10 @@ logged) or **Off**.
 native-messaging connector (`phalanx-cli`) for Chrome, Edge, Brave, Chromium/Vivaldi
 and Firefox, per user under `HKCU`, so no administrator rights are needed. It also
 writes the extension to `<data folder>\browser-extension`. Load that folder once per
-browser with **Load unpacked** (Developer mode).
+Chromium browser with **Load unpacked** (Developer mode). Firefox gets its own copy in
+`<data folder>\browser-extension-firefox` (its manifest runs the background page as a
+script, where Chromium wants a service worker): load its `manifest.json` under
+**about:debugging > This Firefox > Load Temporary Add-on**.
 
 Malicious sites are blocked **before the browser sends any request** to them. The
 connector hands the malicious names (after allow lists) to the extension, which
@@ -632,6 +635,9 @@ The feeds are:
 | [MalwareBazaar](https://bazaar.abuse.ch/) recent samples | SHA-256 hashes with malware family names | CC0 | abuse.ch Auth-Key |
 | [ThreatFox](https://threatfox.abuse.ch/) indicators of the last 7 days | SHA-256 hashes; malware domains, URLs and command-and-control addresses (addresses only at confidence 75 or more) | CC0 | abuse.ch Auth-Key |
 | [URLhaus](https://urlhaus.abuse.ch/) URLs of the last 30 days | malware download links (web protection) | CC0 | abuse.ch Auth-Key |
+| [HaGeZi Threat Intelligence Feeds](https://github.com/hagezi/dns-blocklists) (medium) | about 620,000 malware, phishing and scam domains merged from many feeds (web protection) | GPL-3.0 | nothing |
+| [malware-filter](https://gitlab.com/malware-filter/phishing-filter) phishing host list | phishing hosts from OpenPhish, PhishTank and IPThreat (web protection) | CC0 | nothing |
+| [CERT Polska](https://cert.pl/en/warning-list/) warning list | phishing and scam domains checked by CERT Polska's analysts (web protection) | free to use | nothing |
 
 **abuse.ch Auth-Key.** Since mid-2025 abuse.ch (MalwareBazaar, ThreatFox, URLhaus)
 only serves its data to callers with a free personal Auth-Key; requests without
@@ -655,6 +661,12 @@ How updates work:
   so each update merges new hashes into `signatures/feed-hashes.txt`. The list is
   capped at 750,000 entries, oldest dropped first. Update regularly to build up
   coverage.
+* **Domain lists replace their own names.** The HaGeZi, phishing and CERT Polska
+  lists are full snapshots, so each changed download replaces the names that list
+  added to `signatures/feed-web.txt`; names it dropped (often fixed false positives)
+  stop being blocked. A download with fewer than 1,000 names is treated as broken,
+  and the previous names are kept. The merged web feed is capped at 1,000,000
+  rules, oldest dropped first.
 * **The ad list is replaced, not merged.** Names its maintainers drop are usually
   false positives, so each changed download replaces `signatures/feed-ads.txt`. A
   download with fewer than 1,000 names is treated as broken, and the previous list
@@ -720,5 +732,5 @@ The app only uses the bundled and downloaded signatures. For your own, pass them
 * Browser Guard is loaded unpacked (Developer mode). Firefox removes temporary
   add-ons when it restarts. The connector uses the default data folder, whatever
   `--data-dir` says.
-* Phishing coverage depends on the feeds. The bundled ones (URLhaus, ThreatFox) are
-  mostly malware distribution and command-and-control.
+* Web protection only blocks names and addresses on a list. New phishing and
+  fake-download sites are often unlisted for their first days.

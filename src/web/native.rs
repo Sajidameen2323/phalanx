@@ -140,10 +140,8 @@ impl HostState {
             // Keep the previous rules rather than protecting with none.
             Err(e) => self.error = Some(format!("{e:#}")),
         }
-        if self.rules.counts().blocking() == 0 {
-            if let Ok(builtin) = WebRules::load(None, &self.config.user_lists()) {
-                self.rules = builtin;
-            }
+        if self.rules.counts().blocking() == 0 && let Ok(builtin) = WebRules::load(None, &self.config.user_lists()) {
+            self.rules = builtin;
         }
     }
 
@@ -479,11 +477,9 @@ pub fn run_host(data_dir: &Path, mut input: impl Read, mut output: impl Write) -
     let caller = calling_browser();
     let mut last_contact: Option<Instant> = None;
     let mut note_contact = |force: bool| {
-        if let Some(browser) = caller {
-            if force || last_contact.is_none_or(|t| t.elapsed() >= CONTACT_EVERY) {
-                record_contact(data_dir, browser);
-                last_contact = Some(Instant::now());
-            }
+        if let Some(browser) = caller && (force || last_contact.is_none_or(|t| t.elapsed() >= CONTACT_EVERY)) {
+            record_contact(data_dir, browser);
+            last_contact = Some(Instant::now());
         }
     };
     note_contact(true);
@@ -672,8 +668,14 @@ pub fn connector_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("browser-connector")
 }
 
+/// The extension for Chromium browsers (Chrome, Edge, Brave, Vivaldi).
 pub fn extension_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("browser-extension")
+}
+
+/// The extension for Firefox, whose manifest differs.
+pub fn firefox_extension_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("browser-extension-firefox")
 }
 
 /// The connector program: `phalanx-cli` next to the running program.
@@ -688,20 +690,45 @@ pub fn host_exe() -> Result<PathBuf> {
     }
 }
 
-/// Writes the extension's files to `dir` (replacing older copies).
-pub fn write_extension(dir: &Path) -> Result<()> {
+/// Writes both copies of the extension (replacing older ones).
+pub fn write_extensions(data_dir: &Path) -> Result<()> {
+    write_extension(&extension_dir(data_dir), false)?;
+    write_extension(&firefox_extension_dir(data_dir), true)
+}
+
+/// Writes the extension's files to `dir`, with the manifest for Firefox or
+/// for Chromium browsers.
+fn write_extension(dir: &Path, firefox: bool) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Files earlier versions wrote that this one no longer uses.
-    for retired in ["icon.png"] {
-        let _ = std::fs::remove_file(dir.join(retired));
-    }
+    // A file earlier versions wrote that this one no longer uses.
+    let _ = std::fs::remove_file(dir.join("icon.png"));
     for (name, bytes) in EXTENSION_FILES {
         let path = dir.join(name);
-        if std::fs::read(&path).ok().as_deref() != Some(*bytes) {
+        let manifest;
+        let bytes = if *name == "manifest.json" {
+            manifest = extension_manifest(firefox);
+            manifest.as_slice()
+        } else {
+            *bytes
+        };
+        if std::fs::read(&path).ok().as_deref() != Some(bytes) {
             std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
         }
     }
     Ok(())
+}
+
+/// The bundled manifest is Chromium's, so the source folder loads as is.
+/// Firefox runs background scripts instead of a service worker (Chromium
+/// warns about `background.scripts`) and has no use for Chromium's `key`.
+fn extension_manifest(firefox: bool) -> Vec<u8> {
+    if !firefox {
+        return EXTENSION_FILES[0].1.to_vec();
+    }
+    let mut manifest: Value = serde_json::from_slice(EXTENSION_FILES[0].1).expect("the bundled manifest is JSON");
+    manifest["background"] = json!({ "scripts": ["background.js"] });
+    manifest.as_object_mut().map(|m| m.remove("key"));
+    serde_json::to_vec_pretty(&manifest).expect("JSON serializes")
 }
 
 fn manifest_json(exe: &Path, firefox: bool) -> Value {
@@ -731,7 +758,7 @@ pub fn install(data_dir: &Path, exe: &Path) -> Result<Vec<BrowserRegistration>> 
     std::fs::create_dir_all(connector_dir(data_dir))?;
     std::fs::write(&chromium, serde_json::to_string_pretty(&manifest_json(exe, false))?)?;
     std::fs::write(&firefox, serde_json::to_string_pretty(&manifest_json(exe, true))?)?;
-    write_extension(&extension_dir(data_dir))?;
+    write_extensions(data_dir)?;
     #[cfg(windows)]
     {
         use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -875,8 +902,7 @@ mod tests {
     #[test]
     fn report_only_and_disabled_never_block() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = WebConfig::default();
-        config.mode = Mode::ReportOnly;
+        let config = WebConfig { mode: Mode::ReportOnly, ..Default::default() };
         config.save(tmp.path()).unwrap();
         let mut state = HostState::new(tmp.path());
         let reply = state.handle(&json!({"type": "check", "url": "http://blocktest.phalanx.invalid/"}));
@@ -1087,5 +1113,23 @@ mod tests {
         assert_eq!(manifest_json(exe, true)["allowed_extensions"][0], FIREFOX_EXTENSION_ID);
         let manifest: Value = serde_json::from_slice(EXTENSION_FILES[0].1).unwrap();
         assert_eq!(manifest["browser_specific_settings"]["gecko"]["id"], FIREFOX_EXTENSION_ID);
+    }
+
+    #[test]
+    fn each_browser_gets_its_own_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_extensions(tmp.path()).unwrap();
+        let read = |dir: PathBuf| -> Value { serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap() };
+        assert_eq!(std::fs::read(extension_dir(tmp.path()).join("manifest.json")).unwrap(), EXTENSION_FILES[0].1, "Chromium gets the source manifest");
+        let chromium = read(extension_dir(tmp.path()));
+        assert_eq!(chromium["background"], json!({ "service_worker": "background.js" }), "Chromium warns about background.scripts");
+        assert!(chromium["key"].is_string(), "the key fixes the Chromium extension ID");
+        let firefox = read(firefox_extension_dir(tmp.path()));
+        assert_eq!(firefox["background"], json!({ "scripts": ["background.js"] }));
+        assert!(firefox.get("key").is_none());
+        assert_eq!(firefox["browser_specific_settings"]["gecko"]["id"], FIREFOX_EXTENSION_ID);
+        assert_eq!(chromium["content_scripts"], firefox["content_scripts"]);
+        let (a, b) = (extension_dir(tmp.path()).join("background.js"), firefox_extension_dir(tmp.path()).join("background.js"));
+        assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
     }
 }

@@ -64,33 +64,29 @@ impl App {
     }
 
     pub(super) fn poll_audit(&mut self, ctx: &egui::Context) {
-        if let Some((rx, _)) = &self.audit.running {
-            if let Ok(report) = rx.try_recv() {
-                self.audit.running = None;
-                let high = report.count(Severity::High);
-                self.notify(
-                    match high {
-                        0 => "Stealer check finished: nothing high-risk found".to_string(),
-                        n => format!("Stealer check: {n} high-risk item(s) found"),
-                    },
-                    high == 0,
-                );
-                self.audit.report = Some(report);
-            }
+        if let Some((rx, _)) = &self.audit.running && let Ok(report) = rx.try_recv() {
+            self.audit.running = None;
+            let high = report.count(Severity::High);
+            self.notify(
+                match high {
+                    0 => "Stealer check finished: nothing high-risk found".to_string(),
+                    n => format!("Stealer check: {n} high-risk item(s) found"),
+                },
+                high == 0,
+            );
+            self.audit.report = Some(report);
         }
-        if let Some(rx) = &self.audit.exclusions_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.audit.exclusions_rx = None;
-                match result {
-                    Ok(Some(ex)) => {
-                        let n = ex.paths.len() + ex.processes.len() + ex.extensions.len();
-                        self.notify(format!("Defender has {n} exclusion(s); checking them now"), true);
-                        self.audit.exclusions = Some(ex);
-                        self.start_audit(ctx);
-                    }
-                    Ok(None) => self.notify("Cancelled at the Windows prompt; exclusions were not read", false),
-                    Err(e) => self.notify(format!("Could not read Defender's exclusions: {e}"), false),
+        if let Some(rx) = &self.audit.exclusions_rx && let Ok(result) = rx.try_recv() {
+            self.audit.exclusions_rx = None;
+            match result {
+                Ok(Some(ex)) => {
+                    let n = ex.paths.len() + ex.processes.len() + ex.extensions.len();
+                    self.notify(format!("Defender has {n} exclusion(s); checking them now"), true);
+                    self.audit.exclusions = Some(ex);
+                    self.start_audit(ctx);
                 }
+                Ok(None) => self.notify("Cancelled at the Windows prompt; exclusions were not read", false),
+                Err(e) => self.notify(format!("Could not read Defender's exclusions: {e}"), false),
             }
         }
     }

@@ -343,8 +343,7 @@ mod tests {
 
     #[test]
     fn blocking_drops_the_browser_exclusion_and_unblocking_covers_parents() {
-        let mut c = WebConfig::default();
-        c.extension_exclusions = vec!["spicett.com".into()];
+        let mut c = WebConfig { extension_exclusions: vec!["spicett.com".into()], ..Default::default() };
         c.block("https://spicett.com/");
         assert!(c.extension_exclusions.is_empty(), "an exclusion would still let it through");
         let rules = c.load_rules(tempfile::tempdir().unwrap().path()).unwrap();
@@ -363,8 +362,7 @@ mod tests {
 
     #[test]
     fn merge_keeps_both_sides_list_edits() {
-        let mut base = WebConfig::default();
-        base.user_block = vec!["one.example".into(), "two.example".into()];
+        let base = WebConfig { user_block: vec!["one.example".into(), "two.example".into()], ..Default::default() };
         // The app removed two.example and added three.example ...
         let mut ours = base.clone();
         ours.user_block = vec!["one.example".into(), "three.example".into()];
@@ -395,8 +393,7 @@ mod tests {
     fn saves_and_loads() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(WebConfig::load(tmp.path()).unwrap(), WebConfig::default());
-        let mut c = WebConfig::default();
-        c.mode = Mode::ReportOnly;
+        let mut c = WebConfig { mode: Mode::ReportOnly, ..Default::default() };
         c.allow("ok.example");
         c.save(tmp.path()).unwrap();
         assert_eq!(WebConfig::load(tmp.path()).unwrap(), c);
@@ -425,8 +422,7 @@ mod tests {
     fn resolvers_parse_with_default_port() {
         assert_eq!(parse_resolver("9.9.9.9"), Some("9.9.9.9:53".parse().unwrap()));
         assert_eq!(parse_resolver("[2606:4700::1111]:5353"), Some("[2606:4700::1111]:5353".parse().unwrap()));
-        let mut c = WebConfig::default();
-        c.dns_upstream = vec!["8.8.8.8".into(), "junk".into()];
+        let c = WebConfig { dns_upstream: vec!["8.8.8.8".into(), "junk".into()], ..Default::default() };
         assert_eq!(c.upstreams(), ["8.8.8.8:53".parse().unwrap()]);
     }
 }

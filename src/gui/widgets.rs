@@ -128,7 +128,7 @@ pub fn theme() -> &'static Palette {
 pub fn sync_theme(ctx: &egui::Context) -> Option<Color32> {
     let dark = ctx.theme() == egui::Theme::Dark;
     let was = IS_DARK.swap(dark, Ordering::Relaxed);
-    (was != dark).then(|| if was { DARK.bg } else { LIGHT.bg })
+    (was != dark).then_some(if was { DARK.bg } else { LIGHT.bg })
 }
 
 
@@ -620,10 +620,8 @@ pub fn check_row(ui: &mut Ui, check: &Check, privacy: bool) -> Option<CheckActio
                         action = Some(CheckAction::Toggle(protective));
                     }
                 }
-                if let Some(fix) = &check.fix {
-                    if small_button(ui, fix.label).clicked() {
-                        action = Some(CheckAction::ApplyFix);
-                    }
+                if let Some(fix) = &check.fix && small_button(ui, fix.label).clicked() {
+                    action = Some(CheckAction::ApplyFix);
                 }
                 if !check.link.label.is_empty()
                     && (check.status != Status::Good || privacy)

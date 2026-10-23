@@ -245,11 +245,11 @@ impl Tray {
         }));
         let click_ctx = ctx.clone();
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-            let open = match event {
-                TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => true,
-                TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => true,
-                _ => false,
-            };
+            let open = matches!(
+                event,
+                TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
+                    | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }
+            );
             if open {
                 show_window(&click_ctx);
             }

@@ -5,7 +5,8 @@
 //! rolling window of recent samples, so new hashes are merged into a local
 //! list that grows with every update (oldest entries are dropped past a cap).
 //! Web feeds (malicious domains, URLs and C2 addresses) are merged the same
-//! way into `feed-web.txt`, which web protection loads. The ad and tracker
+//! way into `feed-web.txt`, which web protection loads; domain lists that are
+//! full snapshots replace their own earlier names in it instead. The ad and tracker
 //! list is a full snapshot instead (entries its maintainers drop are usually
 //! false positives), saved as `feed-ads.txt` and only loaded when ad blocking
 //! is switched on.
@@ -28,11 +29,13 @@ const MAX_DOWNLOAD: u64 = 100 * 1024 * 1024;
 /// Upper bound on merged feed hashes (roughly 50 MB of memory when loaded).
 pub const MAX_FEED_HASHES: usize = 750_000;
 const FEED_HASH_FILE: &str = "feed-hashes.txt";
-/// Upper bound on merged web rules.
-pub const MAX_FEED_WEB: usize = 500_000;
+/// Upper bound on merged web rules (the domain lists alone are about 700,000).
+pub const MAX_FEED_WEB: usize = 1_000_000;
 const MANIFEST_FILE: &str = "manifest.json";
 /// Fewest names an ad list download must have to replace the current one.
 const MIN_ADS: usize = 1000;
+/// Fewest names a domain list download must have to replace its names.
+const MIN_DOMAIN_LIST: usize = 1000;
 /// The saved abuse.ch Auth-Key, encrypted for this Windows user (DPAPI, hex).
 const AUTH_KEY_FILE: &str = "abuse-ch-key";
 /// Used when no key is saved.
@@ -62,6 +65,11 @@ pub enum SourceKind {
     HashCsv { hash_column: usize, family_column: usize },
     /// A hosts file (`127.0.0.1 name`) of malicious names.
     WebHostfile { category: &'static str, threat: &'static str },
+    /// A full snapshot of malicious names, one per line (`name`, or hosts
+    /// style `0.0.0.0 name`). Each download replaces the names this source
+    /// added before, so ones its maintainers drop stop being blocked.
+    /// `threat` must be unique to the source: it identifies those names.
+    WebDomainList { category: &'static str, threat: &'static str },
     /// abuse.ch-style quoted CSV of web indicators.
     WebCsv(WebCsv),
     /// A hosts file of ad and tracker names; replaces the ad list each time.
@@ -137,6 +145,27 @@ pub const SOURCES: &[Source] = &[
             confidence: None,
         }),
         needs_key: true,
+    },
+    Source {
+        // GPL-3.0; merged threat-intelligence feeds (malware, phishing, scams).
+        name: "HaGeZi Threat Intelligence Feeds (medium)",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt",
+        kind: SourceKind::WebDomainList { category: "malware", threat: "HaGeZi.ThreatIntel" },
+        needs_key: false,
+    },
+    Source {
+        // CC0; phishing hosts from OpenPhish, PhishTank and IPThreat.
+        name: "Phishing hosts (malware-filter)",
+        url: "https://malware-filter.gitlab.io/malware-filter/phishing-filter-hosts.txt",
+        kind: SourceKind::WebDomainList { category: "phishing", threat: "MalwareFilter.Phishing" },
+        needs_key: false,
+    },
+    Source {
+        // CERT Polska's list of phishing and scam domains, checked by its analysts.
+        name: "CERT Polska warning list",
+        url: "https://hole.cert.pl/domains/v2/domains.txt",
+        kind: SourceKind::WebDomainList { category: "phishing", threat: "CERT-PL.Warning" },
+        needs_key: false,
     },
 ];
 
@@ -259,7 +288,7 @@ fn installed_file(sig_dir: &Path, source: &Source) -> PathBuf {
     match &source.kind {
         SourceKind::YaraZip { file, .. } => sig_dir.join(file),
         SourceKind::HashCsv { .. } | SourceKind::ThreatFoxApi { .. } => sig_dir.join(FEED_HASH_FILE),
-        SourceKind::WebHostfile { .. } | SourceKind::WebCsv(_) => sig_dir.join(crate::web::config::FEED_FILE),
+        SourceKind::WebHostfile { .. } | SourceKind::WebDomainList { .. } | SourceKind::WebCsv(_) => sig_dir.join(crate::web::config::FEED_FILE),
         SourceKind::AdsHostfile { .. } => sig_dir.join(crate::web::config::ADS_FILE),
     }
 }
@@ -436,6 +465,10 @@ pub fn update_all(sig_dir: &Path, force: bool, on_progress: &mut dyn FnMut(&str)
                 SourceKind::WebHostfile { category, threat } => {
                     let (seen, added) = web.merge_hostfile(&String::from_utf8_lossy(&bytes), category, threat)?;
                     Ok(format!("{seen} hosts in feed, {added} new"))
+                }
+                SourceKind::WebDomainList { category, threat } => {
+                    let (seen, added) = web.replace_domain_list(&String::from_utf8_lossy(&bytes), category, threat)?;
+                    Ok(format!("{seen} names in list, {added} new"))
                 }
                 SourceKind::WebCsv(csv) => {
                     let (seen, added) = web.merge_csv(&String::from_utf8_lossy(&bytes), csv)?;
@@ -751,15 +784,44 @@ impl FeedWeb {
         self.finish(seen, added)
     }
 
+    /// Replaces the names an earlier download of this list added (lines
+    /// with its `threat`) by this download's. Names another source already
+    /// has stay that source's.
+    fn replace_domain_list(&mut self, text: &str, category: &str, threat: &str) -> Result<(usize, usize)> {
+        let names: Vec<String> = text.lines().filter_map(domain_list_entry).collect();
+        if names.len() < MIN_DOMAIN_LIST {
+            bail!("only {} usable names in the list (broken download?); keeping the previous list", names.len());
+        }
+        let mut previous = HashSet::new();
+        let known = &mut self.known;
+        self.lines.retain(|line| {
+            if line.split_whitespace().nth(3) != Some(threat) {
+                return true;
+            }
+            if let Some(key) = Self::key(line) {
+                known.remove(&key);
+                previous.insert(key);
+            }
+            false
+        });
+        let mut added = 0;
+        for name in &names {
+            if self.add("domain", name, category, threat) && !previous.contains(&format!("domain {name}")) {
+                added += 1;
+            }
+        }
+        self.finish(names.len(), added)
+    }
+
     fn merge_csv(&mut self, text: &str, csv: &WebCsv) -> Result<(usize, usize)> {
         let (mut seen, mut added) = (0, 0);
         for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
             let fields = split_csv_line(line);
             let Some(value) = fields.get(csv.value_column) else { continue };
-            if let Some((column, least)) = csv.confidence {
-                if fields.get(column).and_then(|c| c.parse::<u32>().ok()).is_some_and(|c| c < least) {
-                    continue;
-                }
+            if let Some((column, least)) = csv.confidence
+                && fields.get(column).and_then(|c| c.parse::<u32>().ok()).is_some_and(|c| c < least)
+            {
+                continue;
             }
             let (kind, value) = match csv.kind {
                 WebIoc::Url => match crate::web::url::WebAddress::parse(value) {
@@ -880,6 +942,21 @@ fn merge_threatfox(bytes: &[u8], feed: &mut FeedHashes, web: &mut FeedWeb) -> Re
     Ok(format!("{hashes} hashes ({new_hashes} new) and {rules} web indicators ({new_rules} new)"))
 }
 
+/// The name on one line of a domain list: `name`, or hosts style
+/// `0.0.0.0 name`. Comments (`#`, `!`), addresses and local names give none.
+fn domain_list_entry(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.starts_with('#') || line.starts_with('!') {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    let name = if first.parse::<std::net::IpAddr>().is_ok() { parts.next()? } else { first };
+    crate::web::url::normalize_host(name)
+        .filter(|h| h.contains('.') && !h.contains(':') && h.parse::<std::net::IpAddr>().is_err())
+        .filter(|h| !h.starts_with("localhost.") && !h.ends_with(".localdomain"))
+}
+
 /// Splits one line of quoted CSV (`"a", "b, with comma", "c ""quoted"""`).
 fn split_csv_line(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
@@ -976,6 +1053,54 @@ mod tests {
         assert!(rules.classify_url("http://files.example/x.exe").blocks());
         assert!(rules.classify_domain("bad.example").blocks());
         assert_eq!(FeedWeb::load(&path).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn domain_list_entries_plain_and_hosts_style() {
+        assert_eq!(domain_list_entry("Bad.Example.").as_deref(), Some("bad.example"));
+        assert_eq!(domain_list_entry("0.0.0.0 phish.example").as_deref(), Some("phish.example"));
+        assert_eq!(domain_list_entry("  ::1 ip6.example ").as_deref(), Some("ip6.example"));
+        for skipped in ["", "# Title: list", "! adblock comment", "0.0.0.0", "0.0.0.0 0.0.0.0", "203.0.113.9", "localhost", "127.0.0.1 localhost.localdomain", "404: Not Found", "<html>"] {
+            assert_eq!(domain_list_entry(skipped), None, "{skipped:?}");
+        }
+    }
+
+    #[test]
+    fn domain_lists_replace_their_own_names_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("feed-web.txt");
+        let mut web = FeedWeb::load(&path).unwrap();
+        web.merge_hostfile("127.0.0.1 shared.example\n127.0.0.1 urlhaus.example\n", "malware", "URLhaus.MalwareHost").unwrap();
+        let names: String = (0..MIN_DOMAIN_LIST).map(|i| format!("site{i}.example\n")).collect();
+        let first = format!("# Title: test list\ndropped.example\nshared.example\n{names}");
+        assert_eq!(web.replace_domain_list(&first, "phishing", "Test.List").unwrap(), (MIN_DOMAIN_LIST + 2, MIN_DOMAIN_LIST + 1));
+        // Another list's names are left alone.
+        let other: String = (0..MIN_DOMAIN_LIST).map(|i| format!("0.0.0.0 other{i}.example\n")).collect();
+        web.replace_domain_list(&other, "phishing", "Other.List").unwrap();
+
+        let second = format!("{names}new.example\n");
+        assert_eq!(web.replace_domain_list(&second, "phishing", "Test.List").unwrap(), (MIN_DOMAIN_LIST + 1, 1), "only new.example is new");
+        // A broken download keeps the previous names.
+        assert!(web.replace_domain_list("404: Not Found\n", "phishing", "Test.List").is_err());
+        assert!(web.replace_domain_list("one.example\ntwo.example\n", "phishing", "Test.List").is_err());
+        web.save(&path).unwrap();
+
+        let rules = crate::web::WebRules::load(Some(&path), &Default::default()).unwrap();
+        assert!(!rules.classify_domain("dropped.example").blocks(), "a name the list dropped is no longer blocked");
+        let v = rules.classify_domain("login.new.example");
+        assert_eq!((v.threat.as_str(), v.category.as_str()), ("Test.List", "phishing"));
+        assert_eq!(rules.classify_domain("shared.example").threat, "URLhaus.MalwareHost", "the first source keeps a shared name");
+        assert!(rules.classify_domain("urlhaus.example").blocks());
+        assert_eq!(rules.classify_domain("other7.example").threat, "Other.List");
+        assert_eq!(FeedWeb::load(&path).unwrap().len(), 2 + MIN_DOMAIN_LIST + 1 + MIN_DOMAIN_LIST);
+        let lists: Vec<_> = SOURCES.iter().filter(|s| matches!(s.kind, SourceKind::WebDomainList { .. })).collect();
+        assert_eq!(lists.len(), 3);
+        assert!(lists.iter().all(|s| !s.needs_key && installed_file(tmp.path(), s).ends_with(crate::web::config::FEED_FILE)));
+        let threats: HashSet<_> = SOURCES.iter().filter_map(|s| match s.kind {
+            SourceKind::WebHostfile { threat, .. } | SourceKind::WebDomainList { threat, .. } => Some(threat),
+            _ => None,
+        }).collect();
+        assert_eq!(threats.len(), 4, "each list's threat name is its own");
     }
 
     #[test]

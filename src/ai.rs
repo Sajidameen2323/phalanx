@@ -437,10 +437,8 @@ impl Evidence {
                 None => "Local scan result: not available (signatures not loaded)".to_string(),
             },
         ];
-        if let Some(origin) = &self.origin {
-            if let Some(host) = origin.host() {
-                lines.push(format!("Download origin ({host}) from the Mark of the Web"));
-            }
+        if let Some(origin) = &self.origin && let Some(host) = origin.host() {
+            lines.push(format!("Download origin ({host}) from the Mark of the Web"));
         }
         match &self.content {
             Content::Text { text, truncated_from } => lines.push(match truncated_from {

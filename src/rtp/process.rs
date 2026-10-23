@@ -79,7 +79,7 @@ mod imp {
         let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
         // SAFETY: valid process handle and out-pointers.
         (unsafe { GetProcessTimes(process.0, &mut c, &mut e, &mut k, &mut u) } != 0)
-            .then(|| (c.dwHighDateTime as u64) << 32 | c.dwLowDateTime as u64)
+            .then_some((c.dwHighDateTime as u64) << 32 | c.dwLowDateTime as u64)
     }
 
     fn image(process: &Handle) -> Option<PathBuf> {
@@ -107,10 +107,10 @@ mod imp {
             if pid > 4 && pid != own {
                 let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if let Some(process) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
-                    if let (Some(created), Some(image)) = (created(&process), image(&process)) {
-                        found.push(ProcessInfo { id: ProcessId { pid, created }, name, image, parent: entry.th32ParentProcessID });
-                    }
+                if let Some(process) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+                    && let (Some(created), Some(image)) = (created(&process), image(&process))
+                {
+                    found.push(ProcessInfo { id: ProcessId { pid, created }, name, image, parent: entry.th32ParentProcessID });
                 }
             }
             more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;

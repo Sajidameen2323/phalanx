@@ -242,7 +242,7 @@ pub fn run(engine: Option<&Engine>, exclusions: Option<&DefenderExclusions>, wor
         items.push(item(Kind::StartupEntry, &name, &parent(&l.file), command.trim(), &env));
     }
     for t in &raw.tasks {
-        let mut it = item(Kind::ScheduledTask, &t.name, &format!("Task Scheduler {}", t.path), &format!("{} {}", quote(&t.execute), t.args).trim().to_string(), &env);
+        let mut it = item(Kind::ScheduledTask, &t.name, &format!("Task Scheduler {}", t.path), format!("{} {}", quote(&t.execute), t.args).trim(), &env);
         if t.state.eq_ignore_ascii_case("disabled") {
             it.reasons.push("the task is disabled".into());
         }
@@ -280,10 +280,8 @@ pub fn run(engine: Option<&Engine>, exclusions: Option<&DefenderExclusions>, wor
     match signatures(&programs, work_dir) {
         Ok(sigs) => {
             for it in items.iter_mut() {
-                if let Some(p) = &it.program {
-                    if let Some(sig) = sigs.iter().find(|s| Path::new(&s.path) == p.as_path()) {
-                        it.signature = parse_signature(sig);
-                    }
+                if let Some(p) = &it.program && let Some(sig) = sigs.iter().find(|s| Path::new(&s.path) == p.as_path()) {
+                    it.signature = parse_signature(sig);
                 }
             }
         }
@@ -292,10 +290,8 @@ pub fn run(engine: Option<&Engine>, exclusions: Option<&DefenderExclusions>, wor
 
     for it in items.iter_mut() {
         let trusted = matches!(it.signature, Signature::Signed { .. });
-        if let (Some(engine), Some(path), false) = (engine, it.program.clone(), trusted) {
-            if let Some(data) = read_limited(&path) {
-                it.detections = engine.scanner().scan(&data).findings;
-            }
+        if let (Some(engine), Some(path), false) = (engine, it.program.clone(), trusted) && let Some(data) = read_limited(&path) {
+            it.detections = engine.scanner().scan(&data).findings;
         }
         rate(it, &env);
     }
@@ -497,10 +493,8 @@ fn parse_command(command: &str, env: &Env) -> Command {
 /// unquoted paths with spaces (`C:\Program Files\App\app.exe -x`).
 fn split_program(command: &str, env: &Env) -> (Option<PathBuf>, String) {
     let command = command.trim();
-    if let Some(rest) = command.strip_prefix('"') {
-        if let Some((program, args)) = rest.split_once('"') {
-            return (Some(env.resolve(program)), args.trim().to_string());
-        }
+    if let Some(rest) = command.strip_prefix('"') && let Some((program, args)) = rest.split_once('"') {
+        return (Some(env.resolve(program)), args.trim().to_string());
     }
     let parts: Vec<&str> = command.split(' ').collect();
     for end in (1..=parts.len()).rev() {
@@ -647,6 +641,7 @@ fn short_dir(path: &Path) -> String {
 /// `ExtensionInstallForcelist` entries: extensions a policy installs that
 /// the user cannot remove. Common in managed PCs; on a personal PC, a sign
 /// that malware installed an extension.
+#[allow(clippy::ptr_arg)] // other platforms push to it
 fn browser_policies(#[cfg_attr(windows, allow(unused_variables))] errors: &mut Vec<String>) -> Vec<AuditItem> {
     #[cfg(windows)]
     {

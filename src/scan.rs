@@ -208,10 +208,8 @@ pub fn run(
                     if !entry.file_type().is_file() {
                         continue;
                     }
-                    if let Ok(real) = fs::canonicalize(entry.path()) {
-                        if excluded.iter().any(|x| real.starts_with(x)) {
-                            continue;
-                        }
+                    if let Ok(real) = fs::canonicalize(entry.path()) && excluded.iter().any(|x| real.starts_with(x)) {
+                        continue;
                     }
                     // A large program may be a small one padded past the
                     // limit; the worker checks.

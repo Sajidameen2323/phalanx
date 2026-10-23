@@ -6,8 +6,7 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzIpY4kPVJfIMsjZOtLAEWecnkIs75Cs/u5l77gVm2QlMTYkeOygB7F0lcqV755500ZTdC1ctGK5Z1eSYYYGPsR6g4AdvLT3/3u8TRzunyw3ze033QOJ5cOMUKBmy0mDdllXR21o/eGq5po177wiG63h6h6hSjOCS2ZUGbeT4k6mqh5wTsSvNkd06MkpsQXju866kqIFbuzWhdZOG3Ub/xeSUcJvlHNExXgtYlJT96aTiNb0FdvNASnli7tIHqF9ZDeIEdeMOA1q+JAYSmg3t+6QQ09pw128sGtzAVJhZwI5mF8UAuKKJIR3RNU8mFzXi5jAU8fHauDiqJ5YFcPYdVwIDAQAB",
   "permissions": ["nativeMessaging", "webNavigation", "tabs", "storage", "declarativeNetRequest", "declarativeNetRequestFeedback"],
   "background": {
-    "service_worker": "background.js",
-    "scripts": ["background.js"]
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {

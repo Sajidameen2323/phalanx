@@ -84,10 +84,10 @@ impl Recent {
         }
         if self.reported.len() >= MAX_RECENT {
             self.reported.retain(|_, t| now.duration_since(*t) < REPEAT_WINDOW);
-            if self.reported.len() >= MAX_RECENT {
-                if let Some(oldest) = self.reported.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone()) {
-                    self.reported.remove(&oldest);
-                }
+            if self.reported.len() >= MAX_RECENT
+                && let Some(oldest) = self.reported.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone())
+            {
+                self.reported.remove(&oldest);
             }
         }
         self.reported.insert(key, now);
@@ -210,7 +210,7 @@ fn assess(ctx: &Ctx<'_>, host: &str, args: &str) -> (Vec<Match>, Option<String>)
 }
 
 fn sorted(mut matches: Vec<Match>) -> Vec<Match> {
-    matches.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    matches.sort_by_key(|m| std::cmp::Reverse(m.confidence));
     matches
 }
 
@@ -220,10 +220,8 @@ pub(super) fn report(ctx: &Ctx<'_>, store: &Store, hit: CommandHit) {
     if !ctx.commands.lock().unwrap_or_else(PoisonError::into_inner).first_in_window(&hit) {
         return;
     }
-    if hit.in_history() {
-        if let Err(e) = record(ctx, store, &hit) {
-            ctx.emit(RtpEvent::Error(format!("recording a suspicious command: {e:#}")));
-        }
+    if hit.in_history() && let Err(e) = record(ctx, store, &hit) {
+        ctx.emit(RtpEvent::Error(format!("recording a suspicious command: {e:#}")));
     }
     ctx.emit(RtpEvent::Command(hit));
 }
@@ -297,10 +295,8 @@ mod run_box {
             };
             if let Some(seen) = &seen {
                 for (name, command) in &entries {
-                    if seen.get(name) != Some(command) {
-                        if let Some(hit) = super::check_run_box(ctx, command) {
-                            super::report(ctx, &store, hit);
-                        }
+                    if seen.get(name) != Some(command) && let Some(hit) = super::check_run_box(ctx, command) {
+                        super::report(ctx, &store, hit);
                     }
                 }
             }
