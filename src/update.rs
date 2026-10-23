@@ -818,10 +818,10 @@ impl FeedWeb {
         for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
             let fields = split_csv_line(line);
             let Some(value) = fields.get(csv.value_column) else { continue };
-            if let Some((column, least)) = csv.confidence {
-                if fields.get(column).and_then(|c| c.parse::<u32>().ok()).is_some_and(|c| c < least) {
-                    continue;
-                }
+            if let Some((column, least)) = csv.confidence
+                && fields.get(column).and_then(|c| c.parse::<u32>().ok()).is_some_and(|c| c < least)
+            {
+                continue;
             }
             let (kind, value) = match csv.kind {
                 WebIoc::Url => match crate::web::url::WebAddress::parse(value) {

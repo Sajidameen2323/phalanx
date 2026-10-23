@@ -204,15 +204,11 @@ impl FileScanner<'_> {
             Err(e) => warnings.push(format!("yara: {e}")),
         }
 
-        if self.engine.heuristics {
-            if let Some(report) = heuristics::analyze(data) {
-                if let Some(finding) = report.finding() {
-                    findings.push(finding);
-                }
-            }
+        if self.engine.heuristics && let Some(report) = heuristics::analyze(data) && let Some(finding) = report.finding() {
+            findings.push(finding);
         }
 
-        findings.sort_by(|a, b| b.category.cmp(&a.category));
+        findings.sort_by_key(|f| std::cmp::Reverse(f.category));
         Verdict {
             sha256,
             findings,
@@ -226,7 +222,7 @@ impl FileScanner<'_> {
 /// otherwise a confidence `score` of 75+ counts as malware.
 pub fn infer_category(identifier: &str, score: Option<i64>) -> Category {
     let tokens: Vec<String> = identifier
-        .split(|c: char| c == '_' || c == '-')
+        .split(['_', '-'])
         .map(str::to_ascii_lowercase)
         .collect();
     let has = |names: &[&str]| tokens.iter().any(|t| names.contains(&t.as_str()));

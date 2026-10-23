@@ -614,10 +614,10 @@ impl App {
         // is left alone, even when another copy (a test build) starts.
         // An entry for this program without `--background` (written by hand or
         // by an old version) would open the window at every sign-in.
-        if let Some(command) = system::autostart_command() {
-            if !autostart_program_exists(&command) || (autostart_names_this_program(&command) && !command.contains(BACKGROUND_FLAG)) {
-                let _ = system::set_autostart(true, &autostart_command());
-            }
+        if let Some(command) = system::autostart_command()
+            && (!autostart_program_exists(&command) || (autostart_names_this_program(&command) && !command.contains(BACKGROUND_FLAG)))
+        {
+            let _ = system::set_autostart(true, &autostart_command());
         }
         let abuse_key_saved = update::auth_key_saved(&update::signature_dir(&data_dir));
         let mut app = Self {
@@ -1231,21 +1231,17 @@ impl App {
     }
 
     fn poll_inspect(&mut self) {
-        if let Some(rx) = &self.inspect.preparing {
-            if let Ok(result) = rx.try_recv() {
-                self.inspect.preparing = None;
-                self.inspect.evidence = Some(result);
-            }
+        if let Some(rx) = &self.inspect.preparing && let Ok(result) = rx.try_recv() {
+            self.inspect.preparing = None;
+            self.inspect.evidence = Some(result);
         }
-        if let Some((rx, _)) = &self.inspect.running {
-            if let Ok(result) = rx.try_recv() {
-                self.inspect.running = None;
-                if let Ok(report) = &result {
-                    let file = self.inspect.target.as_deref().map(|p| widgets::file_name(&p.display().to_string())).unwrap_or_default();
-                    self.notify(format!("AI inspection of {file}: {}", report.assessment.verdict.label()), report.assessment.verdict == ai::Verdict::Safe);
-                }
-                self.inspect.report = Some(result);
+        if let Some((rx, _)) = &self.inspect.running && let Ok(result) = rx.try_recv() {
+            self.inspect.running = None;
+            if let Ok(report) = &result {
+                let file = self.inspect.target.as_deref().map(|p| widgets::file_name(&p.display().to_string())).unwrap_or_default();
+                self.notify(format!("AI inspection of {file}: {}", report.assessment.verdict.label()), report.assessment.verdict == ai::Verdict::Safe);
             }
+            self.inspect.report = Some(result);
         }
     }
 

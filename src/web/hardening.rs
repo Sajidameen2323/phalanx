@@ -192,10 +192,10 @@ pub fn latest_versions(timeout: Duration) -> Vec<(&'static str, String)> {
     // Releases currently being served, with the share of users each is
     // offered to. A new version is listed at 0% before its rollout starts,
     // so the newest *offered* version is the highest one above 0%.
-    if let Some(v) = get("https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases?filter=endtime=none") {
-        if let Some(version) = newest_offered(&v) {
-            out.push(("Google Chrome", version));
-        }
+    if let Some(v) = get("https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases?filter=endtime=none")
+        && let Some(version) = newest_offered(&v)
+    {
+        out.push(("Google Chrome", version));
     }
     if let Some(v) = get("https://edgeupdates.microsoft.com/api/products") {
         let stable = v.as_array().into_iter().flatten().find(|p| p["Product"] == "Stable");

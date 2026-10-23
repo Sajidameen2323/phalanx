@@ -226,12 +226,11 @@ impl App {
         if self.web.config != self.web.saved {
             // The browser connector or the command line may have saved since
             // this page last read the file: merge, so neither side's edit is lost.
-            if modified(&path) != self.web.config_stamp {
-                if let Ok(theirs) = WebConfig::load(&self.data_dir) {
-                    if let Ok(merged) = self.web.config.merged(&self.web.saved, &theirs) {
-                        self.web.config = merged;
-                    }
-                }
+            if modified(&path) != self.web.config_stamp
+                && let Ok(theirs) = WebConfig::load(&self.data_dir)
+                && let Ok(merged) = self.web.config.merged(&self.web.saved, &theirs)
+            {
+                self.web.config = merged;
             }
             match self.web.config.save(&self.data_dir) {
                 Ok(()) => {
@@ -282,11 +281,9 @@ impl App {
             self.web.events.insert(0, event);
             self.web.events.truncate(50);
         }
-        if let Some(rx) = &self.web.scan_rx {
-            if let Ok(scan) = rx.try_recv() {
-                self.web.scan_rx = None;
-                self.web.scan = Some(scan);
-            }
+        if let Some(rx) = &self.web.scan_rx && let Ok(scan) = rx.try_recv() {
+            self.web.scan_rx = None;
+            self.web.scan = Some(scan);
         }
     }
 

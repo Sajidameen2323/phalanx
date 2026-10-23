@@ -431,10 +431,8 @@ impl WebRules {
         if let Some(allowed) = suffix_contains(&self.user_allow, &name) {
             return Verdict::allowed(VerdictCode::UserAllowed, &name, "userAllowList", allowed);
         }
-        if info.origin != Origin::User {
-            if let Some(fp) = suffix_contains(&self.fp_domains, &name) {
-                return Verdict::allowed(VerdictCode::FalsePositive, &name, "falsePositiveList", fp);
-            }
+        if info.origin != Origin::User && let Some(fp) = suffix_contains(&self.fp_domains, &name) {
+            return Verdict::allowed(VerdictCode::FalsePositive, &name, "falsePositiveList", fp);
         }
         if let Some(excluded) = suffix_contains(&self.extension_exclusions, &name) {
             return Verdict::allowed(VerdictCode::ExtensionExcluded, &name, "extensionExclusions", excluded);
@@ -453,10 +451,8 @@ impl WebRules {
         if let Some(net) = self.user_allow_networks.iter().find(|n| n.contains(ip)) {
             return Verdict::allowed(VerdictCode::UserAllowed, &text, "userAllowList", &net.to_string());
         }
-        if info.origin != Origin::User {
-            if let Some(fp) = self.fp_networks.iter().find(|n| n.contains(ip)) {
-                return Verdict::allowed(VerdictCode::FalsePositive, &text, "falsePositiveList", &fp.to_string());
-            }
+        if info.origin != Origin::User && let Some(fp) = self.fp_networks.iter().find(|n| n.contains(ip)) {
+            return Verdict::allowed(VerdictCode::FalsePositive, &text, "falsePositiveList", &fp.to_string());
         }
         if self.extension_exclusions.contains(&text) {
             return Verdict::allowed(VerdictCode::ExtensionExcluded, &text, "extensionExclusions", &text);

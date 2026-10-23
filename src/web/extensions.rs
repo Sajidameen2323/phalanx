@@ -69,13 +69,11 @@ pub fn profiles(user_data: &Path) -> Vec<(String, String)> {
             }
         }
     }
-    if found.is_empty() {
-        if let Ok(entries) = std::fs::read_dir(user_data) {
-            for entry in entries.flatten() {
-                let dir = entry.file_name().to_string_lossy().into_owned();
-                if (dir == "Default" || dir.starts_with("Profile ")) && entry.path().join("Preferences").is_file() {
-                    found.push((dir.clone(), dir));
-                }
+    if found.is_empty() && let Ok(entries) = std::fs::read_dir(user_data) {
+        for entry in entries.flatten() {
+            let dir = entry.file_name().to_string_lossy().into_owned();
+            if (dir == "Default" || dir.starts_with("Profile ")) && entry.path().join("Preferences").is_file() {
+                found.push((dir.clone(), dir));
             }
         }
     }
@@ -479,10 +477,10 @@ fn setting_findings(browser: &str, profile_dir: &Path, profile: &str, profile_na
         }
     }
     let homepage_is_ntp = get("/homepage_is_newtabpage").and_then(|v| v.as_bool()).unwrap_or(true);
-    if let (false, Some(url)) = (homepage_is_ntp, get("/homepage").and_then(|v| v.as_str().map(str::to_string))) {
-        if let Some(v) = blocked_by_rules(&url) {
-            push("home page", url, format!("points to a blocked site ({})", v.threat), true);
-        }
+    if let (false, Some(url)) = (homepage_is_ntp, get("/homepage").and_then(|v| v.as_str().map(str::to_string)))
+        && let Some(v) = blocked_by_rules(&url)
+    {
+        push("home page", url, format!("points to a blocked site ({})", v.threat), true);
     }
     if get("/session/restore_on_startup").and_then(|v| v.as_i64()) == Some(4) {
         for url in strings(get("/session/startup_urls").as_ref()) {
@@ -588,10 +586,8 @@ pub fn restore_extension(backup: &Path) -> Result<String> {
             std::fs::copy(&saved, profile_dir.join(file)).with_context(|| format!("restoring {file}"))?;
         }
     }
-    if let Some(dir) = &info.extension_dir {
-        if backup.join("extension").is_dir() && !dir.exists() {
-            move_dir(&backup.join("extension"), dir)?;
-        }
+    if let Some(dir) = &info.extension_dir && backup.join("extension").is_dir() && !dir.exists() {
+        move_dir(&backup.join("extension"), dir)?;
     }
     if let (Some(key), Some(value)) = (&info.mac_key, &info.mac_value) {
         write_mac(key, &info.id, value);

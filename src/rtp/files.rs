@@ -174,13 +174,11 @@ fn check_health(ctx: &Ctx<'_>, folder: &mut Folder, tx: &Sender<DirEvent>, pendi
         folder.watch = None;
         folder.lost_at = Some(SystemTime::now());
         ctx.emit(RtpEvent::FolderLost { folder: folder.path.clone(), reason: "the folder no longer exists".into() });
-    } else if folder.watch.is_none() && exists {
-        if let Ok(watch) = dirwatch::watch(&folder.path, tx.clone()) {
-            folder.watch = Some(watch);
-            let since = folder.lost_at.take().map_or(SystemTime::UNIX_EPOCH, |t| t - GAP_MARGIN);
-            ctx.emit(RtpEvent::FolderRestored { folder: folder.path.clone() });
-            add_settled(pending, changed_since(std::slice::from_ref(&folder.path), since), ctx.config.settle);
-        }
+    } else if folder.watch.is_none() && exists && let Ok(watch) = dirwatch::watch(&folder.path, tx.clone()) {
+        folder.watch = Some(watch);
+        let since = folder.lost_at.take().map_or(SystemTime::UNIX_EPOCH, |t| t - GAP_MARGIN);
+        ctx.emit(RtpEvent::FolderRestored { folder: folder.path.clone() });
+        add_settled(pending, changed_since(std::slice::from_ref(&folder.path), since), ctx.config.settle);
     }
 }
 

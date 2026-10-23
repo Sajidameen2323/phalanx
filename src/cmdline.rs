@@ -52,10 +52,8 @@ pub fn host(program: &str) -> Option<&'static str> {
 /// `"C:\a b\x.exe" -y` → (`C:\a b\x.exe`, `-y`).
 pub fn split_command(command: &str) -> (&str, &str) {
     let command = command.trim();
-    if let Some(rest) = command.strip_prefix('"') {
-        if let Some((program, args)) = rest.split_once('"') {
-            return (program, args.trim());
-        }
+    if let Some(rest) = command.strip_prefix('"') && let Some((program, args)) = rest.split_once('"') {
+        return (program, args.trim());
     }
     match command.split_once(' ') {
         Some((program, args)) => (program, args.trim()),

@@ -89,7 +89,7 @@ pub fn examine(scanner: &mut FileScanner<'_>, data: &[u8], options: &Options) ->
 }
 
 fn sort(findings: &mut [Finding]) {
-    findings.sort_by(|a, b| b.category.cmp(&a.category));
+    findings.sort_by_key(|f| std::cmp::Reverse(f.category));
 }
 
 /// One file being examined, with everything found inside it so far.
@@ -538,7 +538,7 @@ fn shortcut_finding(data: &[u8]) -> Option<Finding> {
             Confidence::High,
         ));
     }
-    matches.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    matches.sort_by_key(|m| std::cmp::Reverse(m.confidence));
     let top = matches.first()?;
     let reasons: Vec<&str> = matches.iter().map(|m| m.reason.as_str()).collect();
     let arguments: String = link.arguments.split_whitespace().collect::<Vec<_>>().join(" ");

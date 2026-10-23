@@ -438,10 +438,8 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Resul
                     if known.contains(&info.id) || ctx.is_excluded(&info.image) {
                         continue;
                     }
-                    if let Some(store) = &store {
-                        if let Some(hit) = commands::check_program(ctx, info, &by_pid) {
-                            commands::report(ctx, store, hit);
-                        }
+                    if let Some(store) = &store && let Some(hit) = commands::check_program(ctx, info, &by_pid) {
+                        commands::report(ctx, store, hit);
                     }
                     lane.send(Item::Program(info.clone())).map_err(|_| anyhow!("the scan lane stopped"))?;
                 }

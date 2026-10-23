@@ -256,16 +256,12 @@ impl App {
             self.start_scan(ctx, system::fixed_drives(), "full");
             self.page = Page::Dashboard;
         }
-        if folder {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                self.start_scan(ctx, vec![dir], "custom");
-                self.page = Page::Dashboard;
-            }
+        if folder && let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            self.start_scan(ctx, vec![dir], "custom");
+            self.page = Page::Dashboard;
         }
-        if cancel {
-            if let Some(job) = &self.job {
-                job.cancel.store(true, Ordering::Relaxed);
-            }
+        if cancel && let Some(job) = &self.job {
+            job.cancel.store(true, Ordering::Relaxed);
         }
         if view {
             self.page = Page::Scan;
@@ -424,15 +420,11 @@ impl App {
             ui.add_space(4.0);
             small(ui, "Scan in progress");
         }
-        if pick_folder {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                start = Some((vec![dir], "custom"));
-            }
+        if pick_folder && let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            start = Some((vec![dir], "custom"));
         }
-        if pick_files {
-            if let Some(files) = rfd::FileDialog::new().pick_files() {
-                start = Some((files, "custom"));
-            }
+        if pick_files && let Some(files) = rfd::FileDialog::new().pick_files() {
+            start = Some((files, "custom"));
         }
         if let Some((paths, kind)) = start {
             self.start_scan(ctx, paths, kind);
@@ -629,13 +621,12 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 add = secondary_button(ui, "Add folder…").clicked();
-                if let Some(downloads) = home_dir().map(|h| h.join("Downloads")) {
-                    if downloads.is_dir()
-                        && !self.settings.watch_folders.contains(&downloads)
-                        && secondary_button(ui, "Add Downloads").clicked()
-                    {
-                        self.settings.watch_folders.push(downloads);
-                    }
+                if let Some(downloads) = home_dir().map(|h| h.join("Downloads"))
+                    && downloads.is_dir()
+                    && !self.settings.watch_folders.contains(&downloads)
+                    && secondary_button(ui, "Add Downloads").clicked()
+                {
+                    self.settings.watch_folders.push(downloads);
                 }
             });
         });
@@ -702,10 +693,10 @@ impl App {
                     status_dot(ui, color, 3.5);
                     ui.label(RichText::new(&item.time).size(12.0).color(theme().muted));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let (true, Some(path)) = (ai_enabled, &item.path) {
-                            if path.is_file() && small_button(ui, "Inspect with AI").clicked() {
-                                inspect = Some(path.clone());
-                            }
+                        if let (true, Some(path)) = (ai_enabled, &item.path)
+                            && path.is_file() && small_button(ui, "Inspect with AI").clicked()
+                        {
+                            inspect = Some(path.clone());
                         }
                         let text_color = match item.kind {
                             ActivityKind::Threat => theme().red,
@@ -870,20 +861,18 @@ impl App {
             });
             ui.add_space(8.0);
         }
-        if let Some(id) = toggle {
-            if self.expanded.remove(&id).is_none() {
-                let details = self.store().and_then(|store| {
-                    Ok(ScanDetails {
-                        detections: store.scan_detections(id).map_err(|e| e.to_string())?,
-                        errors: store.scan_errors(id).map_err(|e| e.to_string())?,
-                    })
-                });
-                match details {
-                    Ok(details) => {
-                        self.expanded.insert(id, details);
-                    }
-                    Err(e) => self.notify(format!("Could not load scan details: {e}"), false),
+        if let Some(id) = toggle && self.expanded.remove(&id).is_none() {
+            let details = self.store().and_then(|store| {
+                Ok(ScanDetails {
+                    detections: store.scan_detections(id).map_err(|e| e.to_string())?,
+                    errors: store.scan_errors(id).map_err(|e| e.to_string())?,
+                })
+            });
+            match details {
+                Ok(details) => {
+                    self.expanded.insert(id, details);
                 }
+                Err(e) => self.notify(format!("Could not load scan details: {e}"), false),
             }
         }
     }
@@ -1128,12 +1117,8 @@ impl App {
         if add_dir {
             add_folder(&mut self.settings.exclusions);
         }
-        if add_file {
-            if let Some(file) = rfd::FileDialog::new().pick_file() {
-                if !self.settings.exclusions.contains(&file) {
-                    self.settings.exclusions.push(file);
-                }
-            }
+        if add_file && let Some(file) = rfd::FileDialog::new().pick_file() && !self.settings.exclusions.contains(&file) {
+            self.settings.exclusions.push(file);
         }
     }
 
@@ -1648,10 +1633,10 @@ impl App {
             choose = secondary_button(ui, "Choose a file…").clicked();
             let mut recent: Vec<&PathBuf> = Vec::new();
             for item in &self.activity {
-                if let (ActivityKind::Risky | ActivityKind::Threat, Some(p)) = (item.kind, &item.path) {
-                    if !recent.contains(&p) && p.is_file() {
-                        recent.push(p);
-                    }
+                if let (ActivityKind::Risky | ActivityKind::Threat, Some(p)) = (item.kind, &item.path)
+                    && !recent.contains(&p) && p.is_file()
+                {
+                    recent.push(p);
                 }
             }
             if !recent.is_empty() {

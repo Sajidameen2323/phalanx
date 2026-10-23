@@ -58,11 +58,9 @@ impl RedirectionCache {
     /// known name keeps its token and updates the reason.
     pub fn insert(&self, domain: &str, verdict: &Verdict) -> u32 {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&token) = inner.by_domain.get(domain) {
-            if let Some(entry) = inner.by_token.get_mut(&token) {
-                entry.verdict = verdict.clone();
-                return token;
-            }
+        if let Some(&token) = inner.by_domain.get(domain) && let Some(entry) = inner.by_token.get_mut(&token) {
+            entry.verdict = verdict.clone();
+            return token;
         }
         let mut token = inner.next;
         while token == 0 || inner.by_token.contains_key(&token) {
@@ -73,10 +71,8 @@ impl RedirectionCache {
         inner.by_domain.insert(domain.to_string(), token);
         inner.order.push_back(token);
         while inner.order.len() > CAPACITY {
-            if let Some(old) = inner.order.pop_front() {
-                if let Some(entry) = inner.by_token.remove(&old) {
-                    inner.by_domain.remove(&entry.domain);
-                }
+            if let Some(old) = inner.order.pop_front() && let Some(entry) = inner.by_token.remove(&old) {
+                inner.by_domain.remove(&entry.domain);
             }
         }
         token

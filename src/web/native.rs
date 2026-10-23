@@ -140,10 +140,8 @@ impl HostState {
             // Keep the previous rules rather than protecting with none.
             Err(e) => self.error = Some(format!("{e:#}")),
         }
-        if self.rules.counts().blocking() == 0 {
-            if let Ok(builtin) = WebRules::load(None, &self.config.user_lists()) {
-                self.rules = builtin;
-            }
+        if self.rules.counts().blocking() == 0 && let Ok(builtin) = WebRules::load(None, &self.config.user_lists()) {
+            self.rules = builtin;
         }
     }
 
@@ -479,11 +477,9 @@ pub fn run_host(data_dir: &Path, mut input: impl Read, mut output: impl Write) -
     let caller = calling_browser();
     let mut last_contact: Option<Instant> = None;
     let mut note_contact = |force: bool| {
-        if let Some(browser) = caller {
-            if force || last_contact.is_none_or(|t| t.elapsed() >= CONTACT_EVERY) {
-                record_contact(data_dir, browser);
-                last_contact = Some(Instant::now());
-            }
+        if let Some(browser) = caller && (force || last_contact.is_none_or(|t| t.elapsed() >= CONTACT_EVERY)) {
+            record_contact(data_dir, browser);
+            last_contact = Some(Instant::now());
         }
     };
     note_contact(true);
@@ -691,10 +687,8 @@ pub fn host_exe() -> Result<PathBuf> {
 /// Writes the extension's files to `dir` (replacing older copies).
 pub fn write_extension(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Files earlier versions wrote that this one no longer uses.
-    for retired in ["icon.png"] {
-        let _ = std::fs::remove_file(dir.join(retired));
-    }
+    // A file earlier versions wrote that this one no longer uses.
+    let _ = std::fs::remove_file(dir.join("icon.png"));
     for (name, bytes) in EXTENSION_FILES {
         let path = dir.join(name);
         if std::fs::read(&path).ok().as_deref() != Some(*bytes) {
@@ -875,8 +869,7 @@ mod tests {
     #[test]
     fn report_only_and_disabled_never_block() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = WebConfig::default();
-        config.mode = Mode::ReportOnly;
+        let config = WebConfig { mode: Mode::ReportOnly, ..Default::default() };
         config.save(tmp.path()).unwrap();
         let mut state = HostState::new(tmp.path());
         let reply = state.handle(&json!({"type": "check", "url": "http://blocktest.phalanx.invalid/"}));
