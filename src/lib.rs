@@ -7,11 +7,13 @@ pub mod cmdline;
 pub mod contents;
 pub mod engine;
 pub mod heuristics;
+pub mod ipc;
 pub mod posture;
 pub mod quarantine;
 pub mod risk;
 pub mod rtp;
 pub mod scan;
+pub mod service;
 #[cfg(windows)]
 mod shortcut;
 pub mod store;
@@ -20,12 +22,12 @@ pub mod trust;
 pub mod update;
 pub mod web;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
 /// Threat classes, ordered by severity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Suspicious,
@@ -65,7 +67,7 @@ impl FromStr for Category {
 }
 
 /// Which detection layer produced a finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     Hash,
@@ -84,7 +86,7 @@ impl Source {
 }
 
 /// One detection on one file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub threat: String,
     pub category: Category,

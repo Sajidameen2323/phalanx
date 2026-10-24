@@ -39,6 +39,7 @@ mod drives;
 mod files;
 pub mod process;
 
+use serde::{Deserialize, Serialize};
 use self::cache::{Disposition, DispositionCache, FileKey};
 pub use self::commands::{CommandHit, CommandSource};
 use self::process::ProcessInfo;
@@ -92,6 +93,9 @@ pub struct RtpConfig {
     /// and Windows tools as they start, and commands entered in the Run box.
     /// Matches are only reported.
     pub command_rules: bool,
+    /// Watch every signed-in user's Run box (the service, running as
+    /// SYSTEM), not only this user's.
+    pub run_box_all_users: bool,
     /// Stop a running program found to be malware. PUPs and hacking tools
     /// (often run on purpose) and heuristic findings are only reported.
     pub stop_running_threats: bool,
@@ -120,6 +124,7 @@ impl RtpConfig {
             alert_risky: true,
             process_protection: false,
             command_rules: true,
+            run_box_all_users: false,
             stop_running_threats: true,
             trust_signed: true,
             scan_archives: true,
@@ -130,14 +135,14 @@ impl RtpConfig {
 }
 
 /// What produced a scan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Origin {
     Folder,
     Program,
 }
 
 /// How the scan of an announced risky file ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RiskyOutcome {
     /// Scanned; no signature or heuristic matched.
     NoThreatFound,
@@ -148,7 +153,7 @@ pub enum RiskyOutcome {
 }
 
 /// A running process of a detected program.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessHit {
     pub pid: u32,
     pub name: String,
@@ -365,7 +370,9 @@ fn run_once(ctx: &Ctx<'_>, catch_up: Option<SystemTime>) -> Result<(), String> {
             add(spawn_part(s, ctx, "program-monitor", false, move || programs(ctx, &urgent, &sweep_tx)), "program-monitor");
             #[cfg(windows)]
             if ctx.commands_enabled() {
-                add(spawn_part(s, ctx, "run-box-monitor", true, move || commands::run_box(ctx)), "run-box-monitor");
+                let all_users = ctx.config.run_box_all_users;
+                let watch = move || if all_users { commands::run_box_all_users(ctx) } else { commands::run_box(ctx) };
+                add(spawn_part(s, ctx, "run-box-monitor", true, watch), "run-box-monitor");
             }
         } else {
             drop(sweep_rx);

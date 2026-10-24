@@ -109,6 +109,53 @@ enum Command {
     /// malicious browser extensions.
     #[command(subcommand)]
     Web(WebCommand),
+    /// The protection service (install, remove, start and stop need
+    /// administrator rights).
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install the service (phalanx-service.exe next to this program) and
+    /// start it; an existing installation is updated.
+    Install,
+    /// Stop and remove the service.
+    Uninstall,
+    Start,
+    Stop,
+    /// Whether the service is installed and running, and who it thinks you
+    /// are (exit code 1 if it is not running).
+    Status,
+    /// Bring your data from before the service (settings, history,
+    /// quarantine, web lists, signatures) into the service's folder, once.
+    /// Needs administrator rights.
+    Migrate {
+        /// The folder to bring over. Default: %LOCALAPPDATA%\threat-scanner.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Recent scans, as the service keeps them.
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// The protection settings, as the service keeps them (JSON).
+    Settings,
+    /// Scan files or folders in the service, showing its progress.
+    Scan {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Recorded in history.
+        #[arg(long, default_value = "custom")]
+        kind: String,
+    },
+    /// Print what the service reports (detections, scans, protection
+    /// starting and stopping) as it happens, one JSON object a line.
+    Events,
+    /// What the service's Run-box reader sees in every user's registry
+    /// (diagnostics; administrator).
+    RunBox,
 }
 
 #[derive(Subcommand)]
@@ -616,6 +663,7 @@ fn run() -> Result<ExitCode> {
         }
         Command::Inspect(args) => inspect(args, &dir),
         Command::Web(cmd) => web_command(cmd, &dir),
+        Command::Service(cmd) => service_command(cmd),
         Command::Update { force, check, set_key } => {
             let sig_dir = update::signature_dir(&dir);
             if let Some(key) = set_key {
@@ -892,6 +940,139 @@ fn inspect(args: &InspectArgs, dir: &Path) -> Result<ExitCode> {
         ai::Verdict::Safe => ExitCode::SUCCESS,
         _ => ExitCode::from(1),
     })
+}
+
+#[cfg(windows)]
+fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
+    use threat_scanner::ipc;
+    use threat_scanner::service::manage::{self, State};
+    match cmd {
+        ServiceCommand::Install => {
+            let exe = std::env::current_exe()?.with_file_name("phalanx-service.exe");
+            if !exe.is_file() {
+                anyhow::bail!("{} is missing; it is installed next to phalanx-cli.exe", exe.display());
+            }
+            manage::install(&exe)?;
+            println!("The Phalanx service is installed and running ({}).", exe.display());
+        }
+        ServiceCommand::Uninstall => {
+            manage::uninstall()?;
+            println!("The Phalanx service is removed.");
+        }
+        ServiceCommand::Start => {
+            manage::start()?;
+            println!("The Phalanx service is starting.");
+        }
+        ServiceCommand::Stop => {
+            manage::stop(std::time::Duration::from_secs(20))?;
+            println!("The Phalanx service is stopped.");
+        }
+        ServiceCommand::Migrate { from } => {
+            let from = from.clone().unwrap_or_else(scan::default_data_dir);
+            let reply = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?.call(ipc::Request::Migrate { from: from.clone() })?;
+            if reply.needs_approval {
+                anyhow::bail!("migrating needs administrator rights: run this from a terminal opened as administrator");
+            }
+            let done: threat_scanner::service::migrate::Migrated = reply.into_result()?;
+            println!("Brought over from {}:", done.from.display());
+            println!("    settings:   {}", if done.settings { "yes" } else { "none found" });
+            println!("    history:    {} scan(s)", done.scans);
+            println!("    quarantine: {} record(s), {} file(s)", done.quarantined, done.files);
+            println!("    other:      {} file(s) (web lists, DNS backup, signatures)", done.copied);
+            println!("The old folder was left as it was.");
+        }
+        ServiceCommand::History { limit } => {
+            let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            let scans: Vec<threat_scanner::store::ScanRow> = client.call(ipc::Request::RecentScans { limit: *limit, kind: None })?.into_result()?;
+            if scans.is_empty() {
+                println!("No scans yet.");
+            }
+            for s in scans {
+                println!("#{:<5} {:<8} {}  {} file(s), {} detection(s)  {}", s.id, s.kind, s.started_at, s.files_scanned, s.detections, s.targets);
+            }
+        }
+        ServiceCommand::Scan { paths, kind } => {
+            let connect = || ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)));
+            // Events on a connection of their own (see `Request::Subscribe`).
+            let mut events = connect()?;
+            events.call(ipc::Request::Subscribe)?;
+            // Absolute, as the service does not share this working folder;
+            // not canonical, which on Windows means `\\?\C:\…` paths.
+            let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
+            let started: serde_json::Value = connect()?.call(ipc::Request::Scan { paths, kind: kind.clone() })?.into_result()?;
+            let job = started["job"].as_u64().unwrap_or_default();
+            println!("Scanning in the service (job {job})…");
+            loop {
+                let ipc::ServerMessage::Event { event } = events.next_message()? else { continue };
+                if event["job"].as_u64() != Some(job) {
+                    continue;
+                }
+                match event["type"].as_str() {
+                    Some("scan-progress") => eprint!("\r  {} file(s), {} detection(s)   ", event["files"], event["detections"]),
+                    Some("scan-detection") => {
+                        let report = &event["report"];
+                        eprintln!("\r  [{}] {}  {}", report["findings"][0]["category"].as_str().unwrap_or(""), report["findings"][0]["threat"].as_str().unwrap_or(""), report["path"].as_str().unwrap_or(""));
+                    }
+                    Some("scan-finished") => {
+                        let r = &event["report"];
+                        eprintln!();
+                        println!("Done: {} file(s), {} skipped, {} detection(s), {} quarantined (scan {}).", r["files_scanned"], r["files_skipped"], r["detections"], r["quarantined"], r["scan_id"]);
+                        return Ok(if r["detections"].as_i64().unwrap_or(0) > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS });
+                    }
+                    Some("scan-failed") => anyhow::bail!("the scan failed: {}", event["error"].as_str().unwrap_or("")),
+                    _ => {}
+                }
+            }
+        }
+        ServiceCommand::RunBox => {
+            let reply = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?.call(ipc::Request::RunBoxView)?;
+            if reply.needs_approval {
+                anyhow::bail!("this shows every user's Run-box history, so it needs administrator rights");
+            }
+            let view: threat_scanner::rtp::commands::RunBoxView = reply.into_result()?;
+            println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        ServiceCommand::Events => {
+            let mut events = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            events.call(ipc::Request::Subscribe)?;
+            eprintln!("Listening to the service. Press Ctrl+C to stop.");
+            loop {
+                if let ipc::ServerMessage::Event { event } = events.next_message()? {
+                    println!("{event}");
+                }
+            }
+        }
+        ServiceCommand::Settings => {
+            let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            let settings: threat_scanner::service::settings::ProtectionSettings = client.call(ipc::Request::GetSettings)?.into_result()?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        ServiceCommand::Status => {
+            let state = manage::state()?;
+            println!("Service: {}", state.label());
+            if state != State::Running {
+                return Ok(ExitCode::from(1));
+            }
+            match ipc::status_within(std::time::Duration::from_secs(3)) {
+                Ok(status) => {
+                    println!("Version: {} (process {})", status.version, status.pid);
+                    println!("Data:    {}", status.data_dir.display());
+                    let rights = if status.caller.admin { "administrator (elevated)" } else { "standard: changes that weaken protection need approval" };
+                    println!("You:     {}, {rights}", status.caller.user);
+                }
+                Err(e) => {
+                    println!("Pipe:    {e}");
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(windows))]
+fn service_command(_cmd: &ServiceCommand) -> Result<ExitCode> {
+    anyhow::bail!("the protection service is Windows only")
 }
 
 fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {

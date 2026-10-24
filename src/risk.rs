@@ -4,10 +4,10 @@
 //! This is about *type*, not verdict: a risky file is not a threat, it is a
 //! file worth a second look before opening it.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskKind {
     /// Runs as a program or installs one.
@@ -52,7 +52,7 @@ const DOCUMENT_LOOKALIKES: &[&str] = &[
 /// Right-to-left override: renders `exe.pdf` for a name ending in `fdp.exe`.
 const RTL_OVERRIDE: char = '\u{202E}';
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskyFile {
     pub kind: RiskKind,
     /// Lower-case final extension.
@@ -98,7 +98,7 @@ pub fn classify(path: &Path) -> Option<RiskyFile> {
 
 /// Where a download came from, from its Mark of the Web
 /// (the `Zone.Identifier` stream browsers attach to downloads).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadOrigin {
     /// 3 is the Internet zone.
     pub zone: Option<u32>,

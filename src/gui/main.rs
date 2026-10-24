@@ -392,6 +392,20 @@ struct Activity {
     path: Option<PathBuf>,
 }
 
+/// The protection service, as last checked.
+#[derive(Clone)]
+enum ServiceView {
+    NotInstalled,
+    /// Installed but not running (stopped, starting, stopping).
+    Down(&'static str),
+    Running { version: String, user: String, admin: bool },
+    /// Running by Windows' account, but not answering on its pipe.
+    Unreachable(String),
+}
+
+/// How often the service is checked.
+const SERVICE_CHECK_EVERY: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct WatchState {
     running: bool,
@@ -485,6 +499,10 @@ struct App {
     watch: WatchState,
     activity: VecDeque<Activity>,
     last_checkpoint: Instant,
+    // Protection service
+    service: Option<ServiceView>,
+    service_rx: Option<Receiver<ServiceView>>,
+    service_checked: Option<Instant>,
     // History
     history_filter: HistoryFilter,
     expanded: HashMap<i64, ScanDetails>,
@@ -647,6 +665,9 @@ impl App {
             watch: WatchState::default(),
             activity: VecDeque::new(),
             last_checkpoint: Instant::now(),
+            service: None,
+            service_rx: None,
+            service_checked: None,
             history_filter: HistoryFilter::All,
             expanded: HashMap::new(),
             tray,
@@ -1315,6 +1336,30 @@ impl App {
         }
     }
 
+    // ---------- protection service ----------
+
+    /// Picks up the last check and starts the next one every
+    /// [`SERVICE_CHECK_EVERY`], on a thread: a hung service never blocks
+    /// the window.
+    fn poll_service(&mut self, ctx: &egui::Context) {
+        if let Some(view) = self.service_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.service = Some(view);
+            self.service_rx = None;
+        }
+        let due = self.service_checked.is_none_or(|t| t.elapsed() >= SERVICE_CHECK_EVERY);
+        if self.service_rx.is_some() || !due {
+            return;
+        }
+        self.service_checked = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        self.service_rx = Some(rx);
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_service());
+            repaint.request_repaint();
+        });
+    }
+
     // ---------- real-time protection ----------
 
     /// Starts, restarts or stops real-time protection to match settings and engine.
@@ -1655,6 +1700,25 @@ fn threat_notification(report: &FileReport, processes: &[ProcessHit], repeat: bo
     (title, body)
 }
 
+/// The protection service's state, from Windows and from the service itself.
+fn check_service() -> ServiceView {
+    #[cfg(windows)]
+    {
+        use threat_scanner::service::manage::{self, State};
+        match manage::state() {
+            Ok(State::NotInstalled) => ServiceView::NotInstalled,
+            Ok(State::Running) => match threat_scanner::ipc::status_within(Duration::from_secs(3)) {
+                Ok(status) => ServiceView::Running { version: status.version, user: status.caller.user, admin: status.caller.admin },
+                Err(e) => ServiceView::Unreachable(e),
+            },
+            Ok(state) => ServiceView::Down(state.label()),
+            Err(e) => ServiceView::Unreachable(format!("{e:#}")),
+        }
+    }
+    #[cfg(not(windows))]
+    ServiceView::NotInstalled
+}
+
 /// Title and body of the "suspicious command" notification.
 fn command_notification(hit: &CommandHit) -> (String, String) {
     let title = match hit.source {
@@ -1715,6 +1779,7 @@ impl eframe::App for App {
         self.poll_update();
         self.poll_auto_update(ctx);
         self.poll_watch();
+        self.poll_service(ctx);
         self.poll_posture();
         self.poll_fix(ctx);
         self.poll_audit(ctx);

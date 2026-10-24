@@ -9,6 +9,7 @@
 //! queries), whether by this copy or by another one from the same folder
 //! (the app and `phalanx-cli`), are never checked.
 
+use serde::{Deserialize, Serialize};
 use super::process::{self, ProcessInfo};
 use super::{Ctx, RtpEvent};
 use crate::cmdline::{self, Confidence, Match};
@@ -25,7 +26,7 @@ pub const REPEAT_WINDOW: Duration = Duration::from_secs(10 * 60);
 const MAX_RECENT: usize = 1000;
 
 /// Where a suspicious command was seen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CommandSource {
     /// A program that started.
     Program,
@@ -34,7 +35,7 @@ pub enum CommandSource {
 }
 
 /// A command line that matched one or more rules.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandHit {
     pub source: CommandSource,
     pub pid: Option<u32>,
@@ -48,6 +49,9 @@ pub struct CommandHit {
     pub script: Option<String>,
     /// Most confident first.
     pub matches: Vec<Match>,
+    /// Whose Run box it was, when the service watches every user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 impl CommandHit {
@@ -95,6 +99,42 @@ impl Recent {
     }
 }
 
+/// What the service's Run-box reader sees, for diagnosing it (the
+/// service's `RunBoxView` request, administrators only: it shows every
+/// user's Run-box history).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunBoxView {
+    /// A fresh read of every hive under `HKEY_USERS`.
+    pub hives: Vec<HiveView>,
+    /// Errors enumerating `HKEY_USERS` itself.
+    pub enum_errors: Vec<String>,
+    /// What the running all-users watcher last saw.
+    pub watcher: WatcherView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HiveView {
+    pub name: String,
+    /// Counted as a signed-in person's hive (and so watched).
+    pub person: bool,
+    /// The Run-box history read from it, or why it could not be opened.
+    pub run_box: Result<std::collections::BTreeMap<String, String>, String>,
+    /// For people's hives: what Windows reports about the key, and every
+    /// value as enumerated (including errors the reader skips).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WatcherView {
+    /// Passes over every user's Run box since the watcher started.
+    pub passes: u64,
+    /// The hives it watched on its last pass.
+    pub users: Vec<String>,
+    /// Run-box entries it read on its last pass, all users together.
+    pub entries: usize,
+}
+
 /// What history records for a match; nothing is done to the process yet.
 pub const ACTION: &str = "reported (command-line rules are in report-only mode)";
 
@@ -136,6 +176,7 @@ pub(super) fn check_program(ctx: &Ctx<'_>, info: &ProcessInfo, by_pid: &HashMap<
         command,
         script,
         matches: sorted(matches),
+        user: None,
     })
 }
 
@@ -166,7 +207,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// Checks a command added to the Run box's history.
-pub(super) fn check_run_box(ctx: &Ctx<'_>, command: &str) -> Option<CommandHit> {
+pub(super) fn check_run_box(ctx: &Ctx<'_>, command: &str, user: Option<String>) -> Option<CommandHit> {
     let (program, args) = cmdline::split_command(command);
     let host = cmdline::host(program)?;
     let (mut matches, script) = assess(ctx, host, args);
@@ -189,6 +230,7 @@ pub(super) fn check_run_box(ctx: &Ctx<'_>, command: &str) -> Option<CommandHit> 
         parent: None,
         command: command.to_string(),
         script,
+        user,
         matches: sorted(matches),
     })
 }
@@ -258,7 +300,16 @@ fn shorten(text: &str, max: usize) -> String {
 }
 
 #[cfg(windows)]
-pub(super) use run_box::run as run_box;
+pub(super) use run_box::{run as run_box, run_all_users as run_box_all_users};
+#[cfg(windows)]
+pub use run_box::view as run_box_view;
+
+#[cfg(not(windows))]
+pub fn run_box_view() -> RunBoxView {
+    RunBoxView::default()
+}
+#[cfg(all(windows, test))]
+pub(super) use run_box::is_user_hive;
 
 /// Watches the Run box's history (`RunMRU`). ClickFix has the user paste a
 /// command there; the entry is written as the command runs, so this catches
@@ -295,7 +346,7 @@ mod run_box {
             };
             if let Some(seen) = &seen {
                 for (name, command) in &entries {
-                    if seen.get(name) != Some(command) && let Some(hit) = super::check_run_box(ctx, command) {
+                    if seen.get(name) != Some(command) && let Some(hit) = super::check_run_box(ctx, command, None) {
                         super::report(ctx, &store, hit);
                     }
                 }
@@ -309,20 +360,133 @@ mod run_box {
         Ok(())
     }
 
+    /// Every signed-in user's Run box, read from their registry hive under
+    /// `HKEY_USERS` (the service's own `HKEY_CURRENT_USER` is SYSTEM's).
+    /// Read once a second; a user's entries when they are first seen (they
+    /// just signed in) are where they start, not new.
+    pub fn run_all_users(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+        let store = scan::open_store(ctx.data_dir)?;
+        let users = winreg::RegKey::predef(winreg::enums::HKEY_USERS);
+        let mut seen: HashMap<String, HashMap<String, String>> = HashMap::new();
+        while !ctx.halted() {
+            let signed_in: Vec<String> = users.enum_keys().filter_map(Result::ok).filter(|sid| is_user_hive(sid)).collect();
+            seen.retain(|sid, _| signed_in.contains(sid));
+            let mut read_entries = 0;
+            for sid in signed_in.clone() {
+                let entries = users.open_subkey(format!(r"{sid}\{RUN_MRU}")).ok().map(|key| read(&key)).unwrap_or_default();
+                read_entries += entries.len();
+                match seen.get(&sid) {
+                    None => {}
+                    Some(before) => {
+                        for (name, command) in &entries {
+                            if before.get(name) != Some(command) && let Some(hit) = super::check_run_box(ctx, command, Some(account_name(&sid))) {
+                                super::report(ctx, &store, hit);
+                            }
+                        }
+                    }
+                }
+                seen.insert(sid, entries);
+            }
+            {
+                let mut watcher = WATCHER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                watcher.passes += 1;
+                watcher.users = signed_in;
+                watcher.entries = read_entries;
+            }
+            ctx.pause(Duration::from_secs(1));
+        }
+        Ok(())
+    }
+
+    /// What the running all-users watcher last saw.
+    static WATCHER: std::sync::Mutex<super::WatcherView> = std::sync::Mutex::new(super::WatcherView { passes: 0, users: Vec::new(), entries: 0 });
+
+    /// A fresh read of every hive's Run box, the way the watcher reads
+    /// them, and what the watcher itself last saw.
+    pub fn view() -> super::RunBoxView {
+        let users = winreg::RegKey::predef(winreg::enums::HKEY_USERS);
+        let mut view = super::RunBoxView::default();
+        for name in users.enum_keys() {
+            match name {
+                Ok(name) => {
+                    let key = users.open_subkey(format!(r"{name}\{RUN_MRU}"));
+                    let person = is_user_hive(&name);
+                    let mut detail = Vec::new();
+                    if let (true, Ok(key)) = (person, &key) {
+                        match key.query_info() {
+                            Ok(info) => {
+                                let t = info.get_last_write_time_system();
+                                detail.push(format!(
+                                    "Windows reports {} value(s), {} subkey(s), last written {}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                                    info.values, info.sub_keys, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+                                ))
+                            }
+                            Err(e) => detail.push(format!("query_info failed: {e}")),
+                        }
+                        for (i, value) in key.enum_values().enumerate() {
+                            detail.push(match value {
+                                Ok((n, v)) => format!("value {i}: {n} ({:?}, {} bytes) = {:?}", v.vtype, v.bytes.len(), key.get_value::<String, _>(&n)),
+                                Err(e) => format!("value {i}: error {e}"),
+                            });
+                        }
+                    }
+                    let run_box = key.map(|key| read(&key).into_iter().collect()).map_err(|e| e.to_string());
+                    view.hives.push(super::HiveView { person, name, run_box, detail });
+                }
+                Err(e) => view.enum_errors.push(e.to_string()),
+            }
+        }
+        view.watcher = WATCHER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        view
+    }
+
+    /// A signed-in person's hive: `S-1-5-21-…`, not its `_Classes` part and
+    /// not the system's own accounts.
+    pub(crate) fn is_user_hive(name: &str) -> bool {
+        name.starts_with("S-1-5-21-") && !name.ends_with("_Classes")
+    }
+
+    /// `DOMAIN\user` for a SID, or the SID itself.
+    fn account_name(sid: &str) -> String {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::{LookupAccountSidW, PSID, SID_NAME_USE};
+        let wide: Vec<u16> = sid.encode_utf16().chain([0]).collect();
+        unsafe {
+            let mut psid: PSID = std::ptr::null_mut();
+            if ConvertStringSidToSidW(wide.as_ptr(), &mut psid) == 0 {
+                return sid.to_string();
+            }
+            let (mut name, mut domain) = ([0u16; 256], [0u16; 256]);
+            let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+            let mut kind: SID_NAME_USE = 0;
+            let ok = LookupAccountSidW(std::ptr::null(), psid, name.as_mut_ptr(), &mut name_len, domain.as_mut_ptr(), &mut domain_len, &mut kind) != 0;
+            LocalFree(psid as _);
+            if !ok {
+                return sid.to_string();
+            }
+            let name = String::from_utf16_lossy(&name[..name_len as usize]);
+            let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+            if domain.is_empty() { name } else { format!("{domain}\\{name}") }
+        }
+    }
+
     /// The commands in the Run box's history, by value name (`a`, `b`…).
     fn entries() -> Option<HashMap<String, String>> {
         let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).open_subkey(RUN_MRU).ok()?;
-        Some(
-            key.enum_values()
-                .filter_map(Result::ok)
-                .filter(|(name, _)| !name.eq_ignore_ascii_case("MRUList"))
-                .filter_map(|(name, _)| {
-                    let data: String = key.get_value(&name).ok()?;
-                    // Explorer appends `\1` to each entry.
-                    Some((name, data.strip_suffix(r"\1").unwrap_or(&data).to_string()))
-                })
-                .collect(),
-        )
+        Some(read(&key))
+    }
+
+    fn read(key: &winreg::RegKey) -> HashMap<String, String> {
+        key.enum_values()
+            .filter_map(Result::ok)
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("MRUList"))
+            .filter_map(|(name, _)| {
+                let data: String = key.get_value(&name).ok()?;
+                // Explorer appends `\1` to each entry.
+                Some((name, data.strip_suffix(r"\1").unwrap_or(&data).to_string()))
+            })
+            .collect()
     }
 
     /// A pending change notification on the RunMRU key.

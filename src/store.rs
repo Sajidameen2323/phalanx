@@ -3,7 +3,7 @@
 use crate::Finding;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const SCHEMA: &str = "
@@ -76,7 +76,7 @@ pub struct Store {
     conn: Connection,
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ScanStats {
     pub files_scanned: i64,
     pub bytes_scanned: i64,
@@ -86,7 +86,7 @@ pub struct ScanStats {
     pub quarantined: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanRow {
     pub id: i64,
     pub kind: String,
@@ -105,13 +105,13 @@ pub struct ScanRow {
     pub signatures: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanErrorRow {
     pub path: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionRow {
     pub id: i64,
     pub scan_id: i64,
@@ -123,7 +123,7 @@ pub struct DetectionRow {
     pub action: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineRow {
     pub id: String,
     pub original_path: String,
@@ -134,7 +134,7 @@ pub struct QuarantineRow {
     pub restored_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonthRow {
     pub month: String,
     pub scans: i64,
@@ -158,6 +158,43 @@ impl Store {
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Copies every scan, detection, scan error and quarantine record from
+    /// the history database at `other` into this one, which must be empty
+    /// (ids are kept). Columns are matched by name, so an older database
+    /// with fewer columns imports too. Returns the scans and quarantine
+    /// records imported.
+    pub fn import(&self, other: &Path) -> Result<(i64, i64)> {
+        let count = |table: &str| -> Result<i64> { Ok(self.conn.query_row(&format!("SELECT COUNT(*) FROM main.{table}"), [], |r| r.get(0))?) };
+        if count("Scans")? + count("Quarantine")? > 0 {
+            anyhow::bail!("the history here is not empty");
+        }
+        self.conn.execute("ATTACH DATABASE ?1 AS old", [other.display().to_string()])?;
+        let imported = (|| -> Result<(i64, i64)> {
+            let tx = self.conn.unchecked_transaction()?;
+            // Parents before children (foreign keys).
+            for table in ["Scans", "Detections", "ScanErrors", "Quarantine"] {
+                let columns = |schema: &str| -> Result<Vec<String>> {
+                    Ok(self
+                        .conn
+                        .prepare(&format!("SELECT name FROM pragma_table_info('{table}', '{schema}')"))?
+                        .query_map([], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?)
+                };
+                let here = columns("main")?;
+                let shared: Vec<String> = columns("old")?.into_iter().filter(|c| here.iter().any(|h| h.eq_ignore_ascii_case(c))).collect();
+                if shared.is_empty() {
+                    continue;
+                }
+                let list = shared.join(", ");
+                tx.execute(&format!("INSERT INTO main.{table} ({list}) SELECT {list} FROM old.{table}"), [])?;
+            }
+            tx.commit()?;
+            Ok((count("Scans")?, count("Quarantine")?))
+        })();
+        self.conn.execute("DETACH DATABASE old", [])?;
+        imported
     }
 
     fn migrate(&self) -> Result<()> {
@@ -262,6 +299,19 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// A detection's SHA-256, worst threat and action, if scan `scan_id`
+    /// recorded one at `path`.
+    pub fn detection_record(&self, scan_id: i64, path: &str) -> Result<Option<(String, String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT Sha256, Threat, Action FROM Detections WHERE ScanId = ?1 AND Path = ?2 ORDER BY Id LIMIT 1",
+                params![scan_id, path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
     }
 
     /// Records the action taken on a detection after its scan finished (a

@@ -13,6 +13,10 @@ path = "src/gui/main.rs"
 name = "phalanx-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "phalanx-service"
+path = "src/service_main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
@@ -41,5 +45,6 @@ sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["aes2
 
 [target."cfg(windows)".dependencies]
 raw-window-handle = "0.6.2"
-windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_Security_WinTrust", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Wdk_System_Threading"] }
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_Security_WinTrust", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Wdk_System_Threading", "Win32_System_Pipes", "Win32_Security_Authorization"] }
 winreg = "0.56.0"

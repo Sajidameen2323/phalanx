@@ -91,6 +91,28 @@ The icon assets in `assets/` come from the Phalanx logo:
 
 The first build takes several minutes, mostly compiling YARA-X's WebAssembly JIT.
 
+### Protection service (in development)
+
+Protection is moving into a Windows service, so that it keeps running when the app
+is closed and programs running as the user cannot switch it off; see
+[docs/protection-service.md](docs/protection-service.md). So far the build adds
+`phalanx-service.exe`, the pipe the app and CLI talk to it on, and:
+
+```
+phalanx-cli service install     # as administrator: install and start it
+phalanx-cli service status      # any user: is it running, and who am I to it
+phalanx-cli service stop | start | uninstall
+phalanx-cli service migrate     # as administrator, once: bring your data over
+phalanx-cli service scan D:\    # scan in the service, with progress
+phalanx-cli service events      # watch what the service reports
+phalanx-cli service settings | history
+phalanx-service --console --pipe \\.\pipe\phalanx-dev --data-dir D:\dev-data
+```
+
+The installed service runs real-time protection (when it is turned on in its
+settings) and scans, with its data in `%ProgramData%\Phalanx`. The app does not use
+it yet: it keeps protecting as before until it switches to the service.
+
 ### Installer
 
 ```
@@ -190,7 +212,10 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
   comments (`src/cmdline.rs`, shared with the Stealer check). An `-EncodedCommand` is
   decoded and its script also goes through the signatures. New entries in the Run
   box's history (`RunMRU`) are checked the same way, which catches a pasted command
-  even when it exits too quickly for the program monitor. Every match is shown in the
+  even when it exits too quickly for the program monitor. Windows keeps that history
+  only while "Track app launches" is on (Privacy page, `Start_TrackProgs`); with it
+  off, the program monitor still catches what the command starts, and a command
+  started by Explorer is reported as coming from the Run box. Every match is shown in the
   activity log. High-confidence ones are also recorded in History (kind `COMMAND`,
   category suspicious) and notify; medium-confidence ones (encoded commands, hidden
   windows, `Invoke-Expression` alone, all common in admin tools and terminals) are

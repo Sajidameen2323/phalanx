@@ -547,10 +547,49 @@ impl App {
         }
     }
 
+    /// The protection service: whether it is installed, running and answering.
+    fn service_card(&self, ui: &mut Ui) {
+        let (color, title, detail) = match &self.service {
+            None => (theme().muted, "Checking the protection service…".to_string(), String::new()),
+            Some(ServiceView::NotInstalled) => (
+                theme().muted,
+                "Protection service: not installed".to_string(),
+                "Protection runs inside this app for now. The service is being built to keep protecting when the app is closed and nobody is signed in.".to_string(),
+            ),
+            Some(ServiceView::Down(state)) => (
+                theme().amber,
+                format!("Protection service: {state}"),
+                "Windows restarts it automatically after a failure. An administrator can start it with `phalanx-cli service start`.".to_string(),
+            ),
+            Some(ServiceView::Running { version, user, admin }) => (
+                theme().green,
+                format!("Protection service: running ({version})"),
+                if *admin {
+                    format!("Signed in as {user}, an administrator: you can change every setting.")
+                } else {
+                    format!("Signed in as {user}. Changes that weaken protection will need an administrator's approval.")
+                },
+            ),
+            Some(ServiceView::Unreachable(e)) => (theme().red, "Protection service: not answering".to_string(), capitalize(e)),
+        };
+        card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                status_dot(ui, color, 6.0);
+                ui.label(RichText::new(title).size(16.0).strong().color(theme().text));
+            });
+            if !detail.is_empty() {
+                small(ui, detail);
+            }
+        });
+    }
+
     fn protection_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         page_header(ui, "Protection");
 
         self.security_card(ui, ctx);
+        ui.add_space(14.0);
+
+        self.service_card(ui);
         ui.add_space(14.0);
 
         let mut toggle = false;
