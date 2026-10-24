@@ -7,7 +7,7 @@
 //! web-protection lists and the saved Windows DNS settings, and the
 //! downloaded signatures. The old folder is left as it was.
 
-use super::data::{set_permissions, QUARANTINE};
+use super::data::{set_permissions, QUARANTINE, SECRET_SDDL};
 use super::settings::ProtectionSettings;
 use crate::scan;
 use anyhow::{bail, Context, Result};
@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 pub const MARKER: &str = "migrated.json";
 /// The abuse.ch key is a secret: administrators only, unlike the rest.
 const SECRET_FILES: &[&str] = &["signatures/abuse-ch-key"];
-const SECRET_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Migrated {

@@ -19,6 +19,9 @@ use crate::risk::{DownloadOrigin, RiskyFile};
 use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
+use crate::service::web::WebStatus;
+use crate::web::events::WebEvent;
+use crate::web::{SiteChange, WebConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -68,8 +71,14 @@ pub enum Request {
     },
     /// Delete a quarantined file for good.
     DeleteQuarantined { item: String },
-    /// Bring a user's data from before the service (once).
-    Migrate { from: PathBuf },
+    /// Bring a user's data from before the service (once). The abuse.ch
+    /// key travels decrypted: the user's copy is encrypted for the user, and
+    /// the service (SYSTEM) cannot read it.
+    Migrate {
+        from: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_key: Option<String>,
+    },
     /// Send this connection every [`Event`] from now on. It then only
     /// carries events: send requests on another connection.
     Subscribe,
@@ -88,6 +97,22 @@ pub enum Request {
     /// file the service itself detected, recorded in its history and
     /// unchanged since, is moved.
     QuarantineDetection { scan: i64, path: PathBuf },
+    /// Download new signatures and web rules now (every feed with `force`).
+    UpdateSignatures {
+        #[serde(default)]
+        force: bool,
+    },
+    /// Save (or, with `None`, remove) the abuse.ch Auth-Key.
+    SetAuthKey { key: Option<String> },
+    /// The web protection settings.
+    GetWebSettings,
+    /// Replace the web protection settings; weakening needs an administrator.
+    SetWebSettings { settings: WebConfig },
+    /// Block, unblock, allow or stop allowing one site (the browser's
+    /// buttons). Unblocking and allowing need an administrator.
+    ChangeSite { change: SiteChange, site: String },
+    /// Whether the DNS filter runs and how many web rules are loaded.
+    WebStatus,
 }
 
 /// What the service reports to subscribed clients: real-time protection
@@ -118,6 +143,14 @@ pub enum Event {
     ScanDetection { job: u64, report: FileReport },
     ScanFinished { job: u64, report: ScanReport },
     ScanFailed { job: u64, error: String },
+    UpdateProgress { step: String },
+    /// `installed`: new signatures or web rules are in use.
+    UpdateFinished { installed: bool, last_success: Option<String>, failed: Vec<String> },
+    UpdateFailed { error: String },
+    /// Web settings applied: the rules loaded and the DNS filter running or not.
+    WebApplied { status: WebStatus },
+    /// The DNS filter blocked (or reported) a site.
+    Web { event: WebEvent },
 }
 
 impl From<RtpEvent> for Event {
@@ -150,9 +183,9 @@ pub enum Allowed {
 }
 
 impl Request {
-    /// Who may make the request. `SetSettings` is let through here; the
-    /// service then asks for an administrator if the change weakens
-    /// protection.
+    /// Who may make the request. `SetSettings`, `SetWebSettings` and
+    /// `ChangeSite` are let through here; the service then asks for an
+    /// administrator if the change weakens protection.
     pub fn allowed(&self) -> Allowed {
         match self {
             Request::Ping
@@ -168,8 +201,18 @@ impl Request {
             | Request::ProtectionStatus
             | Request::Scan { .. }
             | Request::CancelScan { .. }
-            | Request::QuarantineDetection { .. } => Allowed::Anyone,
-            Request::Stop | Request::Restore { .. } | Request::DeleteQuarantined { .. } | Request::Migrate { .. } | Request::RunBoxView => {
+            | Request::QuarantineDetection { .. }
+            | Request::UpdateSignatures { .. }
+            | Request::GetWebSettings
+            | Request::SetWebSettings { .. }
+            | Request::ChangeSite { .. }
+            | Request::WebStatus => Allowed::Anyone,
+            Request::Stop
+            | Request::Restore { .. }
+            | Request::DeleteQuarantined { .. }
+            | Request::Migrate { .. }
+            | Request::RunBoxView
+            | Request::SetAuthKey { .. } => {
                 Allowed::Administrator
             }
         }
