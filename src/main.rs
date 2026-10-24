@@ -20,6 +20,10 @@ struct Cli {
     /// Defaults to %LOCALAPPDATA%\threat-scanner (or ~/.threat-scanner).
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+    /// For development: the pipe of a `phalanx-service --console` run (as
+    /// PHALANX_PIPE, which an elevated copy does not inherit).
+    #[arg(long, global = true, hide = true)]
+    pipe: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -188,6 +192,32 @@ enum ServiceCommand {
     },
     /// The web protection settings and whether the DNS filter runs.
     Web,
+    /// Replace the protection settings with these (JSON, hex-encoded, as
+    /// the app passes them when a change needs approval).
+    SetSettings {
+        #[arg(long)]
+        json: String,
+    },
+    /// Replace the web settings with these (JSON, hex-encoded).
+    SetWebSettings {
+        #[arg(long)]
+        json: String,
+    },
+    /// Put a quarantined file back (administrator).
+    Restore {
+        id: String,
+        /// Overwrite a file now at the original place.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete a quarantined file for good (administrator).
+    DeleteQuarantined { id: String },
+    /// Quarantine a file no scan detected (administrator).
+    Quarantine {
+        path: PathBuf,
+        #[arg(long, default_value = "Quarantined.ByUser")]
+        threat: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -486,6 +516,10 @@ fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let cli = Cli::parse();
+    if let Some(pipe) = &cli.pipe {
+        // SAFETY: no other thread runs yet.
+        unsafe { std::env::set_var(threat_scanner::ipc::PIPE_ENV, pipe) };
+    }
     let dir = data_dir(&cli);
     let store = scan::open_store(&dir)?;
 
@@ -1140,6 +1174,29 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             let _: serde_json::Value = reply.into_result()?;
             println!("{}", if key.is_some() { "The abuse.ch Auth-Key is saved in the service." } else { "The abuse.ch Auth-Key is removed." });
         }
+        ServiceCommand::SetSettings { json } => {
+            let settings = serde_json::from_slice(&hex::decode(json.trim())?)?;
+            let _: serde_json::Value = approved(connect()?.call(ipc::Request::SetSettings { settings })?)?;
+            println!("The protection settings are saved.");
+        }
+        ServiceCommand::SetWebSettings { json } => {
+            let settings = serde_json::from_slice(&hex::decode(json.trim())?)?;
+            let _: serde_json::Value = approved(connect()?.call(ipc::Request::SetWebSettings { settings })?)?;
+            println!("The web settings are saved.");
+        }
+        ServiceCommand::Restore { id, force } => {
+            let path: PathBuf = approved(connect()?.call(ipc::Request::Restore { item: id.clone(), force: *force })?)?;
+            println!("Restored to {}.", path.display());
+        }
+        ServiceCommand::DeleteQuarantined { id } => {
+            let _: serde_json::Value = approved(connect()?.call(ipc::Request::DeleteQuarantined { item: id.clone() })?)?;
+            println!("Deleted {id} for good.");
+        }
+        ServiceCommand::Quarantine { path, threat } => {
+            let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+            let id: String = approved(connect()?.call(ipc::Request::QuarantineFile { path, threat: threat.clone() })?)?;
+            println!("Quarantined ({id}).");
+        }
         ServiceCommand::Web => {
             let mut client = connect()?;
             let settings: serde_json::Value = client.call(ipc::Request::GetWebSettings)?.into_result()?;
@@ -1182,6 +1239,15 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The result of a reply, or that it needs an administrator.
+#[cfg(windows)]
+fn approved<T: serde::de::DeserializeOwned>(reply: threat_scanner::ipc::Reply) -> Result<T> {
+    if reply.needs_approval {
+        anyhow::bail!("{}: run this from a terminal opened as administrator", reply.error.unwrap_or_default());
+    }
+    Ok(reply.into_result()?)
 }
 
 #[cfg(not(windows))]

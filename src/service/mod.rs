@@ -123,6 +123,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                 id,
                 settings.save(dir).map(|()| {
                     ctx.reapply(settings.clone());
+                    ctx.hub.send(&crate::ipc::Event::SettingsChanged { settings: settings.clone() });
                     settings
                 }),
             )
@@ -154,8 +155,11 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                 Ok(done)
             });
             if done.is_ok() {
-                ctx.reapply(ProtectionSettings::load(dir).unwrap_or_default());
-                ctx.reapply_web(WebConfig::load(dir).unwrap_or_default());
+                let (settings, web) = (ProtectionSettings::load(dir).unwrap_or_default(), WebConfig::load(dir).unwrap_or_default());
+                ctx.hub.send(&crate::ipc::Event::SettingsChanged { settings: settings.clone() });
+                ctx.hub.send(&crate::ipc::Event::WebSettingsChanged { settings: web.clone() });
+                ctx.reapply(settings);
+                ctx.reapply_web(web);
             }
             reply(id, done)
         }
@@ -176,6 +180,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                 id,
                 settings.save(dir).map(|()| {
                     ctx.reapply_web(settings.clone());
+                    ctx.hub.send(&crate::ipc::Event::WebSettingsChanged { settings: settings.clone() });
                     settings
                 }),
             )
@@ -196,12 +201,14 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                     id,
                     config.save(dir).map(|()| {
                         ctx.reapply_web(config.clone());
+                        ctx.hub.send(&crate::ipc::Event::WebSettingsChanged { settings: config.clone() });
                         json!({ "site": host, "settings": config })
                     }),
                 ),
             }
         }
         Request::WebStatus => reply(id, Ok(ctx.web.status())),
+        Request::QuarantineFile { path, threat } => reply(id, session.store(dir).and_then(|s| quarantine_any(s, dir, &plain(&path), &threat))),
         // Handled by the connection itself (see `imp::serve`).
         Request::Subscribe => Reply::ok(id, json!("subscribed")),
         Request::ProtectionStatus => reply(id, Ok(ctx.protector.status())),
@@ -216,6 +223,24 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
         },
         Request::QuarantineDetection { scan, path } => reply(id, session.store(dir).and_then(|s| quarantine_detection(s, dir, scan, &path))),
     }
+}
+
+/// Quarantines `path` as `threat`, whatever it is (an administrator asked).
+fn quarantine_any(store: &Store, dir: &Path, path: &Path, threat: &str) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    drop(file);
+    scan::quarantine_file(store, dir, path, &hex::encode(hasher.finalize()), threat)
 }
 
 /// One spelling per file in history: `\\?\C:\x` is `C:\x`, and
