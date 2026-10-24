@@ -127,6 +127,21 @@ enum ServiceCommand {
     /// Whether the service is installed and running, and who it thinks you
     /// are (exit code 1 if it is not running).
     Status,
+    /// Bring your data from before the service (settings, history,
+    /// quarantine, web lists, signatures) into the service's folder, once.
+    /// Needs administrator rights.
+    Migrate {
+        /// The folder to bring over. Default: %LOCALAPPDATA%\threat-scanner.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Recent scans, as the service keeps them.
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// The protection settings, as the service keeps them (JSON).
+    Settings,
 }
 
 #[derive(Subcommand)]
@@ -938,6 +953,35 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             manage::stop(std::time::Duration::from_secs(20))?;
             println!("The Phalanx service is stopped.");
         }
+        ServiceCommand::Migrate { from } => {
+            let from = from.clone().unwrap_or_else(scan::default_data_dir);
+            let reply = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?.call(ipc::Request::Migrate { from: from.clone() })?;
+            if reply.needs_approval {
+                anyhow::bail!("migrating needs administrator rights: run this from a terminal opened as administrator");
+            }
+            let done: threat_scanner::service::migrate::Migrated = reply.into_result()?;
+            println!("Brought over from {}:", done.from.display());
+            println!("    settings:   {}", if done.settings { "yes" } else { "none found" });
+            println!("    history:    {} scan(s)", done.scans);
+            println!("    quarantine: {} record(s), {} file(s)", done.quarantined, done.files);
+            println!("    other:      {} file(s) (web lists, DNS backup, signatures)", done.copied);
+            println!("The old folder was left as it was.");
+        }
+        ServiceCommand::History { limit } => {
+            let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            let scans: Vec<threat_scanner::store::ScanRow> = client.call(ipc::Request::RecentScans { limit: *limit, kind: None })?.into_result()?;
+            if scans.is_empty() {
+                println!("No scans yet.");
+            }
+            for s in scans {
+                println!("#{:<5} {:<8} {}  {} file(s), {} detection(s)  {}", s.id, s.kind, s.started_at, s.files_scanned, s.detections, s.targets);
+            }
+        }
+        ServiceCommand::Settings => {
+            let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            let settings: threat_scanner::service::settings::ProtectionSettings = client.call(ipc::Request::GetSettings)?.into_result()?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
         ServiceCommand::Status => {
             let state = manage::state()?;
             println!("Service: {}", state.label());
@@ -947,6 +991,7 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             match ipc::status_within(std::time::Duration::from_secs(3)) {
                 Ok(status) => {
                     println!("Version: {} (process {})", status.version, status.pid);
+                    println!("Data:    {}", status.data_dir.display());
                     let rights = if status.caller.admin { "administrator (elevated)" } else { "standard: changes that weaken protection need approval" };
                     println!("You:     {}, {rights}", status.caller.user);
                 }

@@ -3,12 +3,22 @@
 //! tests and `phalanx-service --console` run it in-process, on a private
 //! pipe name. See `docs/protection-service.md` for the design.
 
+pub mod data;
+pub mod migrate;
+pub mod settings;
 #[cfg(windows)]
 pub mod manage;
 
 use crate::ipc::{Caller, ClientMessage, Reply, Request, Status};
+use crate::quarantine::Quarantine;
+use crate::scan;
+use crate::store::Store;
+use serde::Serialize;
 use serde_json::json;
+use settings::ProtectionSettings;
 use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// The service's name in Windows' service manager.
 pub const SERVICE_NAME: &str = "Phalanx";
@@ -18,28 +28,91 @@ pub const DESCRIPTION: &str = "Phalanx's real-time protection, web protection an
 /// What the request handler needs to know about the running service.
 struct Context {
     started: u64,
+    data_dir: PathBuf,
+    /// One settings change (or migration) at a time.
+    settings: Mutex<()>,
     /// Told when an administrator asks the service to stop.
     stop_requested: std::sync::mpsc::Sender<()>,
 }
 
+/// One client's connection: its history database, opened when first needed.
+#[derive(Default)]
+struct Session {
+    store: Option<Store>,
+}
+
+impl Session {
+    fn store(&mut self, data_dir: &Path) -> anyhow::Result<&Store> {
+        if self.store.is_none() {
+            self.store = Some(scan::open_store(data_dir)?);
+        }
+        Ok(self.store.as_ref().expect("just opened"))
+    }
+}
+
+fn reply<T: Serialize>(id: u64, result: anyhow::Result<T>) -> Reply {
+    match result.and_then(|value| Ok(serde_json::to_value(value)?)) {
+        Ok(value) => Reply::ok(id, value),
+        Err(e) => Reply::error(id, format!("{e:#}")),
+    }
+}
+
 /// Answers one request from `caller`.
-fn handle(ctx: &Context, caller: &Caller, message: ClientMessage) -> Reply {
+fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: ClientMessage) -> Reply {
     let id = message.id;
     if !caller.may(&message.request) {
         return Reply::needs_approval(id);
     }
+    let dir = ctx.data_dir.as_path();
     match message.request {
         Request::Ping => Reply::ok(id, json!("pong")),
-        Request::Status => {
-            let status = Status { version: env!("CARGO_PKG_VERSION").into(), pid: std::process::id(), started: ctx.started, caller: caller.clone() };
-            match serde_json::to_value(status) {
-                Ok(value) => Reply::ok(id, value),
-                Err(e) => Reply::error(id, e.to_string()),
-            }
-        }
+        Request::Status => reply(
+            id,
+            Ok(Status {
+                version: env!("CARGO_PKG_VERSION").into(),
+                pid: std::process::id(),
+                started: ctx.started,
+                caller: caller.clone(),
+                data_dir: ctx.data_dir.clone(),
+            }),
+        ),
         Request::Stop => {
             let _ = ctx.stop_requested.send(());
             Reply::ok(id, json!("stopping"))
+        }
+        Request::GetSettings => reply(id, ProtectionSettings::load(dir)),
+        Request::SetSettings { settings } => {
+            let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
+            let current = match ProtectionSettings::load(dir) {
+                Ok(current) => current,
+                Err(e) => return Reply::error(id, format!("{e:#}")),
+            };
+            let weaker = current.weakened_by(&settings);
+            if !weaker.is_empty() && !caller.admin {
+                return Reply::needs_approval_because(id, &weaker);
+            }
+            reply(id, settings.save(dir).map(|()| settings))
+        }
+        Request::RecentScans { limit, kind } => reply(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
+        Request::ScanDetails { scan } => reply(
+            id,
+            session.store(dir).and_then(|s| Ok(json!({ "detections": s.scan_detections(scan)?, "errors": s.scan_errors(scan)? }))),
+        ),
+        Request::RecentDetections { limit } => reply(id, session.store(dir).and_then(|s| s.recent_detections(limit))),
+        Request::MonthlySummary => reply(id, session.store(dir).and_then(|s| s.monthly_summary())),
+        Request::Quarantine { include_restored } => reply(id, session.store(dir).and_then(|s| s.quarantine_items(include_restored))),
+        Request::Restore { item, force } => reply(
+            id,
+            session.store(dir).and_then(|s| Quarantine::new(scan::quarantine_dir(dir), s)?.restore(&item, force)),
+        ),
+        Request::DeleteQuarantined { item } => {
+            reply(id, session.store(dir).and_then(|s| Quarantine::new(scan::quarantine_dir(dir), s)?.delete(&item)))
+        }
+        Request::Migrate { from } => {
+            let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
+            // Reopened after the import, so this session sees it.
+            session.store = None;
+            reply(id, migrate::migrate(&from, dir))
         }
     }
 }
@@ -66,11 +139,14 @@ impl Running {
 }
 
 /// Starts the service on the pipe `pipe_name` ([`crate::ipc::PIPE_NAME`] for
-/// the real service). Fails if another process already holds the name.
-pub fn start(pipe_name: &str) -> io::Result<Running> {
+/// the real service), keeping its data in `data_dir` (for the real service,
+/// [`data::machine_data_dir`] after [`data::prepare`]). Fails if another
+/// process already holds the pipe name.
+pub fn start(pipe_name: &str, data_dir: &Path) -> io::Result<Running> {
+    std::fs::create_dir_all(data_dir)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let ctx = Context { started, stop_requested: tx };
+    let ctx = Context { started, data_dir: data_dir.to_path_buf(), settings: Mutex::new(()), stop_requested: tx };
     #[cfg(windows)]
     {
         Ok(Running { _server: imp::start(pipe_name, ctx)?, stop_requests: rx })
@@ -134,6 +210,7 @@ mod imp {
         let Ok(read) = connection.file.try_clone() else { return };
         let mut writer = &connection.file;
         let mut caller = None;
+        let mut session = super::Session::default();
         for line in BufReader::new(read).lines() {
             let Ok(line) = line else { break };
             if line.trim().is_empty() {
@@ -146,7 +223,7 @@ mod imp {
             let reply = match (serde_json::from_str::<ClientMessage>(&line), &caller) {
                 (Err(e), _) => Reply::error(0, format!("not a request: {e}")),
                 (Ok(message), None) => Reply::error(message.id, "could not tell who is asking"),
-                (Ok(message), Some(caller)) => handle(ctx, caller, message),
+                (Ok(message), Some(caller)) => handle(ctx, &mut session, caller, message),
             };
             let Ok(mut text) = serde_json::to_string(&ServerMessage::Reply(reply)) else { break };
             text.push('\n');

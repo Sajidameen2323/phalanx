@@ -15,8 +15,10 @@
 #[cfg(windows)]
 mod pipe;
 
+use crate::service::settings::ProtectionSettings;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::Duration;
 
@@ -33,6 +35,38 @@ pub enum Request {
     Status,
     /// Stop the service (it is restarted only by Windows or an administrator).
     Stop,
+    /// The protection settings.
+    GetSettings,
+    /// Replace the protection settings. Anyone may strengthen them; a
+    /// change that weakens them needs an administrator.
+    SetSettings { settings: ProtectionSettings },
+    /// Recent scans, newest first; `kind` limits them to one kind.
+    RecentScans {
+        limit: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    },
+    /// A scan's detections and errors. (Fields are not called `id`: that is
+    /// the message's own.)
+    ScanDetails { scan: i64 },
+    RecentDetections { limit: u32 },
+    /// Totals per month.
+    MonthlySummary,
+    /// Quarantined files (and, with `include_restored`, restored ones).
+    Quarantine {
+        #[serde(default)]
+        include_restored: bool,
+    },
+    /// Put a quarantined file back where it was.
+    Restore {
+        item: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Delete a quarantined file for good.
+    DeleteQuarantined { item: String },
+    /// Bring a user's data from before the service (once).
+    Migrate { from: PathBuf },
 }
 
 /// Who may make a request.
@@ -45,10 +79,21 @@ pub enum Allowed {
 }
 
 impl Request {
+    /// Who may make the request. `SetSettings` is let through here; the
+    /// service then asks for an administrator if the change weakens
+    /// protection.
     pub fn allowed(&self) -> Allowed {
         match self {
-            Request::Ping | Request::Status => Allowed::Anyone,
-            Request::Stop => Allowed::Administrator,
+            Request::Ping
+            | Request::Status
+            | Request::GetSettings
+            | Request::SetSettings { .. }
+            | Request::RecentScans { .. }
+            | Request::ScanDetails { .. }
+            | Request::RecentDetections { .. }
+            | Request::MonthlySummary
+            | Request::Quarantine { .. } => Allowed::Anyone,
+            Request::Stop | Request::Restore { .. } | Request::DeleteQuarantined { .. } | Request::Migrate { .. } => Allowed::Administrator,
         }
     }
 }
@@ -94,6 +139,19 @@ impl Reply {
     pub fn needs_approval(id: u64) -> Self {
         Self { needs_approval: true, ..Self::error(id, "this weakens protection, so it needs an administrator's approval") }
     }
+
+    /// Refused because the change weakens protection in these ways.
+    pub fn needs_approval_because(id: u64, reasons: &[String]) -> Self {
+        Self { needs_approval: true, ..Self::error(id, format!("this weakens protection ({}), so it needs an administrator's approval", reasons.join("; "))) }
+    }
+
+    /// The result as `T`, or the service's error.
+    pub fn into_result<T: serde::de::DeserializeOwned>(self) -> io::Result<T> {
+        if !self.ok {
+            return Err(io::Error::other(self.error.unwrap_or_else(|| "the service refused".into())));
+        }
+        serde_json::from_value(self.result).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
 
 /// Who is on the other end of a connection, from their token.
@@ -125,6 +183,8 @@ pub struct Status {
     pub started: u64,
     /// Who the service thinks asked.
     pub caller: Caller,
+    /// Where the service keeps its data.
+    pub data_dir: PathBuf,
 }
 
 /// The pipe server, as the service runs it.
@@ -162,7 +222,8 @@ impl Client {
         }
     }
 
-    /// Sends `request` and waits for its reply, skipping events.
+    /// Sends `request` and waits for its reply, skipping events. Ids start
+    /// at 1; the service answers a request it cannot read with id 0.
     pub fn call(&mut self, request: Request) -> io::Result<Reply> {
         let id = self.next_id;
         self.next_id += 1;
@@ -172,6 +233,10 @@ impl Client {
         loop {
             match self.next_message()? {
                 ServerMessage::Reply(reply) if reply.id == id => return Ok(reply),
+                // Id 0: the service could not read the request at all.
+                ServerMessage::Reply(reply) if reply.id == 0 => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, reply.error.unwrap_or_default()))
+                }
                 _ => continue,
             }
         }
@@ -188,11 +253,7 @@ impl Client {
 
     /// The service's status, or why it could not be had.
     pub fn status(&mut self) -> io::Result<Status> {
-        let reply = self.call(Request::Status)?;
-        if !reply.ok {
-            return Err(io::Error::other(reply.error.unwrap_or_default()));
-        }
-        serde_json::from_value(reply.result).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        self.call(Request::Status)?.into_result()
     }
 }
 

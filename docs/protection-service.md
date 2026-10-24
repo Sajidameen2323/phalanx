@@ -124,13 +124,30 @@ Each one ends with the app working and the tests passing.
    `src/service_main.rs`).* The pipe refuses to share its name; users can
    connect but not add pipe instances; clients only trust a server in
    session 0 and allow it identification, not impersonation.
-2. **Data and settings.** `%ProgramData%\Phalanx` with its permissions; the
-   service owns settings, history and quarantine; migration from the per-user
-   folder. The app reads and changes them through the pipe.
-3. **Real-time protection in the service.** Events stream to the app and tray
-   agent, which shows notifications; RunMRU for every signed-in user.
-4. **Scans, updates, DNS filter and block page in the service.**
-5. **Approval for weakening changes**, in the app and the browser connector.
+Everything that writes Phalanx's data (real-time protection, scans,
+quarantine, signature updates, web protection, the browser connector) must
+move together: once the data is in `%ProgramData%\Phalanx`, only the service
+can write it. So the service side is built first, milestone by milestone,
+while the app keeps working as before; the app then switches to the service
+in one step.
+
+2. **Data and settings, service side.** `%ProgramData%\Phalanx` with its
+   permissions; protection settings with the approval rule (weaker needs an
+   administrator); history and quarantine through the pipe (restore and
+   delete need an administrator); migration from the per-user folder
+   (`phalanx-cli service migrate`, administrator). The service does not
+   quarantine on request: a user could otherwise have it (as SYSTEM) remove
+   files the user cannot. It quarantines what it detects itself, from
+   milestone 3. *Built (`src/service/data.rs`, `settings.rs`, `migrate.rs`;
+   `phalanx-cli service migrate | history | settings`).* The abuse.ch key
+   is migrated readable by administrators only.
+3. **Real-time protection, scans and quarantine in the service.** Events
+   stream to the app and tray agent, which shows notifications; RunMRU for
+   every signed-in user.
+4. **Signature updates, DNS filter, block page and web settings in the
+   service**, and the browser connector through the pipe.
+5. **The switch:** the app uses the service for everything above, and asks
+   for approval (UAC) for weakening changes.
 6. **Installer** (per machine), upgrade from 0.4.x, tray warning when the
    service is down, README and Protection page.
 
