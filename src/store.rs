@@ -301,6 +301,19 @@ impl Store {
         Ok(())
     }
 
+    /// A detection's SHA-256, worst threat and action, if scan `scan_id`
+    /// recorded one at `path`.
+    pub fn detection_record(&self, scan_id: i64, path: &str) -> Result<Option<(String, String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT Sha256, Threat, Action FROM Detections WHERE ScanId = ?1 AND Path = ?2 ORDER BY Id LIMIT 1",
+                params![scan_id, path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
     /// Records the action taken on a detection after its scan finished (a
     /// running program stopped, then quarantined); counts it as quarantined
     /// in the scan when `quarantined`.

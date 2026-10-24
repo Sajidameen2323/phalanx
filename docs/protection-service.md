@@ -143,7 +143,26 @@ in one step.
    is migrated readable by administrators only.
 3. **Real-time protection, scans and quarantine in the service.** Events
    stream to the app and tray agent, which shows notifications; RunMRU for
-   every signed-in user.
+   every signed-in user. *Built (`src/service/protect.rs`).* With no folders
+   set, every user profile's Downloads is watched. A connection that
+   subscribes only carries events from then on (on a synchronous pipe a
+   pending read holds up writes), and each subscriber has its own writer
+   thread and bounded queue: one that stops reading is dropped, never
+   holding up protection. `ProtectionStatus` tells a client that connects
+   late where protection is. Quarantine through the pipe moves only what a
+   service scan detected and recorded, unchanged since.
+
+   Tested installed. A command typed into Win+R (`cmd /c rem verify you are
+   human`) was reported at high confidence by the program monitor, started
+   by Explorer. The Run-box watcher saw nothing new because Windows wrote
+   nothing: it keeps the Run-box history only while "Track app launches"
+   (`Start_TrackProgs`) is on, and Phalanx's own Privacy page recommends
+   turning that off. That item now says so. With tracking off, the program
+   monitor is what catches these commands; the watcher only adds commands
+   that exit before the program monitor looks. `phalanx-cli service run-box`
+   (`RunBoxView`, administrators) shows what the watcher reads, as SYSTEM.
+   Processes started from a Claude Code session see a different registry
+   view than the service, so Run-box tests written from there never reach it.
 4. **Signature updates, DNS filter, block page and web settings in the
    service**, and the browser connector through the pipe.
 5. **The switch:** the app uses the service for everything above, and asks

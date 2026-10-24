@@ -50,8 +50,18 @@ mod live {
     use super::super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A data folder whose settings keep real-time protection off: tests must
+    /// not watch this PC's Downloads folders and programs.
+    fn quiet(dir: &std::path::Path) -> &std::path::Path {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"watch_enabled": false}"#).unwrap();
+        dir
+    }
+
     fn test_data_dir() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("phalanx-ipc-test-{}", std::process::id()))
+        let dir = std::env::temp_dir().join(format!("phalanx-ipc-test-{}", std::process::id()));
+        quiet(&dir);
+        dir
     }
 
     fn private_pipe() -> String {
@@ -135,24 +145,24 @@ mod live {
             store.finish_scan(id, &Default::default(), 10, false).unwrap();
         }
         let name = private_pipe();
-        let running = crate::service::start(&name, dir).unwrap();
+        let running = crate::service::start(&name, quiet(dir)).unwrap();
         let mut client = Client::connect_to(&name, false).unwrap();
         let admin = elevated();
 
         let settings: ProtectionSettings = client.call(Request::GetSettings).unwrap().into_result().unwrap();
-        assert_eq!(settings, ProtectionSettings::default());
+        assert_eq!(settings, ProtectionSettings { watch_enabled: false, ..Default::default() });
         // Stronger: anyone.
         let stronger = ProtectionSettings { auto_quarantine: true, ..settings.clone() };
         assert!(client.call(Request::SetSettings { settings: stronger.clone() }).unwrap().ok);
         assert_eq!(ProtectionSettings::load(dir).unwrap(), stronger, "saved in the service's folder");
         // Weaker: an administrator, and the reply says why.
-        let weaker = ProtectionSettings { watch_enabled: false, ..stronger.clone() };
+        let weaker = ProtectionSettings { program_protection: false, ..stronger.clone() };
         let reply = client.call(Request::SetSettings { settings: weaker }).unwrap();
         if admin {
             assert!(reply.ok);
         } else {
             assert!(reply.needs_approval, "{reply:?}");
-            assert!(reply.error.as_deref().unwrap().contains("turns off real-time protection"), "{reply:?}");
+            assert!(reply.error.as_deref().unwrap().contains("turns off scanning programs as they start"), "{reply:?}");
             assert_eq!(ProtectionSettings::load(dir).unwrap(), stronger, "unchanged");
         }
 
@@ -175,5 +185,102 @@ mod live {
             }
         }
         running.stop();
+    }
+
+    /// Events from a subscribed connection, on a thread, so a test can wait
+    /// for one with a time limit.
+    fn subscribe(name: &str) -> std::sync::mpsc::Receiver<serde_json::Value> {
+        let mut events = Client::connect_to(name, false).unwrap();
+        assert!(events.call(Request::Subscribe).unwrap().ok);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(message) = events.next_message() {
+                if let ServerMessage::Event { event } = message && tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    /// Waits up to 30 s for an event that `wanted` accepts.
+    fn wait_for(events: &std::sync::mpsc::Receiver<serde_json::Value>, wanted: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut seen = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match events.recv_timeout(left) {
+                Ok(event) if wanted(&event) => return event,
+                Ok(event) => seen.push(event["type"].clone()),
+                Err(_) => break,
+            }
+        }
+        panic!("no such event within 30 s; saw {seen:?}");
+    }
+
+    #[test]
+    fn protection_and_scans_run_in_the_service() {
+        use crate::service::settings::ProtectionSettings;
+        let marker = "threat-scanner-test-marker-7f3a".to_ascii_uppercase();
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, watched, elsewhere) = (tmp.path().join("data"), tmp.path().join("downloads"), tmp.path().join("elsewhere"));
+        for d in [&dir, &watched, &elsewhere] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Real-time protection on, for this folder only.
+        let settings = ProtectionSettings {
+            watch_folders: vec![watched.clone()],
+            program_protection: false,
+            scan_new_drives: false,
+            ..Default::default()
+        };
+        settings.save(&dir).unwrap();
+        let name = private_pipe();
+        let events = subscribe_after_start(&name, &dir);
+
+        // Protection may have started before this client subscribed: ask.
+        let mut client = Client::connect_to(&name, false).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status: ProtectionStatus = client.call(Request::ProtectionStatus).unwrap().into_result().unwrap();
+            if status.watching {
+                assert!(status.engine.is_some_and(|(rules, _)| rules > 0), "{status:?}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "protection did not start: {status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::fs::write(watched.join("invoice.txt"), format!("x {marker} y")).unwrap();
+        let found = wait_for(&events, |e| e["type"] == "detection");
+        assert!(found["report"]["path"].as_str().unwrap().ends_with("invoice.txt"), "{found}");
+        assert_eq!(found["report"]["findings"][0]["threat"], "Test.ThreatScanner.Marker");
+
+        // A scan asked for through the pipe.
+        let bad = elsewhere.join("setup.txt");
+        std::fs::write(&bad, format!("x {marker} y")).unwrap();
+        let started: serde_json::Value = client.call(Request::Scan { paths: vec![elsewhere.clone()], kind: "custom".into() }).unwrap().into_result().unwrap();
+        let job = started["job"].clone();
+        let finished = wait_for(&events, |e| e["type"] == "scan-finished" && e["job"] == job);
+        assert_eq!(finished["report"]["infected"].as_array().unwrap().len(), 1, "{finished}");
+        let scan_id = finished["report"]["scan_id"].as_i64().unwrap();
+
+        // Only what the service detected can be quarantined, once.
+        let not_detected = client.call(Request::QuarantineDetection { scan: scan_id, path: elsewhere.join("other.txt") }).unwrap();
+        assert!(!not_detected.ok && not_detected.error.as_deref().unwrap().contains("reported no threat"), "{not_detected:?}");
+        assert!(client.call(Request::QuarantineDetection { scan: scan_id, path: bad.clone() }).unwrap().ok);
+        assert!(!bad.exists());
+        let again = client.call(Request::QuarantineDetection { scan: scan_id, path: bad.clone() }).unwrap();
+        assert!(again.error.as_deref().unwrap().contains("already quarantined"), "{again:?}");
+        let items: Vec<crate::store::QuarantineRow> = client.call(Request::Quarantine { include_restored: false }).unwrap().into_result().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(client.call(Request::Scan { paths: vec![tmp.path().join("missing")], kind: "custom".into() }).unwrap().error.is_some());
+    }
+
+    /// Starts the service (kept running until the test process ends: its
+    /// threads stop with it) and subscribes before protection starts.
+    fn subscribe_after_start(name: &str, dir: &std::path::Path) -> std::sync::mpsc::Receiver<serde_json::Value> {
+        let running = crate::service::start(name, dir).unwrap();
+        let events = subscribe(name);
+        std::mem::forget(running);
+        events
     }
 }

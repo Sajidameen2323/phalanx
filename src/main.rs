@@ -142,6 +142,20 @@ enum ServiceCommand {
     },
     /// The protection settings, as the service keeps them (JSON).
     Settings,
+    /// Scan files or folders in the service, showing its progress.
+    Scan {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Recorded in history.
+        #[arg(long, default_value = "custom")]
+        kind: String,
+    },
+    /// Print what the service reports (detections, scans, protection
+    /// starting and stopping) as it happens, one JSON object a line.
+    Events,
+    /// What the service's Run-box reader sees in every user's registry
+    /// (diagnostics; administrator).
+    RunBox,
 }
 
 #[derive(Subcommand)]
@@ -975,6 +989,57 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             }
             for s in scans {
                 println!("#{:<5} {:<8} {}  {} file(s), {} detection(s)  {}", s.id, s.kind, s.started_at, s.files_scanned, s.detections, s.targets);
+            }
+        }
+        ServiceCommand::Scan { paths, kind } => {
+            let connect = || ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)));
+            // Events on a connection of their own (see `Request::Subscribe`).
+            let mut events = connect()?;
+            events.call(ipc::Request::Subscribe)?;
+            // Absolute, as the service does not share this working folder;
+            // not canonical, which on Windows means `\\?\C:\…` paths.
+            let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
+            let started: serde_json::Value = connect()?.call(ipc::Request::Scan { paths, kind: kind.clone() })?.into_result()?;
+            let job = started["job"].as_u64().unwrap_or_default();
+            println!("Scanning in the service (job {job})…");
+            loop {
+                let ipc::ServerMessage::Event { event } = events.next_message()? else { continue };
+                if event["job"].as_u64() != Some(job) {
+                    continue;
+                }
+                match event["type"].as_str() {
+                    Some("scan-progress") => eprint!("\r  {} file(s), {} detection(s)   ", event["files"], event["detections"]),
+                    Some("scan-detection") => {
+                        let report = &event["report"];
+                        eprintln!("\r  [{}] {}  {}", report["findings"][0]["category"].as_str().unwrap_or(""), report["findings"][0]["threat"].as_str().unwrap_or(""), report["path"].as_str().unwrap_or(""));
+                    }
+                    Some("scan-finished") => {
+                        let r = &event["report"];
+                        eprintln!();
+                        println!("Done: {} file(s), {} skipped, {} detection(s), {} quarantined (scan {}).", r["files_scanned"], r["files_skipped"], r["detections"], r["quarantined"], r["scan_id"]);
+                        return Ok(if r["detections"].as_i64().unwrap_or(0) > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS });
+                    }
+                    Some("scan-failed") => anyhow::bail!("the scan failed: {}", event["error"].as_str().unwrap_or("")),
+                    _ => {}
+                }
+            }
+        }
+        ServiceCommand::RunBox => {
+            let reply = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?.call(ipc::Request::RunBoxView)?;
+            if reply.needs_approval {
+                anyhow::bail!("this shows every user's Run-box history, so it needs administrator rights");
+            }
+            let view: threat_scanner::rtp::commands::RunBoxView = reply.into_result()?;
+            println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        ServiceCommand::Events => {
+            let mut events = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            events.call(ipc::Request::Subscribe)?;
+            eprintln!("Listening to the service. Press Ctrl+C to stop.");
+            loop {
+                if let ipc::ServerMessage::Event { event } = events.next_message()? {
+                    println!("{event}");
+                }
             }
         }
         ServiceCommand::Settings => {

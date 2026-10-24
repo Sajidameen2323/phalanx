@@ -13,7 +13,7 @@ use crate::quarantine::Quarantine;
 use crate::store::{ScanMeta, ScanStats, Store, MAX_STORED_ERRORS};
 use crate::{contents, system, trust, Category, Finding, Source};
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,7 +87,7 @@ impl ScanOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileReport {
     pub path: String,
     pub sha256: String,
@@ -101,7 +101,7 @@ impl FileReport {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ScanReport {
     pub scan_id: i64,
     pub elapsed_ms: u128,

@@ -15,6 +15,9 @@
 #[cfg(windows)]
 mod pipe;
 
+use crate::risk::{DownloadOrigin, RiskyFile};
+use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent};
+use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +70,74 @@ pub enum Request {
     DeleteQuarantined { item: String },
     /// Bring a user's data from before the service (once).
     Migrate { from: PathBuf },
+    /// Send this connection every [`Event`] from now on. It then only
+    /// carries events: send requests on another connection.
+    Subscribe,
+    /// Where protection is now ([`ProtectionStatus`]): for a client that
+    /// connects after the events that said so.
+    ProtectionStatus,
+    /// What the Run-box reader sees in every user's registry (diagnostics;
+    /// administrators only, since it shows other users' Run-box history).
+    RunBoxView,
+    /// Scan files or folders; the reply carries a job number, and progress
+    /// arrives as events. `kind` is recorded in history (`quick`, `full`…).
+    Scan { paths: Vec<PathBuf>, kind: String },
+    /// Stop a scan started with `Scan`.
+    CancelScan { job: u64 },
+    /// Quarantine a file a scan reported (but did not quarantine). Only a
+    /// file the service itself detected, recorded in its history and
+    /// unchanged since, is moved.
+    QuarantineDetection { scan: i64, path: PathBuf },
+}
+
+/// What the service reports to subscribed clients: real-time protection
+/// as it works, and the progress of scans.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Event {
+    /// Signatures loaded; protection starts (again) with them.
+    EngineReady { rules: usize, hashes: usize },
+    /// Signatures could not be loaded; nothing is scanned until they are.
+    EngineFailed { error: String },
+    ProtectionStarted { watching: usize, failed: Vec<(PathBuf, String)>, programs: bool },
+    /// Real-time protection was turned off in the settings.
+    ProtectionOff,
+    FolderLost { folder: PathBuf, reason: String },
+    FolderRestored { folder: PathBuf },
+    FolderRescan { folder: PathBuf },
+    /// A threat; `repeat` when a program already detected started again.
+    Detection { report: FileReport, processes: Vec<ProcessHit>, repeat: bool },
+    Scanned { origin: Origin, files: i64, threats: usize },
+    RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
+    RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
+    Command { hit: CommandHit },
+    DriveAdded { root: PathBuf, files: usize },
+    Restarting { error: String, retry_in_secs: u64 },
+    ProtectionError { message: String },
+    ScanProgress { job: u64, files: i64, bytes: i64, detections: i64, path: PathBuf },
+    ScanDetection { job: u64, report: FileReport },
+    ScanFinished { job: u64, report: ScanReport },
+    ScanFailed { job: u64, error: String },
+}
+
+impl From<RtpEvent> for Event {
+    fn from(event: RtpEvent) -> Self {
+        match event {
+            RtpEvent::Started { watching, failed, programs } => Event::ProtectionStarted { watching, failed, programs },
+            RtpEvent::FolderLost { folder, reason } => Event::FolderLost { folder, reason },
+            RtpEvent::FolderRestored { folder } => Event::FolderRestored { folder },
+            RtpEvent::FolderRescan { folder } => Event::FolderRescan { folder },
+            RtpEvent::Detection { report, processes } => Event::Detection { report, processes, repeat: false },
+            RtpEvent::Blocked { report, processes } => Event::Detection { report, processes, repeat: true },
+            RtpEvent::Scanned { origin, report } => Event::Scanned { origin, files: report.stats.files_scanned, threats: report.infected.len() },
+            RtpEvent::RiskyFile { path, risk, origin } => Event::RiskyFile { path, risk, origin },
+            RtpEvent::RiskyChecked { path, outcome } => Event::RiskyChecked { path, outcome },
+            RtpEvent::Command(hit) => Event::Command { hit },
+            RtpEvent::DriveAdded { root, files } => Event::DriveAdded { root, files },
+            RtpEvent::Restarting { error, retry_in } => Event::Restarting { error, retry_in_secs: retry_in.as_secs() },
+            RtpEvent::Error(message) => Event::ProtectionError { message },
+        }
+    }
 }
 
 /// Who may make a request.
@@ -92,8 +163,15 @@ impl Request {
             | Request::ScanDetails { .. }
             | Request::RecentDetections { .. }
             | Request::MonthlySummary
-            | Request::Quarantine { .. } => Allowed::Anyone,
-            Request::Stop | Request::Restore { .. } | Request::DeleteQuarantined { .. } | Request::Migrate { .. } => Allowed::Administrator,
+            | Request::Quarantine { .. }
+            | Request::Subscribe
+            | Request::ProtectionStatus
+            | Request::Scan { .. }
+            | Request::CancelScan { .. }
+            | Request::QuarantineDetection { .. } => Allowed::Anyone,
+            Request::Stop | Request::Restore { .. } | Request::DeleteQuarantined { .. } | Request::Migrate { .. } | Request::RunBoxView => {
+                Allowed::Administrator
+            }
         }
     }
 }
@@ -185,6 +263,17 @@ pub struct Status {
     pub caller: Caller,
     /// Where the service keeps its data.
     pub data_dir: PathBuf,
+}
+
+/// The reply to `ProtectionStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectionStatus {
+    /// Signatures loaded: rules and known hashes.
+    pub engine: Option<(usize, usize)>,
+    /// Real-time protection is watching (it has started).
+    pub watching: bool,
+    /// Scans running now.
+    pub scans: usize,
 }
 
 /// The pipe server, as the service runs it.

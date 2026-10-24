@@ -5,11 +5,14 @@
 
 pub mod data;
 pub mod migrate;
+pub mod protect;
 pub mod settings;
 #[cfg(windows)]
 pub mod manage;
 
 use crate::ipc::{Caller, ClientMessage, Reply, Request, Status};
+use protect::{Hub, Protector};
+use std::sync::Arc;
 use crate::quarantine::Quarantine;
 use crate::scan;
 use crate::store::Store;
@@ -33,6 +36,17 @@ struct Context {
     settings: Mutex<()>,
     /// Told when an administrator asks the service to stop.
     stop_requested: std::sync::mpsc::Sender<()>,
+    hub: Arc<Hub>,
+    protector: Arc<Protector>,
+}
+
+impl Context {
+    /// Starts protection again with `settings`, off the pipe's threads
+    /// (loading signatures takes seconds).
+    fn reapply(&self, settings: ProtectionSettings) {
+        let protector = Arc::clone(&self.protector);
+        let _ = std::thread::Builder::new().name("apply-settings".into()).spawn(move || protector.apply(&settings));
+    }
 }
 
 /// One client's connection: its history database, opened when first needed.
@@ -91,7 +105,13 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             if !weaker.is_empty() && !caller.admin {
                 return Reply::needs_approval_because(id, &weaker);
             }
-            reply(id, settings.save(dir).map(|()| settings))
+            reply(
+                id,
+                settings.save(dir).map(|()| {
+                    ctx.reapply(settings.clone());
+                    settings
+                }),
+            )
         }
         Request::RecentScans { limit, kind } => reply(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
         Request::ScanDetails { scan } => reply(
@@ -112,17 +132,86 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
             // Reopened after the import, so this session sees it.
             session.store = None;
-            reply(id, migrate::migrate(&from, dir))
+            let done = migrate::migrate(&from, dir);
+            if done.is_ok() {
+                ctx.reapply(ProtectionSettings::load(dir).unwrap_or_default());
+            }
+            reply(id, done)
         }
+        // Handled by the connection itself (see `imp::serve`).
+        Request::Subscribe => Reply::ok(id, json!("subscribed")),
+        Request::ProtectionStatus => reply(id, Ok(ctx.protector.status())),
+        Request::RunBoxView => reply(id, Ok(crate::rtp::commands::run_box_view())),
+        Request::Scan { paths, kind } => {
+            let paths = paths.iter().map(|p| plain(p)).collect();
+            reply(id, ProtectionSettings::load(dir).and_then(|settings| ctx.protector.scan(paths, &kind, &settings)).map(|job| json!({ "job": job })))
+        }
+        Request::CancelScan { job } => match ctx.protector.cancel(job) {
+            true => Reply::ok(id, json!("cancelling")),
+            false => Reply::error(id, format!("there is no scan {job} running")),
+        },
+        Request::QuarantineDetection { scan, path } => reply(id, session.store(dir).and_then(|s| quarantine_detection(s, dir, scan, &path))),
     }
 }
 
-/// The service running in this process. Dropping it stops the pipe server.
+/// One spelling per file in history: `\\?\C:\x` is `C:\x`, and
+/// `\\?\UNC\server\share` is `\\server\share`.
+fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Quarantines a file that scan `scan` detected and recorded, if it is
+/// unchanged since. Nothing else: a user may not have the service (as
+/// SYSTEM) remove files of their choosing.
+fn quarantine_detection(store: &Store, dir: &Path, scan: i64, path: &Path) -> anyhow::Result<String> {
+    let path = plain(path);
+    let mut shown = path.display().to_string();
+    let mut record = store.detection_record(scan, &shown)?;
+    // Recorded with the `\\?\` prefix (before paths were made plain).
+    if record.is_none() {
+        let verbatim = format!(r"\\?\{shown}");
+        record = store.detection_record(scan, &verbatim)?;
+        if record.is_some() {
+            shown = verbatim;
+        }
+    }
+    let Some((sha256, threat, action)) = record else {
+        anyhow::bail!("scan {scan} reported no threat at {}", path.display());
+    };
+    if action.contains("quarantined (") {
+        anyhow::bail!("{shown} is already quarantined");
+    }
+    let quarantined = scan::quarantine_file(store, dir, &path, &sha256, &threat)?;
+    store.set_detection_action(scan, &shown, &format!("quarantined ({quarantined})"), true)?;
+    Ok(quarantined)
+}
+
+/// The service running in this process. Dropping it stops the pipe server,
+/// real-time protection and scans.
 pub struct Running {
     /// Held so that dropping `Running` stops the pipe server.
     #[cfg(windows)]
     _server: imp::Running,
     stop_requests: std::sync::mpsc::Receiver<()>,
+    protector: Arc<Protector>,
+    /// Loading signatures and starting protection, at start.
+    starting: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(starting) = self.starting.take() {
+            let _ = starting.join();
+        }
+        self.protector.stop();
+    }
 }
 
 impl Running {
@@ -146,14 +235,21 @@ pub fn start(pipe_name: &str, data_dir: &Path) -> io::Result<Running> {
     std::fs::create_dir_all(data_dir)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let ctx = Context { started, data_dir: data_dir.to_path_buf(), settings: Mutex::new(()), stop_requested: tx };
+    let hub = Arc::new(Hub::default());
+    let protector = Protector::new(data_dir, Arc::clone(&hub));
+    let ctx = Context { started, data_dir: data_dir.to_path_buf(), settings: Mutex::new(()), stop_requested: tx, hub, protector: Arc::clone(&protector) };
     #[cfg(windows)]
     {
-        Ok(Running { _server: imp::start(pipe_name, ctx)?, stop_requests: rx })
+        let server = imp::start(pipe_name, ctx)?;
+        let (starter, dir) = (Arc::clone(&protector), data_dir.to_path_buf());
+        let starting = std::thread::Builder::new()
+            .name("start-protection".into())
+            .spawn(move || starter.apply(&ProtectionSettings::load(&dir).unwrap_or_default()))?;
+        Ok(Running { _server: server, stop_requests: rx, protector, starting: Some(starting) })
     }
     #[cfg(not(windows))]
     {
-        let _ = (pipe_name, ctx, rx);
+        let _ = (pipe_name, ctx, rx, protector);
         Err(io::Error::new(io::ErrorKind::Unsupported, "the protection service is Windows only"))
     }
 }
@@ -161,7 +257,7 @@ pub fn start(pipe_name: &str, data_dir: &Path) -> io::Result<Running> {
 #[cfg(windows)]
 mod imp {
     use super::{handle, Context};
-    use crate::ipc::{ClientMessage, Connection, Reply, Server, ServerMessage};
+    use crate::ipc::{ClientMessage, Connection, Reply, Request, Server, ServerMessage};
     use std::io::{self, BufRead, BufReader, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -205,10 +301,13 @@ mod imp {
         Ok(Running { name: name.to_string(), stop, thread: Some(thread) })
     }
 
-    /// Answers one client until it disconnects.
+    /// Answers one client until it disconnects, or until it subscribes:
+    /// from then on the connection only carries events, written by the
+    /// hub, and is no longer read. (On a synchronous pipe a pending read
+    /// would hold up every write, so one connection cannot do both.)
     fn serve(connection: Connection, ctx: &Context) {
         let Ok(read) = connection.file.try_clone() else { return };
-        let mut writer = &connection.file;
+        let mut writer = connection.file;
         let mut caller = None;
         let mut session = super::Session::default();
         for line in BufReader::new(read).lines() {
@@ -218,9 +317,11 @@ mod imp {
             }
             // Who is asking, once: the client has written, so it can be read.
             if caller.is_none() {
-                caller = connection.caller().ok();
+                caller = connection_caller(&writer);
             }
-            let reply = match (serde_json::from_str::<ClientMessage>(&line), &caller) {
+            let message = serde_json::from_str::<ClientMessage>(&line);
+            let subscribing = matches!(&message, Ok(m) if m.request == Request::Subscribe) && caller.is_some();
+            let reply = match (message, &caller) {
                 (Err(e), _) => Reply::error(0, format!("not a request: {e}")),
                 (Ok(message), None) => Reply::error(message.id, "could not tell who is asking"),
                 (Ok(message), Some(caller)) => handle(ctx, &mut session, caller, message),
@@ -230,6 +331,27 @@ mod imp {
             if writer.write_all(text.as_bytes()).is_err() || writer.flush().is_err() {
                 break;
             }
+            if subscribing {
+                ctx.hub.subscribe(Box::new(writer));
+                return;
+            }
         }
+    }
+
+    fn connection_caller(file: &std::fs::File) -> Option<crate::ipc::Caller> {
+        Connection { file: file.try_clone().ok()? }.caller().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn paths_have_one_spelling() {
+        assert_eq!(plain(Path::new(r"\\?\C:\Users\me\x.exe")), PathBuf::from(r"C:\Users\me\x.exe"));
+        assert_eq!(plain(Path::new(r"\\?\UNC\server\share\x.exe")), PathBuf::from(r"\\server\share\x.exe"));
+        assert_eq!(plain(Path::new(r"C:\Users\me\x.exe")), PathBuf::from(r"C:\Users\me\x.exe"));
     }
 }
