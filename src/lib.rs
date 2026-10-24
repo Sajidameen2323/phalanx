@@ -7,11 +7,13 @@ pub mod cmdline;
 pub mod contents;
 pub mod engine;
 pub mod heuristics;
+pub mod ipc;
 pub mod posture;
 pub mod quarantine;
 pub mod risk;
 pub mod rtp;
 pub mod scan;
+pub mod service;
 #[cfg(windows)]
 mod shortcut;
 pub mod store;

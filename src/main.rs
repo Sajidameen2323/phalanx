@@ -109,6 +109,24 @@ enum Command {
     /// malicious browser extensions.
     #[command(subcommand)]
     Web(WebCommand),
+    /// The protection service (install, remove, start and stop need
+    /// administrator rights).
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install the service (phalanx-service.exe next to this program) and
+    /// start it; an existing installation is updated.
+    Install,
+    /// Stop and remove the service.
+    Uninstall,
+    Start,
+    Stop,
+    /// Whether the service is installed and running, and who it thinks you
+    /// are (exit code 1 if it is not running).
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -616,6 +634,7 @@ fn run() -> Result<ExitCode> {
         }
         Command::Inspect(args) => inspect(args, &dir),
         Command::Web(cmd) => web_command(cmd, &dir),
+        Command::Service(cmd) => service_command(cmd),
         Command::Update { force, check, set_key } => {
             let sig_dir = update::signature_dir(&dir);
             if let Some(key) = set_key {
@@ -892,6 +911,58 @@ fn inspect(args: &InspectArgs, dir: &Path) -> Result<ExitCode> {
         ai::Verdict::Safe => ExitCode::SUCCESS,
         _ => ExitCode::from(1),
     })
+}
+
+#[cfg(windows)]
+fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
+    use threat_scanner::ipc;
+    use threat_scanner::service::manage::{self, State};
+    match cmd {
+        ServiceCommand::Install => {
+            let exe = std::env::current_exe()?.with_file_name("phalanx-service.exe");
+            if !exe.is_file() {
+                anyhow::bail!("{} is missing; it is installed next to phalanx-cli.exe", exe.display());
+            }
+            manage::install(&exe)?;
+            println!("The Phalanx service is installed and running ({}).", exe.display());
+        }
+        ServiceCommand::Uninstall => {
+            manage::uninstall()?;
+            println!("The Phalanx service is removed.");
+        }
+        ServiceCommand::Start => {
+            manage::start()?;
+            println!("The Phalanx service is starting.");
+        }
+        ServiceCommand::Stop => {
+            manage::stop(std::time::Duration::from_secs(20))?;
+            println!("The Phalanx service is stopped.");
+        }
+        ServiceCommand::Status => {
+            let state = manage::state()?;
+            println!("Service: {}", state.label());
+            if state != State::Running {
+                return Ok(ExitCode::from(1));
+            }
+            match ipc::status_within(std::time::Duration::from_secs(3)) {
+                Ok(status) => {
+                    println!("Version: {} (process {})", status.version, status.pid);
+                    let rights = if status.caller.admin { "administrator (elevated)" } else { "standard: changes that weaken protection need approval" };
+                    println!("You:     {}, {rights}", status.caller.user);
+                }
+                Err(e) => {
+                    println!("Pipe:    {e}");
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(windows))]
+fn service_command(_cmd: &ServiceCommand) -> Result<ExitCode> {
+    anyhow::bail!("the protection service is Windows only")
 }
 
 fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {

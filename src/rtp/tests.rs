@@ -477,7 +477,9 @@ fn a_new_drive_is_checked_when_it_appears() {
     cfg.defer_when_fullscreen = false;
     let mut run = Run::start(&tmp.path().join("data"), cfg);
     assert!(run.until(|m| m.starts_with("started")));
-    std::thread::sleep(Duration::from_millis(500));
+    // The drive monitor's first list of drives is what counts as already
+    // there; wait a full poll so this drive is not taken for one of them.
+    std::thread::sleep(Duration::from_millis(2500));
 
     // Like double-clicking an ISO: a new drive letter appears.
     let Some(drive) = Subst::new(&image) else { return };

@@ -91,6 +91,23 @@ The icon assets in `assets/` come from the Phalanx logo:
 
 The first build takes several minutes, mostly compiling YARA-X's WebAssembly JIT.
 
+### Protection service (in development)
+
+Protection is moving into a Windows service, so that it keeps running when the app
+is closed and programs running as the user cannot switch it off; see
+[docs/protection-service.md](docs/protection-service.md). So far the build adds
+`phalanx-service.exe`, the pipe the app and CLI talk to it on, and:
+
+```
+phalanx-cli service install     # as administrator: install and start it
+phalanx-cli service status      # any user: is it running, and who am I to it
+phalanx-cli service stop | start | uninstall
+phalanx-service --console --pipe \\.\pipe\phalanx-dev   # run it in a terminal
+```
+
+The service does not protect anything yet; the Protection page shows whether it
+is installed and running.
+
 ### Installer
 
 ```
