@@ -180,9 +180,103 @@ in one step.
    needs approval is made by `phalanx-cli` run elevated, after Windows'
    prompt, with only the host name on its command line.
 5. **The switch:** the app uses the service for everything above, and asks
-   for approval (UAC) for weakening changes.
+   for approval (UAC) for weakening changes. Plan:
+   - **The app needs the service.** It runs no protection of its own any
+     more (no real-time protection, engine, DNS filter or updates). With the
+     service missing or stopped, it says so on every protection page and
+     shows what to do; the Stealer check, browser checks, privacy and AI
+     Inspect, which are per-user, keep working. This lands together with
+     milestone 6 (the installer installs the service): `main` must not get
+     an app that needs a service its installer does not install.
+   - **Events instead of threads.** The app keeps one subscribed connection
+     on a thread of its own; detections, scan progress, updates and web
+     blocks arrive there, and notifications are shown from it, so the tray
+     agent (the same app, hidden) notifies with no window open.
+   - **Settings.** The app's settings file keeps only its own preferences
+     (appearance, notifications, tray, AI Inspect). Protection and web
+     settings are read from the service at start and whenever it reports
+     a change (new `SettingsChanged` and `WebSettingsChanged` events, so a
+     change from the CLI or the browser shows at once). The pages still
+     edit them in place; a change is sent to the service, and if it needs
+     approval the app runs `phalanx-cli service set-settings` (or
+     `set-web-settings`) elevated with the settings on its command line, not
+     in a file a program could change before the elevated copy reads it.
+     Declined: the page shows the service's settings again.
+   - **Approval for the rest.** Restoring and deleting quarantined files,
+     allowing and unblocking sites, the abuse.ch key and quarantining a file
+     that only AI Inspect flagged (new `QuarantineFile`, administrators) run
+     the matching `phalanx-cli service …` command elevated. While Windows'
+     prompt is up, the page says it is waiting for approval.
+   - **Scans, history, quarantine** through the pipe; "Quarantine selected"
+     is `QuarantineDetection` for the scan's own detections.
+   - **AI Inspect** keeps a read-only engine, loaded from the service's
+     signatures when first needed, for its local findings.
+   - **Web page:** status, events and rule counts come from the service's
+     folder and `WebStatus`; "Use the filter for Windows DNS" keeps its
+     backup in the service's folder, where the uninstaller finds it.
+   - **Development:** `PHALANX_PIPE` points the app and CLI at a
+     `phalanx-service --console` run instead (and lifts the session-0
+     check, which only a real service passes).
+
+   *Built (`src/gui/link.rs`; the app's own protection, engine scans,
+   updates and DNS filter are gone).* Edits on the pages are sent once
+   they have stayed the same for 0.7 s, so a dragged slider or a typed
+   field asks (and maybe prompts) once; the DNS listen address gets an
+   Apply button for the same reason. The abuse.ch key is saved for the
+   user first, then the elevated `phalanx-cli service auth-key --from-app`
+   reads it there, so it never goes on a command line. Development pipes
+   reach the elevated copy as `--pipe`, since it does not inherit the
+   environment. Found while testing against a console service: the
+   service held its protection lock while loading signatures, so status
+   requests waited (now only applying is serialised); `ScanReport` could
+   not be read back from an event (a `u128` field and two `errors` keys),
+   so a finished scan never reached the app; `ProtectionStatus` now
+   carries the watched-folder count for an app that connects late.
+   Pages that show history and quarantine read them again when opened,
+   since real-time protection, the command line or another user change
+   them too. Tried with Windows' prompt: a weakening change approved
+   (saved) and declined (the page shows the service's setting again),
+   restoring a quarantined file, and saving the Auth-Key. Windows may
+   show the prompt as a flashing taskbar button instead of on top.
 6. **Installer** (per machine), upgrade from 0.4.x, tray warning when the
-   service is down, README and Protection page.
+   service is down, README and Protection page. Plan:
+   - **Setup asks for administrator rights once** and installs to
+     `Program Files\Phalanx`: the app, the CLI and `phalanx-service.exe`.
+     It stops the service before replacing files and runs `phalanx-cli
+     service install` after (which updates an existing service), with
+     its Start-menu shortcut for all users and an `HKLM\…\Run` entry
+     that starts the tray agent at every sign-in.
+   - **Upgrade from 0.4.x** (a per-user install of the same AppId): the
+     installing user's data is migrated (`service migrate`, which also
+     carries the abuse.ch key), then the old copy's uninstaller runs
+     silently. Its DNS backup is set aside first, so the old uninstaller
+     does not undo "Use the filter for Windows DNS": the service's filter
+     answers on the same address, and its folder has the backup. The old
+     data folder is kept. Browsers are connected again for that user.
+   - **Uninstall:** restores Windows' DNS from the service's backup,
+     removes the service, disconnects the browsers, and asks about
+     `%ProgramData%\Phalanx`.
+   - **App:** a Windows notification when the service has been down for a
+     while (and when it is back), not for a quick restart; "Start with
+     Windows" shows the machine-wide entry instead of a per-user toggle;
+     the Data card shows the service's folder; Windows' prompt is given
+     the app's window, so it comes up in front. `web restore-dns` looks
+     in the service's folder first.
+   - **README, setup's README.txt and the Protection page** describe the
+     service, approvals and what it does not protect against (malware
+     that already has administrator rights).
+   - Version 0.5.0.
+
+   *Built (`installer/phalanx.iss`).* Tested by upgrading a real 0.4.1
+   install: the data and abuse.ch key came over (the first update in the
+   service used the key), the old copy was removed, and the uninstaller
+   removed the service and kept the data. Two fixes came from it: a
+   browser keeps the old copy's connector running, which held its folder,
+   so setup closes it first (Browser Guard starts the new one at its next
+   lookup); and Setup named its entry "Phalanx (All users)" because the
+   per-user one still existed, so it is renamed once that is gone. Start
+   setup from Explorer, not from a sandboxed shell: the "as you" steps
+   (connecting browsers, opening the app) run in the shell's session.
 
 ## Testing
 

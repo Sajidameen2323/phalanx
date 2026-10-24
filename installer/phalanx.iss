@@ -7,18 +7,22 @@
 ; The version is read from the built phalanx.exe (Cargo.toml's version,
 ; embedded by build.rs); pass /DAppVersion=x.y.z to override it.
 ;
-; Installs per user (no administrator rights), like everything Phalanx
-; registers: the Start-menu shortcut, start-with-Windows entry and browser
-; connector all live under the current user. A running Phalanx is asked to
-; quit first (`phalanx.exe --quit`). On uninstall, Windows' DNS settings are
-; put back if Phalanx's DNS filter was set up, and the data folder
-; (%LOCALAPPDATA%\threat-scanner: history, quarantine, signatures) is kept
-; unless the user chooses to delete it.
+; Installs for the whole PC (administrator rights, asked once): protection
+; runs in the Phalanx service as LocalSystem, which setup installs and
+; starts, and the app starts in the tray at every user's sign-in to show
+; its notifications. A per-user 0.4.x install is upgraded: its user's data
+; is moved into the service's folder (%ProgramData%\Phalanx) and the old
+; copy is removed, keeping its data folder. On uninstall, Windows' DNS
+; settings are put back if Phalanx's DNS filter was set up, the service is
+; removed, and the data folder is kept unless the user chooses to delete it.
 
 #define AppName "Phalanx"
 #define AppGuid "6B0E3B5A-7C2D-4E57-9F1A-5D7C1B3E2A90"
 #define AppExe "phalanx.exe"
 #define CliExe "phalanx-cli.exe"
+#define ServiceExe "phalanx-service.exe"
+; The Windows service's name (src/service/mod.rs).
+#define ServiceName "Phalanx"
 #define AppUrl "https://github.com/Sajidameen2323/phalanx"
 ; The app's single-instance mutex (src/gui/desktop.rs).
 #define AppMutex "Local\ThreatScanner.SingleInstance"
@@ -45,10 +49,13 @@ VersionInfoProductName={#AppName}
 VersionInfoProductVersion={#AppVersion}
 VersionInfoDescription={#AppName} Setup
 MinVersion=10.0
-DefaultDirName={localappdata}\Programs\{#AppName}
+DefaultDirName={autopf}\{#AppName}
+; Always Program Files: a 0.4.x per-user folder is not reused.
+UsePreviousAppDir=no
+DisableDirPage=yes
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\target\installer
@@ -71,16 +78,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "autostart"; Description: "Start {#AppName} in the tray when I sign in (real-time protection keeps running)"; GroupDescription: "Protection:"; Flags: unchecked
+Name: "autostart"; Description: "Open {#AppName} in the tray when anyone signs in, to show its notifications"; GroupDescription: "Protection:"
 Name: "browsers"; Description: "Connect my browsers for web protection (Browser Guard)"; GroupDescription: "Protection:"
-
-[InstallDelete]
-; Earlier versions installed the developer README.
-Type: files; Name: "{app}\README.md"
 
 [Files]
 Source: "{#Release}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Release}\{#CliExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Release}\{#ServiceExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; A short guide for users; the full README is for developers.
 Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
@@ -88,18 +92,16 @@ Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreve
 [Icons]
 ; Same name and notification identity as the shortcut the app registers
 ; itself, so toasts keep popping up as Phalanx.
-Name: "{userprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "Phalanx.Desktop"
-Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+Name: "{commonprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "Phalanx.Desktop"
+Name: "{commondesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --background"; Tasks: autostart; Flags: uninsdeletevalue
-; Removed on uninstall even when the app (not setup) created them.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "{#AppName}"; Flags: dontcreatekey uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Phalanx.Desktop"; Flags: dontcreatekey uninsdeletekey
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --background"; Tasks: autostart; Flags: uninsdeletevalue
+; Removed on uninstall even when the task was not chosen this time.
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "{#AppName}"; Flags: dontcreatekey uninsdeletevalue
 
 [Run]
-Filename: "{app}\{#CliExe}"; Parameters: "web connect"; StatusMsg: "Connecting browsers…"; Tasks: browsers; Flags: runhidden
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; Unregister the browser connector (HKCU native-messaging keys) before the
@@ -107,13 +109,19 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags
 Filename: "{app}\{#CliExe}"; Parameters: "web disconnect"; RunOnceId: "DisconnectBrowsers"; Flags: runhidden
 
 [UninstallDelete]
-Type: files; Name: "{userprograms}\{#AppName}.lnk"
+Type: files; Name: "{commonprograms}\{#AppName}.lnk"
 
 [Code]
 const
-  DataFolder = '{localappdata}\threat-scanner';
-  DnsBackup = '{localappdata}\threat-scanner\web\windows-dns-backup.json';
-  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGuid}}_is1';
+  DataFolder = '{commonappdata}\Phalanx';
+  DnsBackup = '{commonappdata}\Phalanx\web\windows-dns-backup.json';
+  { A 0.4.x install: per user, with its data in the user's profile. }
+  OldUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGuid}}_is1';
+  OldDataFolder = '{localappdata}\threat-scanner';
+  OldDnsBackup = '{localappdata}\threat-scanner\web\windows-dns-backup.json';
+
+var
+  OldUninstaller: String;
 
 function PhalanxRunning(): Boolean;
 begin
@@ -154,18 +162,22 @@ var
   Location: String;
 begin
   Result := True;
+  { A 0.4.x per-user install, to upgrade from. }
+  OldUninstaller := '';
+  if RegQueryStringValue(HKCU, OldUninstallKey, 'UninstallString', OldUninstaller) then
+    OldUninstaller := RemoveQuotes(OldUninstaller);
   if not PhalanxRunning() then
     Exit;
   if not WizardSilent() then
-    if MsgBox('Phalanx is running. Setup will close it while it installs, then start it again.' + #13#10#13#10 +
-              'Real-time protection is off until then.',
+    if MsgBox('Phalanx is open. Setup will close it while it installs, then start it again.',
               mbInformation, MB_OKCANCEL) = IDCANCEL then
     begin
       Result := False;
       Exit;
     end;
   Location := '';
-  if RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation', Location) then
+  if RegQueryStringValue(HKLM, OldUninstallKey, 'InstallLocation', Location) or
+     RegQueryStringValue(HKCU, OldUninstallKey, 'InstallLocation', Location) then
     Location := AddBackslash(Location) + '{#AppExe}';
   { Not installed by setup (or moved): ask with the copy in this setup. }
   if not FileExists(Location) then
@@ -176,6 +188,96 @@ begin
   Result := QuitPhalanx(Location, WizardSilent());
 end;
 
+{ The service holds phalanx-service.exe open: stop it before the files are
+  replaced. Not installed is fine. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code: Integer;
+begin
+  Result := '';
+  Exec(ExpandConstant('{sys}\net.exe'), 'stop {#ServiceName}', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+{ Runs the CLI (hidden) and returns its exit code, or -1 if it did not run. }
+function Cli(const Params: String): Integer;
+begin
+  if not Exec(ExpandConstant('{app}\{#CliExe}'), Params, '', SW_HIDE, ewWaitUntilTerminated, Result) then
+    Result := -1;
+end;
+
+{ Brings a 0.4.x user's data into the service's folder, then removes the old
+  copy. Its DNS backup is set aside while its uninstaller runs, so Windows'
+  DNS keeps pointing at the filter (the service now answers there, and its
+  folder has the backup). }
+procedure UpgradeFromPerUser();
+var
+  Tries, Code: Integer;
+  Backup, Aside: String;
+begin
+  if (OldUninstaller = '') or not FileExists(OldUninstaller) then
+    Exit;
+  WizardForm.StatusLabel.Caption := 'Bringing over your history, quarantine and settings…';
+  { The service needs a moment before it answers. }
+  for Tries := 1 to 30 do
+  begin
+    Code := Cli('service migrate');
+    if Code = 0 then
+      Break;
+    Sleep(1000);
+  end;
+  if Code <> 0 then
+    Log('Migration from the per-user install did not finish (exit code ' + IntToStr(Code) + ').');
+  Backup := ExpandConstant(OldDnsBackup);
+  Aside := Backup + '.moved-to-service';
+  if FileExists(Backup) and not RenameFile(Backup, Aside) then
+    Aside := '';
+  WizardForm.StatusLabel.Caption := 'Removing the previous version…';
+  { A browser keeps the old copy's connector running, which would hold its
+    folder; Browser Guard starts the new one at its next lookup. }
+  Exec(ExpandConstant('{sys}	askkill.exe'), '/F /IM {#CliExe}', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Exec(OldUninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  { The uninstaller hands over to a copy of itself and returns at once: wait
+    for that copy to finish. }
+  for Tries := 1 to 120 do
+  begin
+    if not RegKeyExists(HKCU, OldUninstallKey) then
+      Break;
+    Sleep(500);
+  end;
+  if (Aside <> '') and FileExists(Aside) then
+    RenameFile(Aside, Backup);
+  { The per-user entry still existed when setup registered itself, so Setup
+    named this one "Phalanx (All users)": it is the only one now. }
+  RegWriteStringValue(HKLM, OldUninstallKey, 'DisplayName', '{#AppName}');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+  WizardForm.StatusLabel.Caption := 'Starting the protection service…';
+  Code := Cli('service install');
+  if Code <> 0 then
+  begin
+    Log('phalanx-cli service install failed (exit code ' + IntToStr(Code) + ').');
+    if not WizardSilent() then
+      MsgBox('The Phalanx protection service could not be installed (code ' + IntToStr(Code) + '), so this PC is not protected yet.' + #13#10#13#10 +
+             'Run setup again, or run "phalanx-cli service install" from a terminal opened as administrator.', mbError, MB_OK);
+    Exit;
+  end;
+  UpgradeFromPerUser();
+  { The browser connector is registered per user, for the one installing;
+    after the upgrade, whose uninstaller disconnects the old one. }
+  if WizardIsTaskSelected('browsers') then
+  begin
+    WizardForm.StatusLabel.Caption := 'Connecting browsers…';
+    if not ExecAsOriginalUser(ExpandConstant('{app}\{#CliExe}'), 'web connect', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+      Log('Connecting browsers failed (exit code ' + IntToStr(Code) + ').');
+  end;
+end;
+
 function InitializeUninstall(): Boolean;
 begin
   Result := QuitPhalanx(ExpandConstant('{app}\{#AppExe}'), UninstallSilent());
@@ -184,17 +286,15 @@ end;
 { If Windows' DNS points at Phalanx's filter, removing Phalanx could leave
   websites unreachable: put back the settings saved when it was set up. }
 procedure RestoreDns();
-var
-  Code: Integer;
 begin
   if not FileExists(ExpandConstant(DnsBackup)) then
     Exit;
   if not UninstallSilent() then
     if MsgBox('Windows is set to use Phalanx''s DNS filter. Put your previous DNS settings back now?' + #13#10#13#10 +
-              'Windows will ask for permission. If you skip this, websites may stop loading once Phalanx is removed.',
+              'If you skip this, websites may stop loading once Phalanx is removed.',
               mbConfirmation, MB_YESNO) = IDNO then
       Exit;
-  if not Exec(ExpandConstant('{app}\{#CliExe}'), 'web restore-dns', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+  if Cli('web restore-dns') <> 0 then
     if not UninstallSilent() then
       MsgBox('Your DNS settings were not restored. If websites stop loading, open Settings > Network & internet, ' +
              'choose your connection, and set DNS server assignment back to Automatic.', mbError, MB_OK);
@@ -202,18 +302,31 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  Dir: String;
+  Dir, OldDir, Folders: String;
 begin
   if CurUninstallStep = usUninstall then
+  begin
     RestoreDns();
+    if Cli('service uninstall') <> 0 then
+      Log('The protection service could not be removed.');
+  end;
   if CurUninstallStep = usPostUninstall then
   begin
     Dir := ExpandConstant(DataFolder);
-    if DirExists(Dir) and not UninstallSilent() then
-      if MsgBox('Also delete Phalanx''s data folder?' + #13#10#13#10 + Dir + #13#10#13#10 +
+    OldDir := ExpandConstant(OldDataFolder);
+    Folders := '';
+    if DirExists(Dir) then
+      Folders := Dir;
+    if DirExists(OldDir) then
+      Folders := Folders + #13#10 + OldDir;
+    if (Folders <> '') and not UninstallSilent() then
+      if MsgBox('Also delete Phalanx''s data?' + #13#10#13#10 + Trim(Folders) + #13#10#13#10 +
                 'It holds your scan history, downloaded signatures, settings and QUARANTINED FILES. ' +
                 'Keep it if you might reinstall or need to restore a quarantined file.',
                 mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+      begin
         DelTree(Dir, True, True, True);
+        DelTree(OldDir, True, True, True);
+      end;
   end;
 end;

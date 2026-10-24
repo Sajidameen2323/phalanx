@@ -4,6 +4,7 @@
 mod brand;
 mod desktop;
 mod dots;
+mod link;
 mod mark;
 mod motion;
 mod pages;
@@ -16,20 +17,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use threat_scanner::ai::{self, AiReport, Evidence};
 use threat_scanner::engine::{Engine, EngineConfig};
 use threat_scanner::posture::{self, Check};
-use threat_scanner::quarantine::Quarantine;
-use threat_scanner::scan::{self, FileReport, ScanEvent, ScanOptions, ScanReport};
-use threat_scanner::store::{DetectionRow, MonthRow, QuarantineRow, ScanErrorRow, ScanRow, Store};
+use threat_scanner::ipc::{self, Event, Request};
+use threat_scanner::scan::{self, FileReport, ScanOptions, ScanReport};
+use threat_scanner::service::settings::ProtectionSettings;
+use threat_scanner::store::{DetectionRow, MonthRow, QuarantineRow, ScanErrorRow, ScanRow};
 use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
 use threat_scanner::cmdline::Confidence;
-use threat_scanner::rtp::{self, CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome, RtpConfig, RtpEvent, RtpHandle};
+use threat_scanner::rtp::{CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome};
 use threat_scanner::Category;
 use widgets::APP_TITLE;
 
@@ -38,8 +40,6 @@ const BACKGROUND_FLAG: &str = "--background";
 /// Quit the running copy and exit (the installer and uninstaller use it).
 /// Exits with 0 once no copy is running, 1 if one could not be stopped.
 const QUIT_FLAG: &str = "--quit";
-/// How often the watcher's "still running" checkpoint is saved.
-const CHECKPOINT_EVERY: Duration = Duration::from_secs(60);
 const MAX_ACTIVITY: usize = 100;
 
 fn main() -> eframe::Result {
@@ -273,25 +273,6 @@ impl Settings {
         options.archives = self.scan_archives;
         options
     }
-    /// Everything the running watcher depends on; a change restarts it.
-    fn watch_key(&self) -> String {
-        serde_json::to_string(&(
-            self.watch_enabled,
-            &self.watch_folders,
-            self.exclude(),
-            self.max_size_mb,
-            self.quarantine_floor().map(|c| c.as_str()),
-            self.notifications,
-            self.risky_file_alerts,
-            self.program_protection,
-            self.stop_running_threats,
-            self.trust_signed,
-            self.scan_archives,
-            self.scan_new_drives,
-            self.defer_when_fullscreen,
-        ))
-        .unwrap_or_default()
-    }
 }
 
 /// Where the Gemini key comes from.
@@ -323,10 +304,6 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
 enum WorkerMsg {
     Progress { path: String, files: i64, bytes: i64 },
     Detection(FileReport),
@@ -335,7 +312,11 @@ enum WorkerMsg {
 
 struct ScanJob {
     rx: Receiver<WorkerMsg>,
-    cancel: Arc<AtomicBool>,
+    /// Events for this scan are passed on here.
+    tx: Sender<WorkerMsg>,
+    /// The service's job number, once it replied.
+    job: Option<u64>,
+    cancelling: bool,
     started: Instant,
     targets: String,
     kind: String,
@@ -345,17 +326,9 @@ struct ScanJob {
     bytes: i64,
 }
 
-enum UpdateMsg {
-    Step(String),
-    /// The new engine, when the update installed anything.
-    Done(Result<(Manifest, Option<Arc<Engine>>), String>),
-}
-
+/// An update the service is running, as its events report it.
 struct UpdateJob {
-    rx: Receiver<UpdateMsg>,
     step: String,
-    /// Started by the automatic check, not the user.
-    auto: bool,
 }
 
 enum WatchMsg {
@@ -476,9 +449,9 @@ struct App {
     /// and the watcher.
     engine: Option<Arc<Engine>>,
     engine_rx: Option<Receiver<Result<Arc<Engine>, String>>>,
-    /// A scan requested while the engine was still loading: (paths, kind).
-    queued_scan: Option<(Vec<PathBuf>, String)>,
     job: Option<ScanJob>,
+    /// Scan events that arrived before the service said which job is ours.
+    early_scan_events: Vec<(u64, WorkerMsg)>,
     results: Vec<ResultRow>,
     finished: Option<Finished>,
     quarantine: Vec<QuarantineRow>,
@@ -488,18 +461,22 @@ struct App {
     toast: Option<Toast>,
     manifest: Manifest,
     updating: Option<UpdateJob>,
-    update_check_rx: Option<Receiver<update::CheckResult>>,
-    /// Time and result of the last check made in this session.
-    update_check: Option<(String, update::CheckResult)>,
-    // Real-time protection
-    watcher: Option<RtpHandle>,
-    watch_rx: Option<Receiver<WatchMsg>>,
-    /// `watch_key` plus engine identity of the running watcher.
-    watcher_key: Option<String>,
+    // Real-time protection (in the service)
     watch: WatchState,
     activity: VecDeque<Activity>,
-    last_checkpoint: Instant,
     // Protection service
+    link: link::Link,
+    /// Which notifications the event connection shows.
+    notify_prefs: Arc<link::NotifyPrefs>,
+    /// Connected to the service; why not, when not.
+    connected: bool,
+    service_lost: Option<String>,
+    /// The service's data folder (signatures, web rules), once connected.
+    service_dir: Option<PathBuf>,
+    /// The protection settings as the service last reported them.
+    service_settings: Option<ProtectionSettings>,
+    /// A change waiting for Windows' administrator prompt: what it is.
+    approval: Option<String>,
     service: Option<ServiceView>,
     service_rx: Option<Receiver<ServiceView>>,
     service_checked: Option<Instant>,
@@ -511,6 +488,8 @@ struct App {
     quitting: Arc<AtomicBool>,
     hidden_notice_shown: bool,
     autostart: bool,
+    /// Setup starts the tray agent for every user (installed per machine).
+    machine_autostart: bool,
     /// Whether notifications carry the app's own name, or why not.
     notification_identity: Result<(), String>,
     // Windows security and privacy checks
@@ -621,7 +600,7 @@ impl App {
         let data_dir = scan::default_data_dir();
         let _ = std::fs::create_dir_all(&data_dir);
         let (settings, settings_warning) = Settings::load(&data_dir);
-        let manifest = update::load_manifest(&update::signature_dir(&data_dir));
+        let manifest = Manifest::default();
         let (web, web_warning) = web_page::WebState::new(&data_dir);
         let quitting = Arc::new(AtomicBool::new(false));
         let tray = desktop::Tray::create(ctx, quitting.clone()).ok();
@@ -632,12 +611,22 @@ impl App {
         // is left alone, even when another copy (a test build) starts.
         // An entry for this program without `--background` (written by hand or
         // by an old version) would open the window at every sign-in.
-        if let Some(command) = system::autostart_command()
+        // Installed for the whole PC, setup's entry starts the tray agent for
+        // everyone: a per-user entry (from 0.4) would only repeat it.
+        let machine_autostart = system::machine_autostart_command().is_some();
+        if machine_autostart {
+            if system::autostart_enabled() {
+                let _ = system::set_autostart(false, "");
+            }
+        } else if let Some(command) = system::autostart_command()
             && (!autostart_program_exists(&command) || (autostart_names_this_program(&command) && !command.contains(BACKGROUND_FLAG)))
         {
             let _ = system::set_autostart(true, &autostart_command());
         }
         let abuse_key_saved = update::auth_key_saved(&update::signature_dir(&data_dir));
+        let notify_prefs = Arc::new(link::NotifyPrefs::default());
+        notify_prefs.set(settings.notifications, settings.risky_file_alerts);
+        let link = link::Link::start(ctx, Arc::clone(&notify_prefs));
         let mut app = Self {
             page: Page::Dashboard,
             data_dir,
@@ -646,8 +635,8 @@ impl App {
             signatures: Ok((0, 0)),
             engine: None,
             engine_rx: None,
-            queued_scan: None,
             job: None,
+            early_scan_events: Vec::new(),
             results: Vec::new(),
             finished: None,
             quarantine: Vec::new(),
@@ -657,14 +646,15 @@ impl App {
             toast: None,
             manifest,
             updating: None,
-            update_check_rx: None,
-            update_check: None,
-            watcher: None,
-            watch_rx: None,
-            watcher_key: None,
             watch: WatchState::default(),
             activity: VecDeque::new(),
-            last_checkpoint: Instant::now(),
+            link,
+            notify_prefs,
+            connected: false,
+            service_lost: None,
+            service_dir: None,
+            service_settings: None,
+            approval: None,
             service: None,
             service_rx: None,
             service_checked: None,
@@ -674,6 +664,7 @@ impl App {
             quitting,
             hidden_notice_shown: false,
             autostart: system::autostart_enabled(),
+            machine_autostart,
             notification_identity,
             security: None,
             privacy: None,
@@ -700,15 +691,7 @@ impl App {
             hero_fx: dots::Hero::default(),
             theme_fade: None,
         };
-        app.reload_signatures(ctx);
-        app.refresh();
-        // Wakes the app every minute, even hidden in the tray, so scheduled
-        // update checks run.
-        let ticker = ctx.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(60));
-            ticker.request_repaint();
-        });
+        // Signatures and history come once the service answers.
         app.refresh_posture(ctx);
         if let Some(warning) = settings_warning.or(web_warning) {
             app.notify(warning, false);
@@ -727,26 +710,35 @@ impl App {
         });
     }
 
-    fn store(&self) -> Result<Store, String> {
-        scan::open_store(&self.data_dir).map_err(|e| format!("{e:#}"))
+    /// Reads the quarantine, the scans and the monthly totals from the service.
+    fn refresh(&mut self) {
+        if !self.connected {
+            return;
+        }
+        self.link.run(
+            || -> Result<_, String> {
+                use link::read;
+                let q: Vec<QuarantineRow> = read(Request::Quarantine { include_restored: false })?;
+                let s: Vec<ScanRow> = read(Request::RecentScans { limit: 300, kind: None })?;
+                let m: Vec<MonthRow> = read(Request::MonthlySummary)?;
+                Ok((q, s, m))
+            },
+            |app, loaded| match loaded {
+                Ok((q, s, m)) => {
+                    app.quarantine = q;
+                    app.scans = s;
+                    app.months = m;
+                    app.expanded.clear();
+                }
+                Err(e) => app.notify(format!("Could not read history: {e}"), false),
+            },
+        );
     }
 
-    fn refresh(&mut self) {
-        let loaded = self.store().and_then(|store| {
-            let q = store.quarantine_items(false).map_err(|e| e.to_string())?;
-            let s = store.recent_scans(300, None).map_err(|e| e.to_string())?;
-            let m = store.monthly_summary().map_err(|e| e.to_string())?;
-            Ok((q, s, m))
-        });
-        match loaded {
-            Ok((q, s, m)) => {
-                self.quarantine = q;
-                self.scans = s;
-                self.months = m;
-                self.expanded.clear();
-            }
-            Err(e) => self.notify(format!("Could not read history: {e}"), false),
-        }
+    /// Where signatures and web rules are read from: the service's folder
+    /// once connected (users may read it), else the app's own.
+    fn signatures_home(&self) -> &Path {
+        self.service_dir.as_deref().unwrap_or(&self.data_dir)
     }
 
     fn signatures_label(&self) -> Option<String> {
@@ -758,7 +750,9 @@ impl App {
     /// Rebuilds the engine on a background thread; the UI stays responsive.
     fn reload_signatures(&mut self, ctx: &egui::Context) {
         let (tx, rx) = mpsc::channel();
-        let config = self.settings.engine_config(&self.data_dir);
+        // A read-only engine for AI Inspect and the Stealer check; scans run
+        // in the service.
+        let config = self.settings.engine_config(self.signatures_home());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let result = Engine::new(&config).map(Arc::new).map_err(|e| format!("{e:#}"));
@@ -778,158 +772,53 @@ impl App {
             Err(e) => {
                 self.signatures = Err(e.clone());
                 self.engine = None;
-                self.queued_scan = None;
                 self.notify(format!("Signatures failed to load: {e}"), false);
             }
         }
     }
 
-    fn poll_engine(&mut self, ctx: &egui::Context) {
+    fn poll_engine(&mut self) {
         let Some(rx) = &self.engine_rx else { return };
         let Ok(result) = rx.try_recv() else { return };
         self.set_engine(result);
-        if let (Some(_), Some((paths, kind))) = (&self.engine, self.queued_scan.take()) {
-            self.start_scan(ctx, paths, &kind);
-        }
     }
 
-    /// Downloads changed feeds in the background and, if anything new was
-    /// installed, recompiles the engine and reloads the web rules. `auto`
-    /// updates stay quiet unless they install something.
-    fn start_update(&mut self, ctx: &egui::Context, auto: bool) {
+    /// Asks the service to download new signatures; progress and the result
+    /// arrive as events.
+    fn start_update(&mut self) {
         if self.updating.is_some() {
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        let data_dir = self.data_dir.clone();
-        let config = self.settings.engine_config(&self.data_dir);
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            system::enter_background_mode();
-            let result = (|| -> anyhow::Result<(Manifest, Option<Arc<Engine>>)> {
-                let manifest = update::update_all(&update::signature_dir(&data_dir), false, &mut |step| {
-                    let _ = tx.send(UpdateMsg::Step(step.to_string()));
-                    ctx.request_repaint();
-                })?;
-                // A manual update always recompiles, so it also repairs an
-                // engine that failed to load after an earlier update.
-                if auto && !manifest.installed_anything() {
-                    return Ok((manifest, None));
+        self.updating = Some(UpdateJob { step: "Starting…".into() });
+        self.link.run(
+            || link::call(Request::UpdateSignatures { force: false }).and_then(|r| r.into_result::<serde_json::Value>().map_err(|e| e.to_string())),
+            |app, started| {
+                if let Err(e) = started {
+                    // Already running (the service's schedule): follow that one.
+                    if !e.contains("already running") {
+                        app.updating = None;
+                        app.notify(format!("Could not start the update: {e}"), false);
+                    }
                 }
-                let _ = tx.send(UpdateMsg::Step("Compiling rules…".into()));
-                ctx.request_repaint();
-                Ok((manifest, Some(Arc::new(Engine::new(&config)?))))
-            })();
-            let _ = tx.send(UpdateMsg::Done(result.map_err(|e| format!("{e:#}"))));
-            ctx.request_repaint();
-        });
-        self.updating = Some(UpdateJob {
-            rx,
-            step: "Starting…".into(),
-            auto,
-        });
+            },
+        );
     }
 
-    fn poll_update(&mut self) {
-        let Some(job) = &mut self.updating else { return };
-        let mut done = None;
-        while let Ok(msg) = job.rx.try_recv() {
-            match msg {
-                UpdateMsg::Step(step) => job.step = step,
-                UpdateMsg::Done(result) => done = Some(result),
-            }
+    /// An update ended (one asked for here, or the service's own schedule).
+    fn update_finished(&mut self, ctx: &egui::Context, installed: bool, failed: Vec<String>, error: Option<String>) {
+        let asked = self.updating.take().is_some();
+        self.manifest = update::load_manifest(&update::signature_dir(self.signatures_home()));
+        if installed {
+            self.reload_signatures(ctx);
+            let home = self.signatures_home().to_path_buf();
+            self.web.reload_rules(&home);
         }
-        let Some(result) = done else { return };
-        let auto = job.auto;
-        self.updating = None;
-        self.settings.last_update_check = Some(unix_now());
-        match result {
-            Ok((manifest, engine)) => {
-                let failed: Vec<String> = manifest
-                    .sources
-                    .iter()
-                    .filter(|s| s.failed())
-                    .map(|s| s.name.clone())
-                    .collect();
-                let updated: Vec<String> = manifest
-                    .sources
-                    .iter()
-                    .filter(|s| s.ok && !s.unchanged)
-                    .map(|s| s.name.clone())
-                    .collect();
-                self.manifest = manifest;
-                let counts = engine.as_ref().map(|e| (e.rule_count(), e.hash_count()));
-                if let Some(engine) = engine {
-                    self.set_engine(Ok(engine));
-                    self.web.reload_rules(&self.data_dir);
-                }
-                let prefix = if auto { "Automatic update: " } else { "" };
-                match (counts, failed.is_empty()) {
-                    (_, false) if !auto => self.notify(
-                        format!("Some sources failed and kept their previous version: {}", failed.join(", ")),
-                        false,
-                    ),
-                    (Some((rules, hashes)), _) if updated.is_empty() => self.notify(
-                        format!("Signatures are up to date: {rules} rules, {hashes} known-bad hashes, {} web rules", self.web.counts.blocking()),
-                        true,
-                    ),
-                    (Some((rules, hashes)), _) => self.notify(
-                        format!(
-                            "{prefix}signatures updated ({} new source(s)): {rules} rules, {hashes} known-bad hashes, {} web rules",
-                            updated.len(),
-                            self.web.counts.blocking()
-                        ),
-                        true,
-                    ),
-                    (None, _) if !auto => self.notify("Signatures are already up to date", true),
-                    _ => {}
-                }
-            }
-            Err(e) => {
-                self.manifest = update::load_manifest(&update::signature_dir(&self.data_dir));
-                if !auto {
-                    self.notify(format!("Signature update failed: {e}"), false);
-                }
-            }
-        }
-    }
-
-    /// Automatic updates: once the interval has passed, ask every source
-    /// (small HEAD requests) whether it has new data, and update if so.
-    fn poll_auto_update(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.update_check_rx {
-            let Ok(result) = rx.try_recv() else { return };
-            self.update_check_rx = None;
-            self.settings.last_update_check = Some(unix_now());
-            self.update_check = Some((chrono::Local::now().format("%H:%M").to_string(), result.clone()));
-            if !result.changed.is_empty() {
-                self.start_update(ctx, true);
-            }
-            return;
-        }
-        let interval = u64::from(self.settings.auto_update_hours.max(1)) * 3600;
-        let due = self.settings.last_update_check.is_none_or(|t| unix_now().saturating_sub(t) >= interval);
-        if !self.settings.auto_update || !due || self.updating.is_some() || self.engine_rx.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        let sig_dir = update::signature_dir(&self.data_dir);
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            system::enter_background_mode();
-            let _ = tx.send(update::check_for_updates(&sig_dir));
-            ctx.request_repaint();
-        });
-        self.update_check_rx = Some(rx);
-    }
-
-    /// Checks now (ignoring the interval), then updates if anything changed.
-    fn check_updates_now(&mut self, ctx: &egui::Context) {
-        if self.update_check_rx.is_none() && self.updating.is_none() {
-            self.settings.last_update_check = None;
-            let enabled = std::mem::replace(&mut self.settings.auto_update, true);
-            self.poll_auto_update(ctx);
-            self.settings.auto_update = enabled;
+        match (error, installed, failed.is_empty()) {
+            (Some(e), _, _) if asked => self.notify(format!("Signature update failed: {e}"), false),
+            (None, _, false) if asked => self.notify(format!("Some sources failed and kept their previous version: {}", failed.join(", ")), false),
+            (None, true, _) => self.notify("Signatures updated", true),
+            (None, false, _) if asked => self.notify("Signatures are already up to date", true),
+            _ => {}
         }
     }
 
@@ -939,22 +828,12 @@ impl App {
         if self.job.is_some() || paths.is_empty() {
             return;
         }
-        let Some(engine) = self.engine.clone() else {
-            if self.engine_rx.is_some() {
-                // Starts automatically once the signatures finish loading.
-                self.queued_scan = Some((paths, kind.to_string()));
-                self.page = Page::Scan;
-            } else {
-                self.notify("Signatures failed to load; fix them in Settings first", false);
-            }
-            return;
-        };
+        if !self.connected {
+            return self.notify("The protection service is not running, so nothing can be scanned", false);
+        }
+        let _ = ctx;
         let options = self.settings.scan_options(paths, kind, self.signatures_label());
         let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
-        let data_dir = self.data_dir.clone();
-        let ctx = ctx.clone();
         let targets = options
             .paths
             .iter()
@@ -962,41 +841,39 @@ impl App {
             .collect::<Vec<_>>()
             .join(", ");
         let threads = options.threads;
-
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<ScanReport> {
-                let store = scan::open_store(&data_dir)?;
-                let mut last_progress = Instant::now() - Duration::from_secs(1);
-                let mut on_event = |event: ScanEvent<'_>| match event {
-                    ScanEvent::Progress { path, stats } => {
-                        // ~10 updates a second is plenty for the UI.
-                        if last_progress.elapsed() >= Duration::from_millis(100) {
-                            last_progress = Instant::now();
-                            let _ = tx.send(WorkerMsg::Progress {
-                                path: path.display().to_string(),
-                                files: stats.files_scanned,
-                                bytes: stats.bytes_scanned,
-                            });
-                            ctx.request_repaint();
+        let (paths, kind_name) = (options.paths.clone(), kind.to_string());
+        self.link.run(
+            move || link::call(Request::Scan { paths, kind: kind_name }).and_then(|r| r.into_result::<serde_json::Value>().map_err(|e| e.to_string())),
+            |app, started| match started {
+                Ok(reply) => {
+                    let id = reply["job"].as_u64();
+                    if let Some(job) = &mut app.job {
+                        job.job = id;
+                        // Events that came before the reply.
+                        let early = std::mem::take(&mut app.early_scan_events);
+                        for (event_job, msg) in early {
+                            if Some(event_job) == id {
+                                let _ = job.tx.send(msg);
+                            }
                         }
                     }
-                    ScanEvent::Detection(report) => {
-                        let _ = tx.send(WorkerMsg::Detection(report.clone()));
-                        ctx.request_repaint();
+                }
+                Err(e) => {
+                    if let Some(job) = &app.job {
+                        let _ = job.tx.send(WorkerMsg::Done(Err(e)));
                     }
-                };
-                scan::run(&engine, &store, &data_dir, &options, &worker_cancel, &mut on_event)
-            })();
-            let _ = tx.send(WorkerMsg::Done(result.map_err(|e| format!("{e:#}"))));
-            ctx.request_repaint();
-        });
+                }
+            },
+        );
 
         self.results.clear();
         self.finished = None;
         self.scan_run += 1;
         self.job = Some(ScanJob {
             rx,
-            cancel,
+            tx,
+            job: None,
+            cancelling: false,
             started: Instant::now(),
             targets,
             kind: kind.to_string(),
@@ -1032,7 +909,7 @@ impl App {
                 let infected = report.infected.len();
                 self.finished = Some(Finished {
                     scan_id: report.scan_id,
-                    elapsed: Duration::from_millis(report.elapsed_ms as u64),
+                    elapsed: Duration::from_millis(report.elapsed_ms),
                     files: report.stats.files_scanned,
                     bytes: report.stats.bytes_scanned,
                     infected,
@@ -1053,50 +930,108 @@ impl App {
         self.refresh();
     }
 
+    /// Asks the scan for each selected detection to be quarantined (the
+    /// service moves only what its scan detected, unchanged since).
     fn quarantine_selected(&mut self) {
-        let store = match self.store() {
-            Ok(store) => store,
-            Err(e) => return self.notify(e, false),
-        };
-        let (mut ok, mut failed) = (0, 0);
+        let Some(scan) = self.finished.as_ref().map(|f| f.scan_id) else { return };
+        let paths: Vec<String> = self.results.iter().filter(|r| r.selected).map(|r| r.report.path.clone()).collect();
         for row in self.results.iter_mut().filter(|r| r.selected) {
-            match scan::quarantine_reported(&store, &self.data_dir, &row.report) {
-                Ok(id) => {
-                    row.report.action = format!("quarantined ({id})");
-                    ok += 1;
-                }
-                Err(e) => {
-                    row.report.action = format!("quarantine failed: {e:#}");
-                    failed += 1;
-                }
-            }
             row.selected = false;
         }
-        drop(store);
-        let failed_text = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        self.notify(format!("Quarantined {ok} file(s){failed_text}"), failed == 0);
-        self.refresh();
+        self.link.run(
+            move || {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let result = link::call(Request::QuarantineDetection { scan, path: PathBuf::from(&path) })
+                            .and_then(|r| r.into_result::<String>().map_err(|e| e.to_string()));
+                        (path, result)
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |app, outcomes| {
+                let (mut ok, mut failed) = (0, 0);
+                for (path, result) in outcomes {
+                    let Some(row) = app.results.iter_mut().find(|r| r.report.path == path) else { continue };
+                    match result {
+                        Ok(id) => {
+                            row.report.action = format!("quarantined ({id})");
+                            ok += 1;
+                        }
+                        Err(e) => {
+                            row.report.action = format!("quarantine failed: {e}");
+                            failed += 1;
+                        }
+                    }
+                }
+                let failed_text = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+                app.notify(format!("Quarantined {ok} file(s){failed_text}"), failed == 0);
+                app.refresh();
+            },
+        );
     }
 
+    /// Restores or deletes a quarantined file: the service asks for an
+    /// administrator, so Windows' prompt appears.
     fn quarantine_action(&mut self, id: &str, restore: bool) {
-        let result = self.store().and_then(|store| {
-            let q = Quarantine::new(scan::quarantine_dir(&self.data_dir), &store)
-                .map_err(|e| format!("{e:#}"))?;
-            if restore {
-                q.restore(id, false)
-                    .map(|path| format!("Restored {}", path.display()))
-                    .map_err(|e| format!("{e:#}"))
-            } else {
-                q.delete(id)
-                    .map(|()| "Deleted permanently".to_string())
-                    .map_err(|e| format!("{e:#}"))
-            }
-        });
-        match result {
-            Ok(text) => self.notify(text, true),
-            Err(e) => self.notify(e, false),
-        }
-        self.refresh();
+        let (request, args) = if restore {
+            (Request::Restore { item: id.to_string(), force: false }, format!("service restore {id}"))
+        } else {
+            (Request::DeleteQuarantined { item: id.to_string() }, format!("service delete-quarantined {id}"))
+        };
+        self.approval = Some(if restore { "Restoring needs an administrator's approval".into() } else { "Deleting needs an administrator's approval".into() });
+        self.link.run(
+            move || link::with_approval::<serde_json::Value>(request, &args, || Ok(serde_json::Value::Null)),
+            move |app, outcome| {
+                app.approval = None;
+                match outcome {
+                    link::Approval::Done(_) => app.notify(if restore { "Restored" } else { "Deleted permanently" }, true),
+                    link::Approval::Declined => app.notify("Not changed: Windows' administrator prompt was declined", false),
+                    link::Approval::Failed(e) => app.notify(e, false),
+                }
+                app.refresh();
+            },
+        );
+    }
+
+    /// Asks the service to stop the running scan.
+    fn cancel_scan(&mut self) {
+        let Some(job) = &mut self.job else { return };
+        let Some(id) = job.job else { return };
+        job.cancelling = true;
+        self.link.run(move || link::call(Request::CancelScan { job: id }), |_, _| {});
+    }
+
+    /// Gives the service the Auth-Key saved for this user (`Some`), or
+    /// removes the service's: an administrator's approval either way.
+    fn set_service_auth_key(&mut self, save: Option<()>) {
+        let saving = save.is_some();
+        let (request, args) = if saving {
+            let key = update::auth_key(&update::signature_dir(&self.data_dir)).ok().flatten();
+            (Request::SetAuthKey { key }, "service auth-key --from-app")
+        } else {
+            (Request::SetAuthKey { key: None }, "service auth-key --remove")
+        };
+        self.approval = Some("Changing the Auth-Key needs an administrator's approval".into());
+        self.link.run(
+            move || link::with_approval::<serde_json::Value>(request, args, || Ok(serde_json::Value::Null)),
+            move |app, outcome| {
+                app.approval = None;
+                match outcome {
+                    link::Approval::Done(_) => {
+                        app.abuse_key_saved = saving;
+                        if saving {
+                            app.notify("Auth-Key saved; downloading the abuse.ch feeds", true);
+                            app.start_update();
+                        } else {
+                            app.notify("Auth-Key removed; the abuse.ch feeds will be skipped", true);
+                        }
+                    }
+                    link::Approval::Declined => app.notify("Not changed: Windows' administrator prompt was declined", false),
+                    link::Approval::Failed(e) => app.notify(format!("Could not change the Auth-Key: {e}"), false),
+                }
+            },
+        );
     }
 
     // ---------- Windows checks ----------
@@ -1276,18 +1211,27 @@ impl App {
                 _ => "AI.Gemini.Reviewed".to_string(),
             },
         };
-        let (path, sha256) = (evidence.path.clone(), evidence.sha256.clone());
-        let result = self.store().and_then(|store| {
-            scan::quarantine_file(&store, &self.data_dir, &path, &sha256, &threat).map_err(|e| format!("{e:#}"))
-        });
-        match result {
-            Ok(id) => {
-                self.notify(format!("Quarantined {} ({id})", path.display()), true);
-                self.inspect = InspectState::default();
-            }
-            Err(e) => self.notify(format!("Could not quarantine: {e}"), false),
-        }
-        self.refresh();
+        let path = evidence.path.clone();
+        // A name the command line cannot misread.
+        let threat: String = threat.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
+        let args = format!("service quarantine \"{}\" --threat {threat}", path.display());
+        let request = Request::QuarantineFile { path: path.clone(), threat };
+        self.approval = Some("Quarantining a file no scan detected needs an administrator's approval".into());
+        self.link.run(
+            move || link::with_approval::<serde_json::Value>(request, &args, || Ok(serde_json::Value::Null)),
+            move |app, outcome| {
+                app.approval = None;
+                match outcome {
+                    link::Approval::Done(_) => {
+                        app.notify(format!("Quarantined {}", path.display()), true);
+                        app.inspect = InspectState::default();
+                    }
+                    link::Approval::Declined => app.notify("Not quarantined: Windows' administrator prompt was declined", false),
+                    link::Approval::Failed(e) => app.notify(format!("Could not quarantine: {e}"), false),
+                }
+                app.refresh();
+            },
+        );
     }
 
     fn save_api_key(&mut self) {
@@ -1362,111 +1306,161 @@ impl App {
 
     // ---------- real-time protection ----------
 
-    /// Starts, restarts or stops real-time protection to match settings and engine.
-    fn sync_watcher(&mut self, ctx: &egui::Context) {
-        let Some(engine) = self.engine.clone() else {
-            return; // keep the current protection until new signatures are ready
-        };
-        let active = self.settings.watch_enabled && (!self.settings.watch_folders.is_empty() || self.settings.program_protection);
-        let key = active.then(|| format!("{}|{:p}", self.settings.watch_key(), Arc::as_ptr(&engine)));
-        if key == self.watcher_key {
-            return;
-        }
-        if let Some(handle) = self.watcher.take() {
-            handle.stop();
-        }
-        self.watch_rx = None;
-        self.watch.running = false;
-        self.watcher_key = key.clone();
-        if key.is_none() {
-            return;
-        }
+    // ---------- the service link ----------
 
-        let mut config = RtpConfig::new(self.settings.watch_folders.clone());
-        config.exclude = self.settings.exclude();
-        config.max_size_bytes = self.settings.max_size_bytes();
-        config.quarantine_floor = self.settings.quarantine_floor();
-        config.signatures = self.signatures_label();
-        config.catch_up_since = self.settings.watch_checkpoint.map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-        config.alert_risky = self.settings.risky_file_alerts;
-        config.process_protection = self.settings.program_protection;
-        config.stop_running_threats = self.settings.stop_running_threats;
-        config.trust_signed = self.settings.trust_signed;
-        config.scan_archives = self.settings.scan_archives;
-        config.scan_new_drives = self.settings.scan_new_drives;
-        config.defer_when_fullscreen = self.settings.defer_when_fullscreen;
-        let (tx, rx) = mpsc::channel();
-        let notifications = self.settings.notifications;
-        let repaint = ctx.clone();
-        let started = rtp::start(engine, self.data_dir.clone(), config, move |event| {
-            let msg = match event {
-                RtpEvent::Started { watching, failed, programs } => WatchMsg::Started { watching, failed, programs },
-                RtpEvent::FolderLost { folder, reason } => WatchMsg::FolderLost { folder, reason },
-                RtpEvent::FolderRestored { folder } => WatchMsg::FolderRestored(folder),
-                RtpEvent::FolderRescan { folder } => WatchMsg::FolderRescan(folder),
-                RtpEvent::Detection { report, processes } => {
-                    // Sent from the protection thread so it works even while the window is hidden.
-                    if notifications {
-                        let (title, body) = threat_notification(&report, &processes, false);
-                        system::notify(&title, &body);
+    /// Handles what the service link delivered since the last frame.
+    fn poll_link(&mut self, ctx: &egui::Context) {
+        self.notify_prefs.set(self.settings.notifications, self.settings.risky_file_alerts);
+        let messages: Vec<link::LinkMsg> = self.link.rx.try_iter().collect();
+        for msg in messages {
+            match msg {
+                link::LinkMsg::Connected => self.connect_service(ctx),
+                link::LinkMsg::Lost(reason) => {
+                    let was_connected = std::mem::replace(&mut self.connected, false);
+                    self.service_lost = Some(reason);
+                    self.watch.running = false;
+                    self.updating = None;
+                    self.web.service_lost();
+                    if let Some(job) = &self.job {
+                        let _ = job.tx.send(WorkerMsg::Done(Err("the protection service stopped".into())));
                     }
-                    WatchMsg::Detection { report, processes, repeat: false }
-                }
-                RtpEvent::Blocked { report, processes } => {
-                    if notifications {
-                        let (title, body) = threat_notification(&report, &processes, true);
-                        system::notify(&title, &body);
+                    // Without the service, AI Inspect and the Stealer check use
+                    // the app's own signatures.
+                    if !was_connected && self.engine.is_none() && self.engine_rx.is_none() {
+                        self.reload_signatures(ctx);
                     }
-                    WatchMsg::Detection { report, processes, repeat: true }
                 }
-                RtpEvent::Scanned { origin, report } => WatchMsg::Scanned {
-                    origin,
-                    files: report.stats.files_scanned,
-                    threats: report.infected.len(),
-                },
-                RtpEvent::RiskyFile { path, risk, origin } => {
-                    // Only sent when risky-file alerts are on.
-                    let (title, body) = risky_notification(&path, &risk, origin.as_ref());
-                    system::notify(&title, &body);
-                    WatchMsg::RiskyFile { path, risk, origin }
-                }
-                RtpEvent::RiskyChecked { path, outcome } => {
-                    let file = widgets::file_name(&path.display().to_string());
-                    match &outcome {
-                        RiskyOutcome::NoThreatFound => system::notify(
-                            &format!("No known threats in {file}"),
-                            "Nothing known was found, which does not prove it is safe. Open Phalanx to have the AI inspect it.",
-                        ),
-                        RiskyOutcome::NotScanned(reason) => system::notify(&format!("{file} was not scanned"), reason),
-                        // Reported by the detection notification.
-                        RiskyOutcome::Threat(_) => {}
-                    }
-                    WatchMsg::RiskyChecked { path, outcome }
-                }
-                RtpEvent::Command(hit) => {
-                    // Medium-confidence matches are common in admin tools; they
-                    // are only logged.
-                    if notifications && hit.confidence() == Confidence::High {
-                        let (title, body) = command_notification(&hit);
-                        system::notify(&title, &body);
-                    }
-                    WatchMsg::Command(hit)
-                }
-                RtpEvent::DriveAdded { root, files } => WatchMsg::DriveAdded { root, files },
-                RtpEvent::Restarting { error, retry_in } => WatchMsg::Restarting { error, retry_in },
-                RtpEvent::Error(e) => WatchMsg::Error(e),
-            };
-            let _ = tx.send(msg);
-            repaint.request_repaint();
-        });
-        match started {
-            Ok(handle) => {
-                self.watcher = Some(handle);
-                self.watch_rx = Some(rx);
-                self.watch.running = true;
-                self.watch.since = Some(chrono::Local::now().format("%H:%M").to_string());
+                link::LinkMsg::Event(event) => self.on_event(ctx, *event),
+                link::LinkMsg::Done(apply) => apply(self),
             }
-            Err(e) => self.log_activity(ActivityKind::Problem, "Real-time protection failed to start", format!("{e:#}")),
+        }
+    }
+
+    /// The service answered: read its settings and state.
+    fn connect_service(&mut self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        self.link.run(
+            || -> Result<_, String> {
+                let mut client = ipc::Client::connect().map_err(|e| ipc::describe(&e))?;
+                let status = client.status().map_err(|e| e.to_string())?;
+                let settings: ProtectionSettings = client.call(Request::GetSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let web: threat_scanner::web::WebConfig = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let protection: ipc::ProtectionStatus = client.call(Request::ProtectionStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let web_status: threat_scanner::service::web::WebStatus = client.call(Request::WebStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                Ok((status, settings, web, protection, web_status))
+            },
+            move |app, read| match read {
+                Ok((status, settings, web, protection, web_status)) => {
+                    app.connected = true;
+                    app.service_lost = None;
+                    let moved = app.service_dir.as_ref() != Some(&status.data_dir);
+                    app.service_dir = Some(status.data_dir);
+                    app.apply_service_settings(settings);
+                    let home = app.signatures_home().to_path_buf();
+                    app.web.use_service_config(web, &home);
+                    app.web.service_status = Some(web_status);
+                    app.abuse_key_saved = update::auth_key_saved(&update::signature_dir(&home));
+                    // The "started" event may have come first.
+                    if protection.watching {
+                        app.watch.running = true;
+                        app.watch.watching = protection.folders;
+                        app.watch.programs = protection.programs;
+                    }
+                    app.manifest = update::load_manifest(&update::signature_dir(app.signatures_home()));
+                    if moved || app.engine.is_none() {
+                        app.reload_signatures(&ctx);
+                    }
+                    app.refresh();
+                }
+                Err(e) => app.service_lost = Some(e),
+            },
+        );
+    }
+
+    /// The service's protection settings: shown on the pages, and the
+    /// baseline changes are compared with.
+    fn apply_service_settings(&mut self, settings: ProtectionSettings) {
+        copy_protection(&mut self.settings, &settings);
+        copy_protection(&mut self.saved_settings, &settings);
+        self.service_settings = Some(settings);
+    }
+
+    /// Sends protection settings changed on a page to the service; a change
+    /// that weakens protection runs `phalanx-cli` elevated (Windows' prompt).
+    /// Declined or failed, the pages show the service's settings again.
+    fn send_settings(&mut self) {
+        let Some(service) = &self.service_settings else { return };
+        let wanted = protection_from(&self.settings, service);
+        if wanted == *service || self.approval.is_some() {
+            return;
+        }
+        self.service_settings = Some(wanted.clone());
+        let args = format!("service set-settings --json {}", link::hex_json(&wanted));
+        self.link.run(
+            move || {
+                let read = || link::call(Request::GetSettings).and_then(|r| r.into_result::<ProtectionSettings>().map_err(|e| e.to_string()));
+                match link::with_approval::<ProtectionSettings>(Request::SetSettings { settings: wanted }, &args, read) {
+                    link::Approval::Done(settings) => (Ok(settings), None),
+                    link::Approval::Declined => (read(), Some("Not changed: Windows' administrator prompt was declined".to_string())),
+                    link::Approval::Failed(e) => (read(), Some(format!("Could not change the settings: {e}"))),
+                }
+            },
+            |app, (settings, note)| {
+                app.approval = None;
+                if let Ok(settings) = settings {
+                    app.apply_service_settings(settings);
+                }
+                if let Some(note) = note {
+                    app.notify(note, false);
+                }
+            },
+        );
+        self.approval = Some("Changes that weaken protection need an administrator's approval".into());
+    }
+
+    /// One event from the service.
+    fn on_event(&mut self, ctx: &egui::Context, event: Event) {
+        match event {
+            Event::EngineReady { rules, hashes } => self.signatures = Ok((rules, hashes)),
+            Event::EngineFailed { error } => self.log_activity(ActivityKind::Problem, "The service could not load its signatures", error),
+            Event::ProtectionOff => {
+                self.watch.running = false;
+                self.log_activity(ActivityKind::Info, "Real-time protection is off", "");
+            }
+            Event::SettingsChanged { settings } => self.apply_service_settings(settings),
+            Event::WebSettingsChanged { settings } => {
+                let home = self.signatures_home().to_path_buf();
+                self.web.use_service_config(settings, &home);
+            }
+            Event::WebApplied { status } => self.web.service_status = Some(status),
+            Event::Web { event } => self.web.add_event(event),
+            Event::UpdateProgress { step } => match &mut self.updating {
+                Some(job) => job.step = step,
+                None => self.updating = Some(UpdateJob { step }),
+            },
+            Event::UpdateFinished { installed, failed, .. } => self.update_finished(ctx, installed, failed, None),
+            Event::UpdateFailed { error } => self.update_finished(ctx, false, Vec::new(), Some(error)),
+            Event::ScanProgress { job, files, bytes, path, .. } => self.scan_event(job, WorkerMsg::Progress { path: path.display().to_string(), files, bytes }),
+            Event::ScanDetection { job, report } => self.scan_event(job, WorkerMsg::Detection(report)),
+            Event::ScanFinished { job, report } => self.scan_event(job, WorkerMsg::Done(Ok(report))),
+            Event::ScanFailed { job, error } => self.scan_event(job, WorkerMsg::Done(Err(error))),
+            other => {
+                if let Some(msg) = watch_msg(other) {
+                    self.on_watch(vec![msg]);
+                }
+            }
+        }
+    }
+
+    /// Passes a scan event to the scan this app started, holding it until
+    /// the service has said which job that is.
+    fn scan_event(&mut self, job: u64, msg: WorkerMsg) {
+        match &self.job {
+            Some(ours) if ours.job == Some(job) => {
+                let _ = ours.tx.send(msg);
+            }
+            Some(ours) if ours.job.is_none() => self.early_scan_events.push((job, msg)),
+            _ => {}
         }
     }
 
@@ -1485,9 +1479,7 @@ impl App {
         self.activity.truncate(MAX_ACTIVITY);
     }
 
-    fn poll_watch(&mut self) {
-        let Some(rx) = &self.watch_rx else { return };
-        let messages: Vec<WatchMsg> = rx.try_iter().collect();
+    fn on_watch(&mut self, messages: Vec<WatchMsg>) {
         let mut changed_history = false;
         for msg in messages {
             match msg {
@@ -1507,7 +1499,8 @@ impl App {
                     }
                     self.watch.failed = failed;
                     self.log_activity(ActivityKind::Info, text, "");
-                    self.settings.watch_checkpoint = Some(unix_now());
+                    self.watch.running = true;
+                    self.watch.since = Some(chrono::Local::now().format("%H:%M").to_string());
                 }
                 WatchMsg::FolderLost { folder, reason } => {
                     self.watch.watching = self.watch.watching.saturating_sub(1);
@@ -1570,8 +1563,6 @@ impl App {
                         // Programs are checked constantly; only threats are logged.
                         Origin::Program => self.watch.programs_checked += files,
                     }
-                    self.settings.watch_checkpoint = Some(unix_now());
-                    self.last_checkpoint = Instant::now();
                     changed_history |= threats > 0 || origin == Origin::Folder;
                 }
                 WatchMsg::RiskyFile { path, risk, origin } => {
@@ -1644,10 +1635,7 @@ impl App {
 
     /// Saves settings when they change; the checkpoint at most once a minute.
     fn persist_settings(&mut self) {
-        if self.watch.running && self.last_checkpoint.elapsed() >= CHECKPOINT_EVERY {
-            self.settings.watch_checkpoint = Some(unix_now());
-            self.last_checkpoint = Instant::now();
-        }
+        self.send_settings();
         if self.settings != self.saved_settings {
             match self.settings.save(&self.data_dir) {
                 Ok(()) => self.saved_settings = self.settings.clone(),
@@ -1670,6 +1658,106 @@ impl App {
             }
             Err(e) => self.notify(format!("Could not change start-up setting: {e:#}"), false),
         }
+    }
+}
+
+/// The protection settings the pages show, from the service's.
+fn copy_protection(s: &mut Settings, p: &ProtectionSettings) {
+    s.watch_enabled = p.watch_enabled;
+    s.watch_folders = p.watch_folders.clone();
+    s.program_protection = p.program_protection;
+    s.stop_running_threats = p.stop_running_threats;
+    s.scan_new_drives = p.scan_new_drives;
+    s.defer_when_fullscreen = p.defer_when_fullscreen;
+    s.heuristics = p.heuristics;
+    s.trust_signed = p.trust_signed;
+    s.scan_archives = p.scan_archives;
+    s.max_size_mb = p.max_size_mb;
+    s.exclusions = p.exclusions.clone();
+    s.performance = p.performance;
+    s.auto_quarantine = p.auto_quarantine;
+    s.quarantine_suspicious = p.quarantine_suspicious;
+    s.auto_update = p.auto_update;
+    s.auto_update_hours = p.auto_update_hours;
+}
+
+/// The protection settings as the pages have them; what the pages do not
+/// show is kept as the service has it.
+fn protection_from(s: &Settings, service: &ProtectionSettings) -> ProtectionSettings {
+    ProtectionSettings {
+        watch_enabled: s.watch_enabled,
+        watch_folders: s.watch_folders.clone(),
+        program_protection: s.program_protection,
+        stop_running_threats: s.stop_running_threats,
+        scan_new_drives: s.scan_new_drives,
+        defer_when_fullscreen: s.defer_when_fullscreen,
+        heuristics: s.heuristics,
+        trust_signed: s.trust_signed,
+        scan_archives: s.scan_archives,
+        max_size_mb: s.max_size_mb,
+        exclusions: s.exclusions.clone(),
+        performance: s.performance,
+        auto_quarantine: s.auto_quarantine,
+        quarantine_suspicious: s.quarantine_suspicious,
+        auto_update: s.auto_update,
+        auto_update_hours: s.auto_update_hours,
+        ..service.clone()
+    }
+}
+
+/// The activity-log entry for a real-time protection event.
+fn watch_msg(event: Event) -> Option<WatchMsg> {
+    Some(match event {
+        Event::ProtectionStarted { watching, failed, programs } => WatchMsg::Started { watching, failed, programs },
+        Event::FolderLost { folder, reason } => WatchMsg::FolderLost { folder, reason },
+        Event::FolderRestored { folder } => WatchMsg::FolderRestored(folder),
+        Event::FolderRescan { folder } => WatchMsg::FolderRescan(folder),
+        Event::Detection { report, processes, repeat } => WatchMsg::Detection { report, processes, repeat },
+        Event::Scanned { origin, files, threats } => WatchMsg::Scanned { origin, files, threats },
+        Event::RiskyFile { path, risk, origin } => WatchMsg::RiskyFile { path, risk, origin },
+        Event::RiskyChecked { path, outcome } => WatchMsg::RiskyChecked { path, outcome },
+        Event::Command { hit } => WatchMsg::Command(hit),
+        Event::DriveAdded { root, files } => WatchMsg::DriveAdded { root, files },
+        Event::Restarting { error, retry_in_secs } => WatchMsg::Restarting { error, retry_in: Duration::from_secs(retry_in_secs) },
+        Event::ProtectionError { message } => WatchMsg::Error(message),
+        _ => return None,
+    })
+}
+
+/// Shows a Windows notification for an event, as the settings say. Called
+/// by the event connection's thread, so it works with the window hidden.
+fn notify_event(event: &Event, prefs: &link::NotifyPrefs) {
+    match event {
+        Event::Detection { report, processes, repeat } if prefs.threats() => {
+            let (title, body) = threat_notification(report, processes, *repeat);
+            system::notify(&title, &body);
+        }
+        Event::RiskyFile { path, risk, origin } if prefs.risky() => {
+            let (title, body) = risky_notification(path, risk, origin.as_ref());
+            system::notify(&title, &body);
+        }
+        Event::RiskyChecked { path, outcome } if prefs.risky() => {
+            let file = widgets::file_name(&path.display().to_string());
+            match outcome {
+                RiskyOutcome::NoThreatFound => system::notify(
+                    &format!("No known threats in {file}"),
+                    "Nothing known was found, which does not prove it is safe. Open Phalanx to have the AI inspect it.",
+                ),
+                RiskyOutcome::NotScanned(reason) => system::notify(&format!("{file} was not scanned"), reason),
+                // Reported by the detection notification.
+                RiskyOutcome::Threat(_) => {}
+            }
+        }
+        Event::Web { event } if prefs.threats() && event.action == "blocked" => system::notify(
+            &format!("Blocked a dangerous site: {}", event.target),
+            &format!("{} ({}). Phalanx stopped this connection.", event.threat, event.category),
+        ),
+        // Medium-confidence matches are common in admin tools; only logged.
+        Event::Command { hit } if prefs.threats() && hit.confidence() == Confidence::High => {
+            let (title, body) = command_notification(hit);
+            system::notify(&title, &body);
+        }
+        _ => {}
     }
 }
 
@@ -1760,13 +1848,7 @@ fn risky_notification(path: &Path, risk: &RiskyFile, origin: Option<&DownloadOri
 
 impl Drop for App {
     fn drop(&mut self) {
-        if self.watch.running {
-            self.settings.watch_checkpoint = Some(unix_now());
-        }
         let _ = self.settings.save(&self.data_dir);
-        if let Some(handle) = self.watcher.take() {
-            handle.stop();
-        }
     }
 }
 
@@ -1774,11 +1856,9 @@ impl eframe::App for App {
     /// Runs before every frame and also while the window is hidden in the
     /// tray (whenever a background thread requests a repaint).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_engine(ctx);
+        self.poll_link(ctx);
+        self.poll_engine();
         self.poll_job();
-        self.poll_update();
-        self.poll_auto_update(ctx);
-        self.poll_watch();
         self.poll_service(ctx);
         self.poll_posture();
         self.poll_fix(ctx);
@@ -1788,7 +1868,6 @@ impl eframe::App for App {
         self.poll_inspect();
         self.poll_models();
         self.poll_web(ctx);
-        self.sync_watcher(ctx);
         self.persist_settings();
         let busy = self.inspect.preparing.is_some()
             || self.inspect.running.is_some()
@@ -1796,15 +1875,13 @@ impl eframe::App for App {
             || self.fix_rx.is_some()
             || self.audit_busy()
             || self.ai_models_rx.is_some()
-            || self.update_check_rx.is_some()
+            || self.approval.is_some()
             || self.web_busy();
         if self.job.is_some() || self.updating.is_some() || self.engine_rx.is_some() || busy {
             ctx.request_repaint_after(Duration::from_millis(200));
         } else if self.page == Page::Web {
             // Picks up exceptions added from the browser and new blocks.
             ctx.request_repaint_after(Duration::from_secs(3));
-        } else if self.watch.running {
-            ctx.request_repaint_after(CHECKPOINT_EVERY);
         }
     }
 

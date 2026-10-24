@@ -212,6 +212,18 @@ pub fn autostart_command() -> Option<String> {
     None
 }
 
+/// The command the machine-wide "run at sign-in" entry starts (written by
+/// the installer, for every user), if there is one.
+pub fn machine_autostart_command() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(RUN_KEY).ok()?.get_value::<String, _>(RUN_VALUE).ok()
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 /// Whether this user's "run at sign-in" entry exists.
 pub fn autostart_enabled() -> bool {
     autostart_command().is_some()
@@ -271,13 +283,24 @@ pub fn run_elevated(program: &std::path::Path, parameters: &str) -> Result<Eleva
     {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
         use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
         let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        // Windows' prompt comes up in front only for the window the user is
+        // in; without one it may wait as a flashing taskbar button.
+        let owner = unsafe {
+            let window = GetForegroundWindow();
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(window, &mut pid);
+            if pid == GetCurrentProcessId() { window } else { std::ptr::null_mut() }
+        };
         let params = wide(parameters);
         let (verb, file) = (wide("runas"), wide(&program.display().to_string()));
         let mut info = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
             fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            hwnd: owner,
             lpVerb: verb.as_ptr(),
             lpFile: file.as_ptr(),
             lpParameters: params.as_ptr(),

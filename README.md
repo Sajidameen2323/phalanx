@@ -18,6 +18,8 @@ account, and shows you exactly what it found and why.
 | **AI Inspect** | Asks Google Gemini for a second opinion on a file (optional, needs your own API key). |
 | **Signature updates** | Pulls fresh malware hashes, YARA rules and malicious web addresses from public threat-intelligence feeds (abuse.ch, YARA Forge, URLhaus, HaGeZi, CERT Polska). |
 
+Protection runs in a Windows service, so it keeps going with the app closed and
+nobody signed in, and anything that weakens it needs an administrator's approval.
 Phalanx works in user mode, without a kernel driver, so it is designed to run
 **alongside Microsoft Defender**, not instead of it. It adds the web blocking,
 stealer checks, command-line checks and clear explanations on top. See
@@ -91,18 +93,25 @@ The icon assets in `assets/` come from the Phalanx logo:
 
 The first build takes several minutes, mostly compiling YARA-X's WebAssembly JIT.
 
-### Protection service (in development)
+### Protection service
 
-Protection is moving into a Windows service, so that it keeps running when the app
-is closed and programs running as the user cannot switch it off; see
-[docs/protection-service.md](docs/protection-service.md). So far the build adds
-`phalanx-service.exe`, the pipe the app and CLI talk to it on, and:
+Protection runs in a Windows service, `phalanx-service.exe`, as LocalSystem: it
+keeps protecting when the app is closed and nobody is signed in, and programs
+running as a user cannot switch it off. It runs real-time protection, scans,
+signature updates, quarantine, and the DNS filter and block page, with its data in
+`%ProgramData%\Phalanx` (administrators can change it; users can read it, except
+the quarantine). The app, the browser connector and the CLI talk to it on the
+named pipe `\.\pipe\Phalanx`, and the app shows its notifications. Anything that
+weakens protection needs an administrator: the app then runs `phalanx-cli`
+elevated, after Windows' own prompt, which malware running as the user cannot
+answer. Malware that already has administrator rights is out of reach of any
+user-mode tool; see [docs/protection-service.md](docs/protection-service.md).
 
 ```
-phalanx-cli service install     # as administrator: install and start it
+phalanx-cli service install     # as administrator: install and start it (setup does this)
 phalanx-cli service status      # any user: is it running, and who am I to it
 phalanx-cli service stop | start | uninstall
-phalanx-cli service migrate     # as administrator, once: bring your data over
+phalanx-cli service migrate     # as administrator, once: bring a 0.4 user's data over
 phalanx-cli service scan D:\    # scan in the service, with progress
 phalanx-cli service events      # watch what the service reports
 phalanx-cli service settings | history
@@ -111,14 +120,15 @@ phalanx-cli service web         # web settings and whether the DNS filter runs
 phalanx-cli service site block example.test   # allow / unblock need administrator
 phalanx-cli service ads on|off  # off needs administrator
 phalanx-cli service auth-key --from-app       # as administrator: the app's abuse.ch key
-phalanx-service --console --pipe \\.\pipe\phalanx-dev --data-dir D:\dev-data
 ```
 
-The installed service runs real-time protection (when it is turned on in its
-settings), scans, signature updates, and the DNS filter and block page (when the DNS
-filter is on in its web settings), with its data in `%ProgramData%\Phalanx`. With the
-service running, the browser connector uses it. The app does not use it yet: it
-keeps protecting as before until it switches to the service.
+For development, run the service in a terminal on a pipe of its own and point the
+app and CLI at it:
+
+```
+phalanx-service --console --pipe \.\pipe\phalanx-dev --data-dir D:\dev-data
+set PHALANX_PIPE=\.\pipe\phalanx-dev
+```
 
 ### Installer
 
@@ -129,13 +139,21 @@ cargo build --release
 
 This needs [Inno Setup](https://jrsoftware.org/isinfo.php) 6.7 or later and produces
 `target\installer\Phalanx-Setup-<version>.exe`, with the version read from the built
-`phalanx.exe` (so it always matches `Cargo.toml`). Setup installs per user, without
-administrator rights, into `%LOCALAPPDATA%\Programs\Phalanx`, and ships a short user
-guide (`installer\README.txt`) rather than this file. A running Phalanx, even one
-hidden in the tray, is asked to quit before files are replaced. The uninstaller puts
-Windows' DNS settings back if the DNS filter was set up (`phalanx-cli web
-restore-dns`), and asks before deleting the data folder. The setup program is not
-code-signed, so SmartScreen warns about it until it is.
+`phalanx.exe` (so it always matches `Cargo.toml`). Setup asks for administrator
+rights once and installs for the whole PC into `Program Files\Phalanx`: it installs
+and starts the protection service, and starts the app in the tray at every user's
+sign-in (`HKLM\...\Run`). It ships a short user guide (`installer\README.txt`)
+rather than this file. A running Phalanx is asked to quit, and the service is
+stopped, before files are replaced.
+
+Setup upgrades a 0.4.x install (per user, in `%LOCALAPPDATA%\Programs\Phalanx`):
+the installing user's settings, history, quarantine, web lists and abuse.ch key are
+brought into the service's folder, the old copy is removed, and its data folder is
+kept. If Windows' DNS was pointed at the DNS filter, it stays that way: the
+service answers on the same address. The uninstaller puts Windows' DNS settings
+back if the DNS filter was set up (`phalanx-cli web restore-dns`), removes the
+service, and asks before deleting the data. The setup program is not code-signed,
+so SmartScreen warns about it until it is.
 
 ## Desktop app
 
@@ -252,16 +270,19 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
 * **Light on resources.** One file is scanned at a time per lane; everything but new
   programs runs at Windows *background priority*. While a full-screen game or
   presentation runs, the bulk lane waits (at most 10 minutes).
-* **Catches up.** Files that arrived while the app was closed are scanned the next
-  time it starts. A copied-in file counts as new even if it keeps an old
+* **Catches up.** Files that arrived while the service was stopped are scanned the
+  next time it starts. A copied-in file counts as new even if it keeps an old
   modification time.
-* **Keeps running when closed.** Closing the window keeps it running in the tray.
-  Right-click the tray icon and choose **Quit** to stop it.
-* **Start with Windows.** This setting adds a per-user sign-in entry
-  (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, no administrator rights
-  needed). It starts the app hidden in the tray with protection on: the window
-  never appears or takes the focus until you open it from the tray. An existing
-  entry for this program that lacks `--background` is corrected on start.
+* **Runs without the app.** Real-time protection runs in the protection service, so
+  closing or quitting the app does not stop it. The app keeps running in the tray
+  to show notifications, and warns when the service has been down for a while.
+* **Start with Windows.** Setup adds a machine-wide sign-in entry
+  (`HKLM\Software\Microsoft\Windows\CurrentVersion\Run`) that starts the app
+  hidden in the tray for every user: the window never appears or takes the focus
+  until you open it from the tray. Each user can turn it off for themselves in
+  Windows' Settings > Apps > Startup. Without setup's entry, the app's own setting
+  adds a per-user one (`HKCU`); a per-user entry left by 0.4 is removed when the
+  machine-wide one exists.
 * **One copy at a time.** Launching it again brings the running window to the
   front. A second start-up entry (`--background`) never does.
 * **Warns about programs and scripts before you open them.** When an `.exe`, `.msi`,

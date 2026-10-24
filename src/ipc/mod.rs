@@ -30,6 +30,17 @@ use std::time::Duration;
 
 /// The service's pipe.
 pub const PIPE_NAME: &str = r"\\.\pipe\Phalanx";
+/// For development: the pipe of a `phalanx-service --console` run to use
+/// instead. It also lifts the check that the server is a real service.
+pub const PIPE_ENV: &str = "PHALANX_PIPE";
+
+/// The pipe clients use: [`PIPE_ENV`] if set, else [`PIPE_NAME`].
+pub fn pipe_name() -> (String, bool) {
+    match std::env::var(PIPE_ENV) {
+        Ok(name) if !name.trim().is_empty() => (name, false),
+        _ => (PIPE_NAME.to_string(), true),
+    }
+}
 
 /// What a client asks of the service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +124,9 @@ pub enum Request {
     ChangeSite { change: SiteChange, site: String },
     /// Whether the DNS filter runs and how many web rules are loaded.
     WebStatus,
+    /// Quarantine a file no scan detected (AI Inspect flagged it):
+    /// administrators only, since the service can remove any file.
+    QuarantineFile { path: PathBuf, threat: String },
 }
 
 /// What the service reports to subscribed clients: real-time protection
@@ -151,6 +165,10 @@ pub enum Event {
     WebApplied { status: WebStatus },
     /// The DNS filter blocked (or reported) a site.
     Web { event: WebEvent },
+    /// The protection settings were changed (by anyone, from anywhere).
+    SettingsChanged { settings: ProtectionSettings },
+    /// The web settings were changed.
+    WebSettingsChanged { settings: WebConfig },
 }
 
 impl From<RtpEvent> for Event {
@@ -212,7 +230,8 @@ impl Request {
             | Request::DeleteQuarantined { .. }
             | Request::Migrate { .. }
             | Request::RunBoxView
-            | Request::SetAuthKey { .. } => {
+            | Request::SetAuthKey { .. }
+            | Request::QuarantineFile { .. } => {
                 Allowed::Administrator
             }
         }
@@ -315,6 +334,12 @@ pub struct ProtectionStatus {
     pub engine: Option<(usize, usize)>,
     /// Real-time protection is watching (it has started).
     pub watching: bool,
+    /// Folders it watches.
+    #[serde(default)]
+    pub folders: usize,
+    /// Programs are scanned as they start.
+    #[serde(default)]
+    pub programs: bool,
     /// Scans running now.
     pub scans: usize,
 }
@@ -336,7 +361,8 @@ impl Client {
     /// cannot create anything), so another program holding the name first
     /// cannot pose as it.
     pub fn connect() -> io::Result<Self> {
-        Self::connect_to(PIPE_NAME, true)
+        let (name, service_only) = pipe_name();
+        Self::connect_to(&name, service_only)
     }
 
     /// Connects to `name`; `service_only` as in [`Client::connect`]. Tests

@@ -8,16 +8,30 @@ It runs alongside Microsoft Defender and adds to it; keep Defender on.
 
 GETTING STARTED
 
-1. Open Phalanx from the Start menu.
-2. Protection: turn on real-time protection. It watches your Downloads
-   folder, checks every program as it starts, and scans disk images and USB
-   drives when they appear.
-3. Web protection: choose "Connect browsers", then add the Browser Guard
-   extension to each browser once (the page shows how).
-4. Dashboard: run a quick scan.
+Protection starts as soon as setup finishes: it runs in the Phalanx
+protection service, for the whole PC, whether or not the app is open and
+even with nobody signed in. It watches everyone's Downloads folder, checks
+every program as it starts, and scans disk images and USB drives when they
+appear.
 
-Closing the window keeps Phalanx running in the tray. To stop it, right-click
-the tray icon and choose Quit.
+1. Open Phalanx from the Start menu.
+2. Web protection: choose "Connect browsers" (setup did this for you if you
+   left that option on), then add the Browser Guard extension to each
+   browser once (the page shows how). Each Windows user does this once.
+3. Dashboard: run a quick scan.
+
+The app opens in the tray when you sign in, to show notifications. Closing
+the window or quitting it does not stop protection.
+
+
+CHANGES THAT NEED AN ADMINISTRATOR
+
+Anything that weakens protection asks for Windows' administrator approval:
+turning protection or one of its checks off, adding an exclusion or an
+allowed site, restoring or deleting a quarantined file, and so on.
+Strengthening it never asks. Malware running as you can ask for these
+changes, but it cannot approve them. Phalanx cannot protect against malware
+that already has administrator rights.
 
 
 WHAT IT DOES
@@ -36,7 +50,9 @@ WHAT IT DOES
 
 YOUR DATA
 
-History, quarantine, settings and downloaded signatures are kept in
+History, quarantine, protection settings and downloaded signatures are
+kept by the service in %ProgramData%\Phalanx, which only administrators can
+change. Your own app settings (appearance, notifications, AI Inspect) are in
 %LOCALAPPDATA%\threat-scanner. Phalanx connects to the internet only to
 download signature updates and browser version information, and to Google
 Gemini if you turn on AI Inspect.
@@ -46,8 +62,8 @@ UNINSTALLING
 
 Use Settings > Apps > Installed apps > Phalanx. If you set Windows to use
 Phalanx's DNS filter, the uninstaller puts your previous DNS settings back
-first (Windows asks for permission). You choose whether to keep your data
-folder; keep it if you may need to restore a quarantined file.
+first. The protection service is removed, and you choose whether to keep
+the data; keep it if you may need to restore a quarantined file.
 
 
 MORE

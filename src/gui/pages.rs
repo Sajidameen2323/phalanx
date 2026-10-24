@@ -26,6 +26,11 @@ impl App {
         let shown: Option<Page> = ctx.data(|d| d.get_temp(Id::new("page-shown")));
         if shown != Some(self.page) {
             ctx.data_mut(|d| d.insert_temp(Id::new("page-shown"), self.page));
+            // History and quarantine change elsewhere too (real-time
+            // protection, the command line, other users): read them again.
+            if shown.is_some() && matches!(self.page, Page::Dashboard | Page::Quarantine | Page::History) {
+                self.refresh();
+            }
             if shown.is_some() {
                 motion::set(ctx, enter, 0.0);
             }
@@ -43,6 +48,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.multiply_opacity(t);
                         ui.add_space((1.0 - t) * 14.0);
+                        self.service_banner(ui);
                         match self.page {
                             Page::Dashboard => self.dashboard(ui, ctx),
                             Page::Scan => self.scan_page(ui, ctx),
@@ -157,6 +163,23 @@ impl App {
         });
     }
 
+    /// Above the pages that show protection: the service is missing, or a
+    /// change waits for Windows' administrator prompt.
+    fn service_banner(&mut self, ui: &mut Ui) {
+        let protection_page = !matches!(self.page, Page::Inspect | Page::Privacy | Page::Audit);
+        if let Some(waiting) = &self.approval {
+            notice(ui, theme().amber, &format!("{waiting}. Answer Windows' prompt to go on."));
+            ui.add_space(12.0);
+        } else if protection_page && !self.connected && self.service_lost.is_some() {
+            notice(
+                ui,
+                theme().red,
+                "The Phalanx protection service is not running, so this PC is not protected. Start Phalanx Protection in Windows' Services app, or reinstall Phalanx.",
+            );
+            ui.add_space(12.0);
+        }
+    }
+
     fn dashboard(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         // Threats from any scan (manual or real-time protection) in the last 7
         // days that were not quarantined need attention.
@@ -192,7 +215,7 @@ impl App {
                 ),
             }
         };
-        let scanning = self.job.is_some() || self.queued_scan.is_some();
+        let scanning = self.job.is_some();
 
         // ---- the hero: an open dot field, no frame ----
         let width = ui.available_width();
@@ -260,8 +283,8 @@ impl App {
             self.start_scan(ctx, vec![dir], "custom");
             self.page = Page::Dashboard;
         }
-        if cancel && let Some(job) = &self.job {
-            job.cancel.store(true, Ordering::Relaxed);
+        if cancel {
+            self.cancel_scan();
         }
         if view {
             self.page = Page::Scan;
@@ -341,7 +364,7 @@ impl App {
             (None, None) => format!("Never updated · built-in set only · {every}"),
         };
         setting_row(ui, "Signatures", &summary, |ui| {
-            if self.updating.is_some() || self.update_check_rx.is_some() {
+            if self.updating.is_some() {
                 spinner(ui);
             } else {
                 update_clicked = small_button(ui, "Check now").clicked();
@@ -351,7 +374,7 @@ impl App {
             self.page = Page::Protection;
         }
         if update_clicked {
-            self.start_update(ctx, false);
+            self.start_update();
         }
         let rest_now = ui.cursor().top() - rect.bottom();
         if (rest_now - rest).abs() > 0.5 {
@@ -368,7 +391,7 @@ impl App {
             Full,
             Custom,
         }
-        let busy = self.job.is_some() || self.queued_scan.is_some();
+        let busy = self.job.is_some();
         let drives = system::fixed_drives();
         let drive_list = drives.iter().map(|d| d.display().to_string().trim_end_matches('\\').to_string()).collect::<Vec<_>>().join(", ");
         let mut start: Option<(Vec<PathBuf>, &str)> = None;
@@ -435,7 +458,7 @@ impl App {
         page_header(ui, "Scan");
 
         if let Some(job) = &self.job {
-            let cancelling = job.cancel.load(Ordering::Relaxed);
+            let cancelling = job.cancelling;
             self.scan_fx.show(ui, self.scan_run, StageMode::Scanning { files: job.files, threats: self.results.len(), cancelling });
             ui.add_space(14.0);
             let mut cancel = false;
@@ -464,17 +487,9 @@ impl App {
                 truncated(ui, job.current.clone(), theme().muted, 12.0);
             });
             if cancel {
-                job.cancel.store(true, Ordering::Relaxed);
+                self.cancel_scan();
             }
             ui.add_space(14.0);
-        } else if self.queued_scan.is_some() {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    spinner(ui);
-                    ui.label(RichText::new("Loading signatures").font(semibold(16.0)).color(theme().text));
-                });
-            });
-            return;
         } else if let Some(done) = &self.finished {
             let (outcome, title) = match (done.cancelled, done.infected) {
                 (true, _) => (Outcome::Cancelled, "Scan cancelled".to_string()),
@@ -554,21 +569,24 @@ impl App {
             Some(ServiceView::NotInstalled) => (
                 theme().muted,
                 "Protection service: not installed".to_string(),
-                "Protection runs inside this app for now. The service is being built to keep protecting when the app is closed and nobody is signed in.".to_string(),
+                "Phalanx protects this PC through its service, so nothing is protected now. Reinstall Phalanx to put the service back.".to_string(),
             ),
             Some(ServiceView::Down(state)) => (
                 theme().amber,
                 format!("Protection service: {state}"),
-                "Windows restarts it automatically after a failure. An administrator can start it with `phalanx-cli service start`.".to_string(),
+                "This PC is not protected until it runs again. Windows restarts it automatically after a failure; an administrator can start Phalanx Protection in Windows' Services app.".to_string(),
             ),
             Some(ServiceView::Running { version, user, admin }) => (
                 theme().green,
                 format!("Protection service: running ({version})"),
-                if *admin {
-                    format!("Signed in as {user}, an administrator: you can change every setting.")
-                } else {
-                    format!("Signed in as {user}. Changes that weaken protection will need an administrator's approval.")
-                },
+                format!(
+                    "It protects this PC with this app closed and with nobody signed in. {} It cannot stop malware that already has administrator rights.",
+                    if *admin {
+                        format!("Signed in as {user}, an administrator: you can change every setting.")
+                    } else {
+                        format!("Signed in as {user}: changes that weaken protection need an administrator's approval, which other programs cannot give themselves.")
+                    }
+                ),
             ),
             Some(ServiceView::Unreachable(e)) => (theme().red, "Protection service: not answering".to_string(), capitalize(e)),
         };
@@ -901,18 +919,15 @@ impl App {
             ui.add_space(8.0);
         }
         if let Some(id) = toggle && self.expanded.remove(&id).is_none() {
-            let details = self.store().and_then(|store| {
-                Ok(ScanDetails {
-                    detections: store.scan_detections(id).map_err(|e| e.to_string())?,
-                    errors: store.scan_errors(id).map_err(|e| e.to_string())?,
-                })
-            });
-            match details {
-                Ok(details) => {
-                    self.expanded.insert(id, details);
-                }
-                Err(e) => self.notify(format!("Could not load scan details: {e}"), false),
-            }
+            self.link.run(
+                move || link::read::<(Vec<DetectionRow>, Vec<ScanErrorRow>)>(Request::ScanDetails { scan: id }),
+                move |app, details| match details {
+                    Ok((detections, errors)) => {
+                        app.expanded.insert(id, ScanDetails { detections, errors });
+                    }
+                    Err(e) => app.notify(format!("Could not load scan details: {e}"), false),
+                },
+            );
         }
     }
 
@@ -964,12 +979,21 @@ impl App {
         let has_tray = self.tray.is_some();
         card(ui, |ui| {
             group_title(ui, "Startup and background", "");
-            setting_toggle(
-                ui,
-                &mut autostart,
-                "Start with Windows",
-                "Opens in the tray when you sign in, so real-time protection starts automatically. Adds a per-user sign-in entry; no administrator rights are needed.",
-            );
+            if self.machine_autostart {
+                setting_row(
+                    ui,
+                    "Start with Windows",
+                    "Phalanx opens in the tray for everyone who signs in, to show its notifications; protection itself runs in the protection service whether or not it is open. To stop it opening for you, turn Phalanx off in Windows' Settings > Apps > Startup.",
+                    |ui| badge(ui, "On", theme().green),
+                );
+            } else {
+                setting_toggle(
+                    ui,
+                    &mut autostart,
+                    "Start with Windows",
+                    "Opens in the tray when you sign in, to show notifications from the protection service. Adds a per-user sign-in entry; no administrator rights are needed.",
+                );
+            }
             row_divider(ui);
             ui.add_enabled_ui(has_tray, |ui| {
                 setting_toggle(
@@ -977,7 +1001,7 @@ impl App {
                     &mut self.settings.close_to_tray,
                     "Keep running in the tray when the window is closed",
                     if has_tray {
-                        "Real-time protection keeps working with the window closed. Right-click the tray icon to quit."
+                        "Notifications keep coming with the window closed. Right-click the tray icon to quit; protection keeps running in the service either way."
                     } else {
                         "Unavailable: the tray icon could not be created, so closing the window quits."
                     },
@@ -1027,15 +1051,30 @@ impl App {
         }
         ui.add_space(14.0);
 
-        let mut open = false;
+        let mut open = None;
         card(ui, |ui| {
-            group_title(ui, "Data", "History, quarantine, downloaded signatures and settings.");
-            setting_row(ui, "Data folder", &self.data_dir.display().to_string(), |ui| {
-                open = small_button(ui, "Open folder").clicked();
+            group_title(ui, "Data", "");
+            if let Some(dir) = &self.service_dir {
+                setting_row(
+                    ui,
+                    "Protection data",
+                    &format!("History, quarantine, signatures and protection settings, kept by the protection service. Only administrators can change them.\n{}", dir.display()),
+                    |ui| {
+                        if small_button(ui, "Open folder").clicked() {
+                            open = Some(dir.clone());
+                        }
+                    },
+                );
+                row_divider(ui);
+            }
+            setting_row(ui, "Your settings", &format!("Appearance, notifications and AI Inspect, for you only.\n{}", self.data_dir.display()), |ui| {
+                if small_button(ui, "Open folder").clicked() {
+                    open = Some(self.data_dir.clone());
+                }
             });
         });
-        if open {
-            let _ = std::process::Command::new("explorer").arg(&self.data_dir).spawn();
+        if let Some(dir) = open {
+            let _ = std::process::Command::new("explorer").arg(dir).spawn();
         }
     }
 
@@ -1184,26 +1223,21 @@ impl App {
             }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                if self.update_check_rx.is_some() {
+                if let Some(job) = &self.updating {
                     spinner(ui);
-                    muted(ui, "Checking feeds for new data…");
+                    muted(ui, job.step.clone());
                 } else {
-                    let status = match &self.update_check {
-                        Some((time, r)) if r.changed.is_empty() && r.failed.is_empty() => format!("Checked at {time}: everything is up to date."),
-                        Some((time, r)) if r.changed.is_empty() => format!("Checked at {time}: could not reach {}.", r.failed.join(", ")),
-                        Some((time, r)) => format!("Checked at {time}: new data from {}.", r.changed.join(", ")),
-                        None => match self.settings.last_update_check {
-                            Some(t) => format!("Last checked {} ago.", fmt_duration(Duration::from_secs(unix_now().saturating_sub(t)))),
-                            None => "Not checked yet.".to_string(),
-                        },
+                    let status = match self.manifest.last_check() {
+                        Some(t) => format!("Last checked {}.", short_time(t)),
+                        None => "Not checked yet.".to_string(),
                     };
                     muted(ui, status);
-                    check_clicked = self.updating.is_none() && small_button(ui, "Check now").clicked();
+                    check_clicked = small_button(ui, "Check now").clicked();
                 }
             });
         });
         if check_clicked {
-            self.check_updates_now(ctx);
+            self.start_update();
         }
         ui.add_space(14.0);
         card(ui, |ui| {
@@ -1249,7 +1283,7 @@ impl App {
             small(ui, "Sources: YARA Forge (licences vary per rule), malware-filter's URLhaus host list (CC0), StevenBlack hosts (MIT) and, with an Auth-Key, abuse.ch MalwareBazaar, ThreatFox and URLhaus (CC0). Only feeds with new data are downloaded, and downloads are validated before they replace your current signatures. Web protection picks up new web rules automatically.");
         });
         if update_clicked {
-            self.start_update(ctx, false);
+            self.start_update();
         }
         ui.add_space(14.0);
         self.abuse_key_card(ui, ctx);
@@ -1271,7 +1305,7 @@ impl App {
             setting_row(
                 ui,
                 "Known-bad hashes and malware sites",
-                "MalwareBazaar, ThreatFox and URLhaus only share their data with a free personal key (sign in at abuse.ch with a GitHub, Google or Microsoft account and copy your Auth-Key). Without it those feeds are skipped; YARA rules and the other feeds still update. The key is stored encrypted by Windows, so only your account on this PC can read it.",
+                "MalwareBazaar, ThreatFox and URLhaus only share their data with a free personal key (sign in at abuse.ch with a GitHub, Google or Microsoft account and copy your Auth-Key). Without it those feeds are skipped; YARA rules and the other feeds still update. The protection service keeps the key encrypted, readable only by administrators, so saving or removing it asks for an administrator's approval.",
                 |ui| badge(ui, state, color),
             );
             ui.horizontal_wrapped(|ui| {
@@ -1289,26 +1323,22 @@ impl App {
             });
             ui.hyperlink_to(RichText::new("Get a free Auth-Key at auth.abuse.ch").size(12.5), update::AUTH_KEY_PORTAL);
         });
-        let sig_dir = update::signature_dir(&self.data_dir);
+        let _ = ctx;
         if save {
+            // Saved for this user first (encrypted for them), where the
+            // elevated `phalanx-cli` reads it: the key never goes on a
+            // command line.
+            let sig_dir = update::signature_dir(&self.data_dir);
             match update::save_auth_key(&sig_dir, Some(self.abuse_key_input.trim())) {
                 Ok(()) => {
                     self.abuse_key_input.clear();
-                    self.abuse_key_saved = true;
-                    self.notify("Auth-Key saved; downloading the abuse.ch feeds", true);
-                    self.start_update(ctx, false);
+                    self.set_service_auth_key(Some(()));
                 }
                 Err(e) => self.notify(format!("Could not save the Auth-Key: {e:#}"), false),
             }
         }
         if remove {
-            match update::save_auth_key(&sig_dir, None) {
-                Ok(()) => {
-                    self.abuse_key_saved = false;
-                    self.notify("Auth-Key removed; the abuse.ch feeds will be skipped", true);
-                }
-                Err(e) => self.notify(format!("Could not remove the Auth-Key: {e:#}"), false),
-            }
+            self.set_service_auth_key(None);
         }
     }
 

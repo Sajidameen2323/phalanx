@@ -1,15 +1,15 @@
-//! The Web protection page: blocking mode, the browser connector, the local
-//! DNS filter, site checks, the user's allow/block lists, recent blocks and
-//! the browser extension scan.
+//! The Web protection page: blocking mode, the browser connector, the DNS
+//! filter, site checks, the user's allow/block lists, recent blocks and the
+//! browser extension scan.
+//!
+//! The settings, the DNS filter and the block page belong to the protection
+//! service; this page shows them and sends changes, as the protection
+//! settings do. The browser connector and extension checks are per user.
 
 use super::*;
 use eframe::egui::{Align, Layout, RichText, Ui};
-use std::net::SocketAddr;
-use std::time::SystemTime;
-use threat_scanner::web::blockpage::BlockPageServer;
-use threat_scanner::web::cache::RedirectionCache;
+use threat_scanner::service::web::WebStatus;
 use threat_scanner::web::config::{self as web_config, Mode};
-use threat_scanner::web::dnsfilter::{DnsFilter, FilterConfig};
 use threat_scanner::web::events::{self as web_events, WebEvent};
 use threat_scanner::web::extensions::{self, BrowserScan, KnownBad};
 use threat_scanner::web::native::{self, BrowserRegistration, GuardState};
@@ -17,33 +17,28 @@ use threat_scanner::web::rules::RuleCounts;
 use threat_scanner::web::{SharedRules, Verdict, WebConfig, WebRules};
 use widgets::*;
 
-/// How often settings changed by the browser connector or the command line
-/// are picked up, and the event log re-read.
+/// How often whether Windows uses the DNS filter is checked again.
 const WEB_POLL: Duration = Duration::from_secs(3);
 
 pub(super) struct WebState {
+    /// The settings as the page shows them.
     pub(super) config: WebConfig,
-    saved: WebConfig,
-    config_stamp: Option<SystemTime>,
+    /// As the service last reported them; `None` until it does.
+    saved: Option<WebConfig>,
+    settle: link::Settle<WebConfig>,
     rules: SharedRules,
     pub(super) counts: RuleCounts,
     rules_error: Option<String>,
-    cache: Arc<RedirectionCache>,
-    /// The running DNS filter and block-page server, with the settings
-    /// they were started from.
-    filter: Option<(DnsFilter, BlockPageServer)>,
-    filter_key: Option<String>,
-    filter_error: Option<String>,
-    filter_tx: mpsc::Sender<WebEvent>,
-    filter_rx: Receiver<WebEvent>,
+    /// The service's DNS filter.
+    pub(super) service_status: Option<WebStatus>,
     windows_dns: bool,
     browsers: Vec<BrowserRegistration>,
     events: Vec<WebEvent>,
-    events_stamp: Option<SystemTime>,
     last_poll: Instant,
     check_input: String,
     check_result: Option<(String, Verdict)>,
     site_input: String,
+    listen_input: String,
     upstream_input: String,
     scan_rx: Option<Receiver<BrowserScan>>,
     scan: Option<BrowserScan>,
@@ -83,35 +78,23 @@ fn rule_inputs(c: &WebConfig) -> (&[String], &[String], &[String], bool, bool) {
     (&c.user_allow, &c.user_block, &c.extension_exclusions, c.use_feeds, c.block_ads)
 }
 
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
 impl WebState {
+    /// The page before the service has answered: defaults, no rules.
     pub(super) fn new(data_dir: &Path) -> (Self, Option<String>) {
-        let (config, warning) = match WebConfig::load(data_dir) {
-            Ok(c) => (c, None),
-            Err(e) => (WebConfig::default(), Some(format!("Web protection settings could not be read ({e:#}); defaults are in use"))),
-        };
-        let (filter_tx, filter_rx) = mpsc::channel();
-        let mut state = Self {
-            upstream_input: config.dns_upstream.join(", "),
-            saved: config.clone(),
+        let config = WebConfig::default();
+        let state = Self {
+            upstream_input: String::new(),
+            listen_input: config.dns_listen.clone(),
+            saved: None,
             config,
-            config_stamp: modified(&WebConfig::path(data_dir)),
+            settle: link::Settle::default(),
             rules: Arc::new(std::sync::RwLock::new(Arc::new(WebRules::default()))),
             counts: RuleCounts::default(),
             rules_error: None,
-            cache: Arc::new(RedirectionCache::new()),
-            filter: None,
-            filter_key: None,
-            filter_error: None,
-            filter_tx,
-            filter_rx,
+            service_status: None,
             windows_dns: false,
             browsers: native::status(data_dir),
-            events: web_events::recent(data_dir, 50),
-            events_stamp: modified(&web_events::path(data_dir)),
+            events: Vec::new(),
             last_poll: Instant::now(),
             check_input: String::new(),
             check_result: None,
@@ -126,14 +109,46 @@ impl WebState {
             tab: WebTab::Overview,
             browsers_checked: Instant::now(),
         };
-        state.reload_rules(data_dir);
         // After an upgrade, the browsers load the new extension files from
         // here (on their next start, or Reload in the extensions page).
         if state.browsers.iter().any(|b| b.current) {
             let _ = native::write_extensions(data_dir);
         }
-        state.windows_dns = state.config.dns_listen_addr().is_ok_and(|a| web_config::windows_uses_filter(&a));
-        (state, warning)
+        (state, None)
+    }
+
+    /// The service's web settings (at connecting, or changed anywhere);
+    /// `home` is the service's folder, where the rules and events are.
+    pub(super) fn use_service_config(&mut self, config: WebConfig, home: &Path) {
+        let lists_changed = self.saved.as_ref().is_none_or(|saved| rule_inputs(saved) != rule_inputs(&config));
+        if self.saved.is_none() {
+            self.events = web_events::recent(home, 50);
+        }
+        self.upstream_input = config.dns_upstream.join(", ");
+        self.listen_input = config.dns_listen.clone();
+        self.saved = Some(config.clone());
+        self.config = config;
+        self.windows_dns = self.config.dns_listen_addr().is_ok_and(|a| web_config::windows_uses_filter(&a));
+        if lists_changed {
+            self.reload_rules(home);
+        }
+    }
+
+    /// The service went away: nothing is known about its settings.
+    pub(super) fn service_lost(&mut self) {
+        self.saved = None;
+        self.service_status = None;
+    }
+
+    /// A block or report from the service's DNS filter or a browser.
+    pub(super) fn add_event(&mut self, event: WebEvent) {
+        self.events.insert(0, event);
+        self.events.truncate(50);
+    }
+
+    /// The service's DNS filter is serving.
+    fn dns_running(&self) -> bool {
+        self.service_status.as_ref().is_some_and(|s| s.dns_filter)
     }
 
     /// Reloads rules (built-in, feeds and the user's lists) for the page,
@@ -150,7 +165,7 @@ impl WebState {
     }
 
     pub(super) fn running(&self) -> bool {
-        self.config.enabled && (self.protected_browsers() > 0 || self.filter.is_some())
+        self.saved.is_some() && self.config.enabled && (self.protected_browsers() > 0 || self.dns_running())
     }
 
     /// Browsers whose extension is added and linked to this copy.
@@ -162,124 +177,53 @@ impl WebState {
         self.browsers.iter().filter(|b| b.state() != GuardState::NotInstalled).count()
     }
 
-    fn filter_key(&self) -> String {
-        serde_json::to_string(&(
-            self.config.dns_filter,
-            &self.config.dns_listen,
-            self.config.upstreams(),
-            self.config.sinkhole,
-            self.config.block_page_port,
-            self.config.mode,
-        ))
-        .unwrap_or_default()
-    }
-
-    /// Starts, restarts or stops the DNS filter to match the settings.
-    fn sync_filter(&mut self, data_dir: &Path, ctx: &egui::Context) {
-        let key = self.filter_key();
-        if self.filter_key.as_deref() == Some(key.as_str()) {
-            return;
-        }
-        self.filter_key = Some(key);
-        if let Some((filter, page)) = self.filter.take() {
-            filter.stop();
-            page.stop();
-        }
-        self.filter_error = None;
-        if !self.config.dns_filter {
-            return;
-        }
-        let page_addr = SocketAddr::new(self.config.sinkhole.into(), self.config.block_page_port);
-        let started = self.config.dns_listen_addr().and_then(|listen| {
-            let page = BlockPageServer::start(page_addr, self.cache.clone())?;
-            let tx = self.filter_tx.clone();
-            let ctx = ctx.clone();
-            let filter = DnsFilter::start(
-                FilterConfig {
-                    listen,
-                    upstreams: self.config.upstreams(),
-                    sinkhole: self.config.sinkhole,
-                    mode: self.config.mode,
-                    data_dir: Some(data_dir.to_path_buf()),
-                },
-                self.rules.clone(),
-                self.cache.clone(),
-                Some(Box::new(move |event: &WebEvent| {
-                    let _ = tx.send(event.clone());
-                    ctx.request_repaint();
-                })),
-            )?;
-            Ok((filter, page))
-        });
-        match started {
-            Ok(servers) => self.filter = Some(servers),
-            Err(e) => self.filter_error = Some(format!("{e:#}")),
-        }
-    }
 }
 
 impl App {
-    /// Saves changed settings, follows changes made elsewhere, keeps the DNS
-    /// filter in step and collects its events. Called every frame.
+    /// Sends changed settings to the service once they stop changing; a
+    /// change that weakens protection runs `phalanx-cli` elevated, and
+    /// declined, the page shows the service's settings again. Called every
+    /// frame.
     pub(super) fn poll_web(&mut self, ctx: &egui::Context) {
-        let path = WebConfig::path(&self.data_dir);
-        if self.web.config != self.web.saved {
-            // The browser connector or the command line may have saved since
-            // this page last read the file: merge, so neither side's edit is lost.
-            if modified(&path) != self.web.config_stamp
-                && let Ok(theirs) = WebConfig::load(&self.data_dir)
-                && let Ok(merged) = self.web.config.merged(&self.web.saved, &theirs)
-            {
-                self.web.config = merged;
-            }
-            match self.web.config.save(&self.data_dir) {
-                Ok(()) => {
-                    let lists_changed = rule_inputs(&self.web.config) != rule_inputs(&self.web.saved);
-                    self.web.saved = self.web.config.clone();
-                    self.web.config_stamp = modified(&path);
-                    if lists_changed {
-                        self.web.reload_rules(&self.data_dir);
-                    }
-                }
-                Err(e) => {
-                    self.web.saved = self.web.config.clone();
-                    self.notify(format!("Could not save web protection settings: {e:#}"), false);
-                }
+        let _ = ctx;
+        if let Some(saved) = &self.web.saved
+            && self.web.config != *saved
+            && self.approval.is_none()
+        {
+            if !self.web.settle.settled(&self.web.config) {
+                self.link.repaint_after(link::SETTLE);
+            } else {
+                let wanted = self.web.config.clone();
+                self.web.saved = Some(wanted.clone());
+                let args = format!("service set-web-settings --json {}", link::hex_json(&wanted));
+                self.approval = Some("Changes that weaken web protection need an administrator's approval".into());
+                self.link.run(
+                    move || {
+                        let read = || link::read::<WebConfig>(Request::GetWebSettings);
+                        match link::with_approval::<WebConfig>(Request::SetWebSettings { settings: wanted }, &args, read) {
+                            link::Approval::Done(config) => (Ok(config), None),
+                            link::Approval::Declined => (read(), Some("Not changed: Windows' administrator prompt was declined".to_string())),
+                            link::Approval::Failed(e) => (read(), Some(format!("Could not change web protection: {e}"))),
+                        }
+                    },
+                    |app, (config, note)| {
+                        app.approval = None;
+                        if let Ok(config) = config {
+                            let home = app.signatures_home().to_path_buf();
+                            app.web.use_service_config(config, &home);
+                        }
+                        if let Some(note) = note {
+                            app.notify(note, false);
+                        }
+                    },
+                );
             }
         }
         if self.web.last_poll.elapsed() >= WEB_POLL {
             self.web.last_poll = Instant::now();
-            let stamp = modified(&path);
-            if stamp != self.web.config_stamp {
-                // Changed by the browser connector or the command line.
-                self.web.config_stamp = stamp;
-                if let Ok(config) = WebConfig::load(&self.data_dir) {
-                    self.web.upstream_input = config.dns_upstream.join(", ");
-                    self.web.config = config.clone();
-                    self.web.saved = config;
-                    self.web.reload_rules(&self.data_dir);
-                }
-            }
-            if self.web.filter.is_some() {
+            if self.web.dns_running() {
                 self.web.windows_dns = self.web.config.dns_listen_addr().is_ok_and(|a| web_config::windows_uses_filter(&a));
             }
-            let events_stamp = modified(&web_events::path(&self.data_dir));
-            if events_stamp != self.web.events_stamp {
-                self.web.events_stamp = events_stamp;
-                self.web.events = web_events::recent(&self.data_dir, 50);
-            }
-        }
-        let data_dir = self.data_dir.clone();
-        self.web.sync_filter(&data_dir, ctx);
-        while let Ok(event) = self.web.filter_rx.try_recv() {
-            if self.settings.notifications && event.action == "blocked" {
-                system::notify(
-                    &format!("Blocked a dangerous site: {}", event.target),
-                    &format!("{} ({}). Phalanx stopped this connection.", event.threat, event.category),
-                );
-            }
-            self.web.events.insert(0, event);
-            self.web.events.truncate(50);
         }
         if let Some(rx) = &self.web.scan_rx && let Ok(scan) = rx.try_recv() {
             self.web.scan_rx = None;
@@ -297,7 +241,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let rules = self.web.rules.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let sig_dir = update::signature_dir(&self.data_dir);
+        let sig_dir = update::signature_dir(self.signatures_home());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(extensions::scan(Some(&rules), &KnownBad::load(Some(&sig_dir))));
@@ -405,11 +349,11 @@ impl App {
                 (t, _) => (theme().red, format!("{t} dangerous extension(s)")),
             },
         };
-        let dns = match (&web.filter, &web.filter_error) {
+        let dns = match (web.dns_running(), web.service_status.as_ref().and_then(|s| s.error.as_ref())) {
             (_, Some(_)) => (theme().red, "Could not start".to_string()),
-            (Some(_), None) if web.windows_dns => (theme().green, "Running, and Windows uses it".to_string()),
-            (Some(_), None) => (theme().amber, "Running, but Windows does not use it yet".to_string()),
-            (None, None) => (theme().muted, "Off (optional: protects every program, not just browsers)".to_string()),
+            (true, None) if web.windows_dns => (theme().green, "Running, and Windows uses it".to_string()),
+            (true, None) => (theme().amber, "Running, but Windows does not use it yet".to_string()),
+            (false, None) => (theme().muted, "Off (optional: protects every program, not just browsers)".to_string()),
         };
         let day_ago = (chrono::Local::now() - chrono::Duration::days(1)).to_rfc3339();
         let recent = web.events.iter().filter(|e| e.time >= day_ago && e.action == "blocked").count();
@@ -443,14 +387,14 @@ impl App {
     fn web_status_card(&mut self, ui: &mut Ui) {
         let connected = self.web.protected_browsers();
         let installed = self.web.installed_browsers();
-        let ads_blocked = self.web.filter.as_ref().map(|(f, _)| f.ads_blocked());
+        let dns_running = self.web.dns_running();
         let config = &mut self.web.config;
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let (color, title) = match (config.enabled, config.mode) {
                     (false, _) => (theme().muted, "Web protection is off"),
                     (true, Mode::ReportOnly) => (theme().amber, "Report-only: matches are logged, not blocked"),
-                    (true, Mode::Block) if connected == 0 && self.web.filter.is_none() => (theme().amber, "Add the extension to a browser to start blocking"),
+                    (true, Mode::Block) if connected == 0 && !dns_running => (theme().amber, "Add the extension to a browser to start blocking"),
                     (true, Mode::Block) => (theme().green, "Web protection is on"),
                 };
                 status_dot(ui, color, 6.0);
@@ -463,7 +407,7 @@ impl App {
                     ("Sites", self.web.counts.domains.to_string()),
                     ("Addresses", (self.web.counts.urls + self.web.counts.networks + self.web.counts.ports).to_string()),
                     ("Browsers protected", format!("{connected} of {installed}")),
-                    ("DNS filter", if self.web.filter.is_some() { "running".into() } else { "off".into() }),
+                    ("DNS filter", if dns_running { "running".into() } else { "off".into() }),
                 ],
             );
             if let Some(e) = &self.web.rules_error {
@@ -495,13 +439,10 @@ impl App {
                 "Uses the StevenBlack ad and tracker list (refreshed with Update signatures) in Browser Guard, inside pages too, and in the DNS filter. Ad blocks are counted, not logged or notified.",
             );
             if config.block_ads {
-                let mut line = match self.web.counts.ads {
+                let line = match self.web.counts.ads {
                     0 => "The ad list is not downloaded yet. Run Update signatures.".to_string(),
                     n => format!("{n} ad and tracker names"),
                 };
-                if let Some(n) = ads_blocked {
-                    line.push_str(&format!(" · {n} blocked by the DNS filter since it started"));
-                }
                 small(ui, line);
             }
         });
@@ -840,7 +781,9 @@ impl App {
 
     fn start_dns_change(&mut self, change: DnsChange) {
         let (tx, rx) = mpsc::channel();
-        let data_dir = self.data_dir.clone();
+        // The backup is kept in the service's folder, where the uninstaller
+        // finds it.
+        let data_dir = self.signatures_home().to_path_buf();
         let listen = self.web.config.dns_listen_addr();
         let fallback = self.web.dns_fallback;
         std::thread::spawn(move || {
@@ -871,18 +814,18 @@ impl App {
     }
 
     fn web_dns_card(&mut self, ui: &mut Ui) {
-        let running = self.web.filter.is_some();
+        let running = self.web.dns_running();
         let upstreams: Vec<String> = self.web.config.upstreams().iter().map(ToString::to_string).collect();
-        let mut apply_upstream = false;
+        let (mut apply_upstream, mut apply_listen) = (false, false);
         card(ui, |ui| {
             section_title(ui, "DNS filter (whole PC)");
             setting_toggle(
                 ui,
                 &mut self.web.config.dns_filter,
-                "Filter DNS while Phalanx runs",
+                "Filter DNS for this PC",
                 "A local resolver that answers blocked names with a block address, so every program, not just browsers, is stopped from reaching them.",
             );
-            if let Some(e) = &self.web.filter_error {
+            if let Some(e) = self.web.service_status.as_ref().and_then(|s| s.error.as_ref()) {
                 notice(ui, theme().red, &format!("The DNS filter could not start: {e}. Another program may be using the address; change it below."));
             } else if running {
                 let note = if self.web.windows_dns {
@@ -891,7 +834,7 @@ impl App {
                     (
                         theme().amber,
                         format!(
-                            "Running on {}, but Windows does not use it yet. Set your network adapter's DNS server to {} (Settings > Network & internet > your connection > DNS server assignment), and set the router as the alternate so the internet keeps working when Phalanx is closed.",
+                            "Running on {}, but Windows does not use it yet. Set your network adapter's DNS server to {} (Settings > Network & internet > your connection > DNS server assignment), and set the router as the alternate so the internet keeps working if the protection service stops.",
                             self.web.config.dns_listen,
                             self.web.config.dns_listen_addr().map(|a| a.ip().to_string()).unwrap_or_default()
                         ),
@@ -901,7 +844,8 @@ impl App {
             }
             ui.add_space(6.0);
             setting_row(ui, "Listen address", "Where Windows should send DNS lookups.", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.web.config.dns_listen).desired_width(160.0));
+                apply_listen = small_button(ui, "Apply").clicked();
+                ui.add(egui::TextEdit::singleline(&mut self.web.listen_input).desired_width(160.0));
             });
             setting_row(ui, "Forward to", "Comma-separated resolvers. Leave empty to use this PC's own resolvers.", |ui| {
                 apply_upstream = small_button(ui, "Apply").clicked();
@@ -914,7 +858,7 @@ impl App {
             row_divider(ui);
             let listen = self.web.config.dns_listen_addr().ok();
             let usable = listen.as_ref().map(threat_scanner::web::windows_dns::usable_listen);
-            let backup = threat_scanner::web::windows_dns::has_backup(&self.data_dir);
+            let backup = threat_scanner::web::windows_dns::has_backup(self.signatures_home());
             let busy = self.web.dns_rx.is_some();
             setting_row(
                 ui,
@@ -944,7 +888,7 @@ impl App {
                 ui,
                 &mut self.web.dns_fallback,
                 "Keep a fallback DNS server",
-                "Recommended. Your previous DNS server stays second in line, so the internet keeps working when Phalanx is closed. Without it, nothing resolves unless Phalanx runs, but no lookup can slip past the filter.",
+                "Recommended. Your previous DNS server stays second in line, so the internet keeps working if the protection service stops. Without it, nothing resolves while the service is stopped, but no lookup can slip past the filter.",
             );
             if busy {
                 ui.horizontal(|ui| {
@@ -960,6 +904,13 @@ impl App {
                 self.web.config.dns_upstream = entries;
             } else {
                 self.notify(format!("Not a resolver address: {}", bad.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")), false);
+            }
+        }
+        if apply_listen {
+            let listen = self.web.listen_input.trim().to_string();
+            match listen.parse::<std::net::SocketAddr>().ok() {
+                Some(_) => self.web.config.dns_listen = listen,
+                None => self.notify(format!("Not an address:port to listen on: {listen}"), false),
             }
         }
     }

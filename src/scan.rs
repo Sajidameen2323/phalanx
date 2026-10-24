@@ -104,12 +104,14 @@ impl FileReport {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanReport {
     pub scan_id: i64,
-    pub elapsed_ms: u128,
+    pub elapsed_ms: u64,
     pub cancelled: bool,
     pub threads: usize,
     #[serde(flatten)]
     pub stats: ScanStats,
     pub infected: Vec<FileReport>,
+    /// Named apart from `stats.errors` (the count), which shares the object.
+    #[serde(rename = "error_messages")]
     pub errors: Vec<String>,
 }
 
@@ -339,7 +341,7 @@ pub fn run(
         Ok(())
     });
     let cancelled = cancel.load(Ordering::Relaxed);
-    let elapsed_ms = started.elapsed().as_millis();
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     store.finish_scan(scan_id, &stats, elapsed_ms as i64, cancelled || outcome.is_err())?;
     outcome?;
     if !options.keep_clean_history && stats.detections == 0 {

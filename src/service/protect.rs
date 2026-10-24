@@ -69,8 +69,9 @@ struct State {
     /// Whether `engine` was built with heuristics.
     heuristics: bool,
     rtp: Option<RtpHandle>,
-    /// Set when real-time protection reports it has started watching.
-    watching: Arc<AtomicBool>,
+    /// Set when real-time protection reports it has started: folders
+    /// watched and whether programs are.
+    started: Arc<Mutex<Option<(usize, bool)>>>,
 }
 
 pub(crate) struct Protector {
@@ -79,18 +80,23 @@ pub(crate) struct Protector {
     state: Mutex<State>,
     jobs: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     next_job: AtomicU64,
+    /// Held while settings are applied, so two never interleave.
+    applying: Mutex<()>,
 }
 
 impl Protector {
     pub fn new(data_dir: &Path, hub: Arc<Hub>) -> Arc<Self> {
-        Arc::new(Self { data_dir: data_dir.to_path_buf(), hub, state: Mutex::default(), jobs: Mutex::default(), next_job: AtomicU64::new(1) })
+        Arc::new(Self { data_dir: data_dir.to_path_buf(), hub, state: Mutex::default(), jobs: Mutex::default(), next_job: AtomicU64::new(1), applying: Mutex::default() })
     }
 
     pub fn status(&self) -> ProtectionStatus {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let started = if state.rtp.is_some() { *state.started.lock().unwrap_or_else(PoisonError::into_inner) } else { None };
         ProtectionStatus {
             engine: state.engine.as_ref().map(|e| (e.rule_count(), e.hash_count())),
-            watching: state.rtp.is_some() && state.watching.load(Ordering::Relaxed),
+            watching: started.is_some(),
+            folders: started.map_or(0, |(folders, _)| folders),
+            programs: started.is_some_and(|(_, programs)| programs),
             scans: self.jobs.lock().unwrap_or_else(PoisonError::into_inner).len(),
         }
     }
@@ -101,39 +107,51 @@ impl Protector {
 
     /// Loads signatures (again, if heuristics changed) and starts real-time
     /// protection as `settings` say, stopping what ran before. Takes seconds
-    /// the first time: call it off the pipe's threads.
+    /// the first time: call it off the pipe's threads. One runs at a time;
+    /// the state is only locked briefly, so status requests answer while the
+    /// signatures load.
     pub fn apply(&self, settings: &ProtectionSettings) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(running) = state.rtp.take() {
+        let _applying = self.applying.lock().unwrap_or_else(PoisonError::into_inner);
+        let (running, loaded) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let loaded = state.engine.clone().filter(|_| state.heuristics == settings.heuristics);
+            (state.rtp.take(), loaded)
+        };
+        if let Some(running) = running {
             running.stop();
         }
-        if state.engine.is_none() || state.heuristics != settings.heuristics {
-            let config = EngineConfig { signature_dir: Some(update::signature_dir(&self.data_dir)), heuristics: settings.heuristics, ..Default::default() };
-            match Engine::new(&config) {
-                Ok(engine) => {
-                    self.hub.send(&Event::EngineReady { rules: engine.rule_count(), hashes: engine.hash_count() });
-                    state.engine = Some(Arc::new(engine));
-                    state.heuristics = settings.heuristics;
-                }
-                Err(e) => {
-                    self.hub.send(&Event::EngineFailed { error: format!("{e:#}") });
-                    return;
+        let engine = match loaded {
+            Some(engine) => engine,
+            None => {
+                let config = EngineConfig { signature_dir: Some(update::signature_dir(&self.data_dir)), heuristics: settings.heuristics, ..Default::default() };
+                match Engine::new(&config) {
+                    Ok(engine) => {
+                        self.hub.send(&Event::EngineReady { rules: engine.rule_count(), hashes: engine.hash_count() });
+                        let engine = Arc::new(engine);
+                        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        state.engine = Some(Arc::clone(&engine));
+                        state.heuristics = settings.heuristics;
+                        engine
+                    }
+                    Err(e) => {
+                        self.hub.send(&Event::EngineFailed { error: format!("{e:#}") });
+                        return;
+                    }
                 }
             }
-        }
+        };
         if !settings.watch_enabled {
             self.hub.send(&Event::ProtectionOff);
             return;
         }
-        let Some(engine) = state.engine.clone() else { return };
-        let watching = Arc::new(AtomicBool::new(false));
-        state.watching = Arc::clone(&watching);
+        let started = Arc::new(Mutex::new(None));
+        let on_started = Arc::clone(&started);
         let hub = Arc::clone(&self.hub);
         let dir = self.data_dir.clone();
         let mut checkpoint_saved: Option<Instant> = None;
         let on_event = move |event: RtpEvent| {
-            if matches!(event, RtpEvent::Started { .. }) {
-                watching.store(true, Ordering::Relaxed);
+            if let RtpEvent::Started { watching, programs, .. } = &event {
+                *on_started.lock().unwrap_or_else(PoisonError::into_inner) = Some((*watching, *programs));
             }
             if matches!(event, RtpEvent::Started { .. } | RtpEvent::Scanned { .. }) && checkpoint_saved.is_none_or(|t| t.elapsed() >= CHECKPOINT_EVERY) {
                 save_checkpoint(&dir);
@@ -141,7 +159,10 @@ impl Protector {
             }
             hub.send(&Event::from(event));
         };
-        match rtp::start(engine, self.data_dir.clone(), rtp_config(&self.data_dir, settings), on_event) {
+        let result = rtp::start(engine, self.data_dir.clone(), rtp_config(&self.data_dir, settings), on_event);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.started = started;
+        match result {
             Ok(running) => state.rtp = Some(running),
             Err(e) => self.hub.send(&Event::ProtectionError { message: format!("{e:#}") }),
         }

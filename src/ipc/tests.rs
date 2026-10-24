@@ -38,6 +38,36 @@ fn every_request_reads_back_as_sent() {
     }
 }
 
+/// Events are internally tagged, which buffers their fields: a field serde
+/// cannot buffer (a `u128`) makes the event unreadable, and the app drops it.
+#[test]
+fn every_event_reads_back_as_sent() {
+    use crate::scan::{FileReport, ScanReport};
+    let file = || FileReport { path: r"C:\Users\me\Downloads\a.exe".into(), sha256: "ab".repeat(32), findings: Vec::new(), action: "reported".into() };
+    let report = ScanReport {
+        scan_id: 7,
+        elapsed_ms: 1_234,
+        cancelled: true,
+        threads: 2,
+        stats: Default::default(),
+        infected: vec![file()],
+        errors: vec!["locked".into()],
+    };
+    for event in [
+        Event::ScanProgress { job: 1, files: 10, bytes: 2048, detections: 0, path: r"C:\x".into() },
+        Event::ScanDetection { job: 1, report: file() },
+        Event::ScanFinished { job: 1, report },
+        Event::ScanFailed { job: 1, error: "gone".into() },
+        Event::SettingsChanged { settings: Default::default() },
+        Event::WebSettingsChanged { settings: Default::default() },
+        Event::UpdateFinished { installed: true, last_success: None, failed: vec!["URLhaus".into()] },
+    ] {
+        let sent = serde_json::to_value(&event).unwrap();
+        let back = serde_json::from_value::<Event>(sent.clone());
+        assert!(back.as_ref().is_ok_and(|b| serde_json::to_value(b).unwrap() == sent), "{sent}: {back:?}");
+    }
+}
+
 #[test]
 fn weakening_needs_an_administrator() {
     let user = Caller { user: "PC\\me".into(), sid: "S-1-5-21-1".into(), admin: false };
