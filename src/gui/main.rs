@@ -488,6 +488,8 @@ struct App {
     quitting: Arc<AtomicBool>,
     hidden_notice_shown: bool,
     autostart: bool,
+    /// Setup starts the tray agent for every user (installed per machine).
+    machine_autostart: bool,
     /// Whether notifications carry the app's own name, or why not.
     notification_identity: Result<(), String>,
     // Windows security and privacy checks
@@ -609,7 +611,14 @@ impl App {
         // is left alone, even when another copy (a test build) starts.
         // An entry for this program without `--background` (written by hand or
         // by an old version) would open the window at every sign-in.
-        if let Some(command) = system::autostart_command()
+        // Installed for the whole PC, setup's entry starts the tray agent for
+        // everyone: a per-user entry (from 0.4) would only repeat it.
+        let machine_autostart = system::machine_autostart_command().is_some();
+        if machine_autostart {
+            if system::autostart_enabled() {
+                let _ = system::set_autostart(false, "");
+            }
+        } else if let Some(command) = system::autostart_command()
             && (!autostart_program_exists(&command) || (autostart_names_this_program(&command) && !command.contains(BACKGROUND_FLAG)))
         {
             let _ = system::set_autostart(true, &autostart_command());
@@ -655,6 +664,7 @@ impl App {
             quitting,
             hidden_notice_shown: false,
             autostart: system::autostart_enabled(),
+            machine_autostart,
             notification_identity,
             security: None,
             privacy: None,

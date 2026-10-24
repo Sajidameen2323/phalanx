@@ -569,21 +569,24 @@ impl App {
             Some(ServiceView::NotInstalled) => (
                 theme().muted,
                 "Protection service: not installed".to_string(),
-                "Protection runs inside this app for now. The service is being built to keep protecting when the app is closed and nobody is signed in.".to_string(),
+                "Phalanx protects this PC through its service, so nothing is protected now. Reinstall Phalanx to put the service back.".to_string(),
             ),
             Some(ServiceView::Down(state)) => (
                 theme().amber,
                 format!("Protection service: {state}"),
-                "Windows restarts it automatically after a failure. An administrator can start it with `phalanx-cli service start`.".to_string(),
+                "This PC is not protected until it runs again. Windows restarts it automatically after a failure; an administrator can start Phalanx Protection in Windows' Services app.".to_string(),
             ),
             Some(ServiceView::Running { version, user, admin }) => (
                 theme().green,
                 format!("Protection service: running ({version})"),
-                if *admin {
-                    format!("Signed in as {user}, an administrator: you can change every setting.")
-                } else {
-                    format!("Signed in as {user}. Changes that weaken protection will need an administrator's approval.")
-                },
+                format!(
+                    "It protects this PC with this app closed and with nobody signed in. {} It cannot stop malware that already has administrator rights.",
+                    if *admin {
+                        format!("Signed in as {user}, an administrator: you can change every setting.")
+                    } else {
+                        format!("Signed in as {user}: changes that weaken protection need an administrator's approval, which other programs cannot give themselves.")
+                    }
+                ),
             ),
             Some(ServiceView::Unreachable(e)) => (theme().red, "Protection service: not answering".to_string(), capitalize(e)),
         };
@@ -976,12 +979,21 @@ impl App {
         let has_tray = self.tray.is_some();
         card(ui, |ui| {
             group_title(ui, "Startup and background", "");
-            setting_toggle(
-                ui,
-                &mut autostart,
-                "Start with Windows",
-                "Opens in the tray when you sign in, so real-time protection starts automatically. Adds a per-user sign-in entry; no administrator rights are needed.",
-            );
+            if self.machine_autostart {
+                setting_row(
+                    ui,
+                    "Start with Windows",
+                    "Phalanx opens in the tray for everyone who signs in, to show its notifications; protection itself runs in the protection service whether or not it is open. To stop it opening for you, turn Phalanx off in Windows' Settings > Apps > Startup.",
+                    |ui| badge(ui, "On", theme().green),
+                );
+            } else {
+                setting_toggle(
+                    ui,
+                    &mut autostart,
+                    "Start with Windows",
+                    "Opens in the tray when you sign in, to show notifications from the protection service. Adds a per-user sign-in entry; no administrator rights are needed.",
+                );
+            }
             row_divider(ui);
             ui.add_enabled_ui(has_tray, |ui| {
                 setting_toggle(
@@ -989,7 +1001,7 @@ impl App {
                     &mut self.settings.close_to_tray,
                     "Keep running in the tray when the window is closed",
                     if has_tray {
-                        "Real-time protection keeps working with the window closed. Right-click the tray icon to quit."
+                        "Notifications keep coming with the window closed. Right-click the tray icon to quit; protection keeps running in the service either way."
                     } else {
                         "Unavailable: the tray icon could not be created, so closing the window quits."
                     },
@@ -1039,15 +1051,30 @@ impl App {
         }
         ui.add_space(14.0);
 
-        let mut open = false;
+        let mut open = None;
         card(ui, |ui| {
-            group_title(ui, "Data", "History, quarantine, downloaded signatures and settings.");
-            setting_row(ui, "Data folder", &self.data_dir.display().to_string(), |ui| {
-                open = small_button(ui, "Open folder").clicked();
+            group_title(ui, "Data", "");
+            if let Some(dir) = &self.service_dir {
+                setting_row(
+                    ui,
+                    "Protection data",
+                    &format!("History, quarantine, signatures and protection settings, kept by the protection service. Only administrators can change them.\n{}", dir.display()),
+                    |ui| {
+                        if small_button(ui, "Open folder").clicked() {
+                            open = Some(dir.clone());
+                        }
+                    },
+                );
+                row_divider(ui);
+            }
+            setting_row(ui, "Your settings", &format!("Appearance, notifications and AI Inspect, for you only.\n{}", self.data_dir.display()), |ui| {
+                if small_button(ui, "Open folder").clicked() {
+                    open = Some(self.data_dir.clone());
+                }
             });
         });
-        if open {
-            let _ = std::process::Command::new("explorer").arg(&self.data_dir).spawn();
+        if let Some(dir) = open {
+            let _ = std::process::Command::new("explorer").arg(dir).spawn();
         }
     }
 

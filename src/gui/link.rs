@@ -16,6 +16,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use threat_scanner::ipc::{self, Client, Event, Reply, Request, ServerMessage};
 
+/// How long the service may be gone before the user is told: a crash
+/// restarts it in seconds.
+const DOWN_GRACE: Duration = Duration::from_secs(20);
+/// At sign-in the app may start before Windows has started the service.
+const STARTUP_GRACE: Duration = Duration::from_secs(90);
+
 /// What the link hands to the UI thread.
 pub enum LinkMsg {
     Connected,
@@ -73,6 +79,12 @@ impl Link {
             // Reported once when the service is first found missing, and once
             // each time a connection ends; not every retry.
             let mut report_failure = true;
+            // A Windows notification when protection has been down a while
+            // (not for a quick restart, nor while Windows is still starting
+            // the service at sign-in), and when it is back.
+            let started = Instant::now();
+            let mut down_since: Option<Instant> = None;
+            let mut warned = false;
             loop {
                 let subscribed = Client::connect().and_then(|mut client| {
                     client.call(Request::Subscribe)?;
@@ -81,6 +93,10 @@ impl Link {
                 match subscribed {
                     Ok(mut client) => {
                         report_failure = false;
+                        down_since = None;
+                        if std::mem::take(&mut warned) && notify.threats() {
+                            threat_scanner::system::notify("Phalanx protection is back", "The protection service is running again.");
+                        }
                         if events_tx.send(LinkMsg::Connected).is_err() {
                             return;
                         }
@@ -105,6 +121,14 @@ impl Link {
                         repaint.request_repaint();
                     }
                     Err(e) => {
+                        let since = *down_since.get_or_insert_with(Instant::now);
+                        if !warned && since.elapsed() >= DOWN_GRACE && started.elapsed() >= STARTUP_GRACE && notify.threats() {
+                            warned = true;
+                            threat_scanner::system::notify(
+                                "Phalanx protection is not running",
+                                "The Phalanx protection service stopped, so this PC is not protected. Open Phalanx to see what to do.",
+                            );
+                        }
                         if report_failure {
                             report_failure = false;
                             if events_tx.send(LinkMsg::Lost(ipc::describe(&e))).is_err() {

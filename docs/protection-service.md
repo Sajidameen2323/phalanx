@@ -239,7 +239,44 @@ in one step.
    restoring a quarantined file, and saving the Auth-Key. Windows may
    show the prompt as a flashing taskbar button instead of on top.
 6. **Installer** (per machine), upgrade from 0.4.x, tray warning when the
-   service is down, README and Protection page.
+   service is down, README and Protection page. Plan:
+   - **Setup asks for administrator rights once** and installs to
+     `Program Files\Phalanx`: the app, the CLI and `phalanx-service.exe`.
+     It stops the service before replacing files and runs `phalanx-cli
+     service install` after (which updates an existing service), with
+     its Start-menu shortcut for all users and an `HKLM\…\Run` entry
+     that starts the tray agent at every sign-in.
+   - **Upgrade from 0.4.x** (a per-user install of the same AppId): the
+     installing user's data is migrated (`service migrate`, which also
+     carries the abuse.ch key), then the old copy's uninstaller runs
+     silently. Its DNS backup is set aside first, so the old uninstaller
+     does not undo "Use the filter for Windows DNS": the service's filter
+     answers on the same address, and its folder has the backup. The old
+     data folder is kept. Browsers are connected again for that user.
+   - **Uninstall:** restores Windows' DNS from the service's backup,
+     removes the service, disconnects the browsers, and asks about
+     `%ProgramData%\Phalanx`.
+   - **App:** a Windows notification when the service has been down for a
+     while (and when it is back), not for a quick restart; "Start with
+     Windows" shows the machine-wide entry instead of a per-user toggle;
+     the Data card shows the service's folder; Windows' prompt is given
+     the app's window, so it comes up in front. `web restore-dns` looks
+     in the service's folder first.
+   - **README, setup's README.txt and the Protection page** describe the
+     service, approvals and what it does not protect against (malware
+     that already has administrator rights).
+   - Version 0.5.0.
+
+   *Built (`installer/phalanx.iss`).* Tested by upgrading a real 0.4.1
+   install: the data and abuse.ch key came over (the first update in the
+   service used the key), the old copy was removed, and the uninstaller
+   removed the service and kept the data. Two fixes came from it: a
+   browser keeps the old copy's connector running, which held its folder,
+   so setup closes it first (Browser Guard starts the new one at its next
+   lookup); and Setup named its entry "Phalanx (All users)" because the
+   per-user one still existed, so it is renamed once that is gone. Start
+   setup from Explorer, not from a sandboxed shell: the "as you" steps
+   (connecting browsers, opening the app) run in the shell's session.
 
 ## Testing
 

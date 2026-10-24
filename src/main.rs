@@ -1509,6 +1509,9 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         WebCommand::RestoreDns => {
+            // Since 0.5 the backup is kept in the service's folder.
+            let machine = threat_scanner::service::data::machine_data_dir();
+            let dir = if web::windows_dns::has_backup(&machine) { machine.as_path() } else { dir };
             if !web::windows_dns::has_backup(dir) {
                 println!("Phalanx did not change Windows' DNS settings; nothing to restore.");
                 return Ok(ExitCode::SUCCESS);
