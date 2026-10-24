@@ -164,7 +164,21 @@ in one step.
    Processes started from a Claude Code session see a different registry
    view than the service, so Run-box tests written from there never reach it.
 4. **Signature updates, DNS filter, block page and web settings in the
-   service**, and the browser connector through the pipe.
+   service**, and the browser connector through the pipe. *Built
+   (`src/service/web.rs`, `updates.rs`).* Web settings follow the same rule
+   as protection settings (`WebConfig::weakened_by`): turning checks or the
+   DNS filter off, reporting only, allowing or unblocking a site, dropping
+   the feeds or ad blocking, and changing where the DNS filter listens or
+   forwards need an administrator. The DNS filter keeps serving across
+   settings changes and is restarted only when what it listens with
+   changes. Updates run on the settings' schedule and reload the engine
+   and web rules when anything new arrives. The abuse.ch key is saved by
+   the service, encrypted for SYSTEM and readable only by administrators;
+   migration passes it decrypted, since the user's copy is encrypted for
+   the user. With the service running, the browser connector reads the
+   service's folder and sends changes through the pipe; a change that
+   needs approval is made by `phalanx-cli` run elevated, after Windows'
+   prompt, with only the host name on its command line.
 5. **The switch:** the app uses the service for everything above, and asks
    for approval (UAC) for weakening changes.
 6. **Installer** (per machine), upgrade from 0.4.x, tray warning when the

@@ -24,7 +24,7 @@ pub mod rules;
 pub mod url;
 pub mod windows_dns;
 
-pub use config::{Mode, WebConfig};
+pub use config::{Mode, SiteChange, SiteError, WebConfig};
 pub use rules::{Verdict, VerdictCode, WebRules};
 
 use std::sync::{Arc, RwLock};

@@ -147,6 +147,13 @@ impl Protector {
         }
     }
 
+    /// Loads the signatures again (an update installed new ones) and starts
+    /// protection with them.
+    pub fn reload_signatures(&self, settings: &ProtectionSettings) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).engine = None;
+        self.apply(settings);
+    }
+
     /// Stops real-time protection and every scan (the service is stopping).
     pub fn stop(&self) {
         for cancel in self.jobs.lock().unwrap_or_else(PoisonError::into_inner).values() {

@@ -106,12 +106,19 @@ phalanx-cli service migrate     # as administrator, once: bring your data over
 phalanx-cli service scan D:\    # scan in the service, with progress
 phalanx-cli service events      # watch what the service reports
 phalanx-cli service settings | history
+phalanx-cli service update      # download signatures in the service, with progress
+phalanx-cli service web         # web settings and whether the DNS filter runs
+phalanx-cli service site block example.test   # allow / unblock need administrator
+phalanx-cli service ads on|off  # off needs administrator
+phalanx-cli service auth-key --from-app       # as administrator: the app's abuse.ch key
 phalanx-service --console --pipe \\.\pipe\phalanx-dev --data-dir D:\dev-data
 ```
 
 The installed service runs real-time protection (when it is turned on in its
-settings) and scans, with its data in `%ProgramData%\Phalanx`. The app does not use
-it yet: it keeps protecting as before until it switches to the service.
+settings), scans, signature updates, and the DNS filter and block page (when the DNS
+filter is on in its web settings), with its data in `%ProgramData%\Phalanx`. With the
+service running, the browser connector uses it. The app does not use it yet: it
+keeps protecting as before until it switches to the service.
 
 ### Installer
 

@@ -7,11 +7,17 @@ pub mod data;
 pub mod migrate;
 pub mod protect;
 pub mod settings;
+pub mod updates;
+pub mod web;
 #[cfg(windows)]
 pub mod manage;
 
 use crate::ipc::{Caller, ClientMessage, Reply, Request, Status};
+use crate::web::WebConfig;
 use protect::{Hub, Protector};
+use std::sync::atomic::{AtomicBool, Ordering};
+use updates::Updater;
+use web::WebGuard;
 use std::sync::Arc;
 use crate::quarantine::Quarantine;
 use crate::scan;
@@ -38,9 +44,17 @@ struct Context {
     stop_requested: std::sync::mpsc::Sender<()>,
     hub: Arc<Hub>,
     protector: Arc<Protector>,
+    web: Arc<WebGuard>,
+    updater: Arc<Updater>,
 }
 
 impl Context {
+    /// Applies web settings off the pipe's threads (the DNS filter may restart).
+    fn reapply_web(&self, config: WebConfig) {
+        let web = Arc::clone(&self.web);
+        let _ = std::thread::Builder::new().name("apply-web".into()).spawn(move || web.apply(&config));
+    }
+
     /// Starts protection again with `settings`, off the pipe's threads
     /// (loading signatures takes seconds).
     fn reapply(&self, settings: ProtectionSettings) {
@@ -128,16 +142,66 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
         Request::DeleteQuarantined { item } => {
             reply(id, session.store(dir).and_then(|s| Quarantine::new(scan::quarantine_dir(dir), s)?.delete(&item)))
         }
-        Request::Migrate { from } => {
+        Request::Migrate { from, auth_key } => {
             let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
             // Reopened after the import, so this session sees it.
             session.store = None;
-            let done = migrate::migrate(&from, dir);
+            let done = migrate::migrate(&from, dir).and_then(|done| {
+                // The copied key is encrypted for the user: save it again as SYSTEM.
+                if let Some(key) = auth_key.as_deref() {
+                    updates::save_auth_key(dir, Some(key))?;
+                }
+                Ok(done)
+            });
             if done.is_ok() {
                 ctx.reapply(ProtectionSettings::load(dir).unwrap_or_default());
+                ctx.reapply_web(WebConfig::load(dir).unwrap_or_default());
             }
             reply(id, done)
         }
+        Request::UpdateSignatures { force } => reply(id, ctx.updater.start(force).map(|()| json!("started"))),
+        Request::SetAuthKey { key } => reply(id, updates::save_auth_key(dir, key.as_deref())),
+        Request::GetWebSettings => reply(id, WebConfig::load(dir)),
+        Request::SetWebSettings { settings } => {
+            let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
+            let current = match WebConfig::load(dir) {
+                Ok(current) => current,
+                Err(e) => return Reply::error(id, format!("{e:#}")),
+            };
+            let weaker = current.weakened_by(&settings);
+            if !weaker.is_empty() && !caller.admin {
+                return Reply::needs_approval_because(id, &weaker);
+            }
+            reply(
+                id,
+                settings.save(dir).map(|()| {
+                    ctx.reapply_web(settings.clone());
+                    settings
+                }),
+            )
+        }
+        Request::ChangeSite { change, site } => {
+            let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
+            if change.weakens() && !caller.admin {
+                let what = if change == crate::web::SiteChange::Allow { "allows" } else { "stops blocking" };
+                return Reply::needs_approval_because(id, &[format!("{what} {}", site.trim())]);
+            }
+            let mut config = match WebConfig::load(dir) {
+                Ok(config) => config,
+                Err(e) => return Reply::error(id, format!("{e:#}")),
+            };
+            match config.change_site(change, &site) {
+                Err(e) => Reply::error(id, e.to_string()),
+                Ok(host) => reply(
+                    id,
+                    config.save(dir).map(|()| {
+                        ctx.reapply_web(config.clone());
+                        json!({ "site": host, "settings": config })
+                    }),
+                ),
+            }
+        }
+        Request::WebStatus => reply(id, Ok(ctx.web.status())),
         // Handled by the connection itself (see `imp::serve`).
         Request::Subscribe => Reply::ok(id, json!("subscribed")),
         Request::ProtectionStatus => reply(id, Ok(ctx.protector.status())),
@@ -201,16 +265,21 @@ pub struct Running {
     _server: imp::Running,
     stop_requests: std::sync::mpsc::Receiver<()>,
     protector: Arc<Protector>,
+    web: Arc<WebGuard>,
+    /// Stops the update schedule.
+    schedule: Arc<AtomicBool>,
     /// Loading signatures and starting protection, at start.
     starting: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
+        self.schedule.store(true, Ordering::Relaxed);
         if let Some(starting) = self.starting.take() {
             let _ = starting.join();
         }
         self.protector.stop();
+        self.web.stop();
     }
 }
 
@@ -237,19 +306,38 @@ pub fn start(pipe_name: &str, data_dir: &Path) -> io::Result<Running> {
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let hub = Arc::new(Hub::default());
     let protector = Protector::new(data_dir, Arc::clone(&hub));
-    let ctx = Context { started, data_dir: data_dir.to_path_buf(), settings: Mutex::new(()), stop_requested: tx, hub, protector: Arc::clone(&protector) };
+    let web = WebGuard::new(data_dir, Arc::clone(&hub));
+    // New signatures or web rules: reload the engine and the web rules.
+    let (reload_engine, reload_web, settings_dir) = (Arc::clone(&protector), Arc::clone(&web), data_dir.to_path_buf());
+    let updater = Updater::new(data_dir, Arc::clone(&hub), move || {
+        reload_engine.reload_signatures(&ProtectionSettings::load(&settings_dir).unwrap_or_default());
+        reload_web.reload();
+    });
+    let ctx = Context {
+        started,
+        data_dir: data_dir.to_path_buf(),
+        settings: Mutex::new(()),
+        stop_requested: tx,
+        hub,
+        protector: Arc::clone(&protector),
+        web: Arc::clone(&web),
+        updater: Arc::clone(&updater),
+    };
+    let schedule = Arc::new(AtomicBool::new(false));
     #[cfg(windows)]
     {
         let server = imp::start(pipe_name, ctx)?;
-        let (starter, dir) = (Arc::clone(&protector), data_dir.to_path_buf());
-        let starting = std::thread::Builder::new()
-            .name("start-protection".into())
-            .spawn(move || starter.apply(&ProtectionSettings::load(&dir).unwrap_or_default()))?;
-        Ok(Running { _server: server, stop_requests: rx, protector, starting: Some(starting) })
+        let (starter, web_starter, dir) = (Arc::clone(&protector), Arc::clone(&web), data_dir.to_path_buf());
+        let starting = std::thread::Builder::new().name("start-protection".into()).spawn(move || {
+            starter.apply(&ProtectionSettings::load(&dir).unwrap_or_default());
+            web_starter.reload();
+        })?;
+        updater.schedule(Arc::clone(&schedule));
+        Ok(Running { _server: server, stop_requests: rx, protector, web, schedule, starting: Some(starting) })
     }
     #[cfg(not(windows))]
     {
-        let _ = (pipe_name, ctx, rx, protector);
+        let _ = (pipe_name, ctx, rx, protector, web, updater, schedule);
         Err(io::Error::new(io::ErrorKind::Unsupported, "the protection service is Windows only"))
     }
 }

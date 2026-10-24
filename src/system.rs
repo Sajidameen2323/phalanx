@@ -257,15 +257,24 @@ pub enum Elevated {
 /// prompt, and waits for it. The script travels as `-EncodedCommand`, so no
 /// quoting can change what runs. Callers pass fixed scripts, never input.
 pub fn run_elevated_powershell(script: &str) -> Result<Elevated> {
+    let encoded = encode_powershell(script);
+    run_elevated(
+        std::path::Path::new("powershell.exe"),
+        &format!("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}"),
+    )
+}
+
+/// Runs `program` with `parameters` as administrator, after Windows' own
+/// consent prompt, without a window, and waits for it.
+pub fn run_elevated(program: &std::path::Path, parameters: &str) -> Result<Elevated> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
         use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
         let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-        let encoded = encode_powershell(script);
-        let params = wide(&format!("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {encoded}"));
-        let (verb, file) = (wide("runas"), wide("powershell.exe"));
+        let params = wide(parameters);
+        let (verb, file) = (wide("runas"), wide(&program.display().to_string()));
         let mut info = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
             fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -281,10 +290,10 @@ pub fn run_elevated_powershell(script: &str) -> Result<Elevated> {
             if unsafe { GetLastError() } == ERROR_CANCELLED {
                 return Ok(Elevated::Declined);
             }
-            anyhow::bail!("could not start PowerShell as administrator: {}", std::io::Error::last_os_error());
+            anyhow::bail!("could not start {} as administrator: {}", program.display(), std::io::Error::last_os_error());
         }
         if info.hProcess.is_null() {
-            anyhow::bail!("PowerShell started without a process handle");
+            anyhow::bail!("{} started without a process handle", program.display());
         }
         let mut code = 0u32;
         unsafe {
@@ -296,7 +305,7 @@ pub fn run_elevated_powershell(script: &str) -> Result<Elevated> {
     }
     #[cfg(not(windows))]
     {
-        let _ = script;
+        let _ = (program, parameters);
         anyhow::bail!("only supported on Windows")
     }
 }

@@ -17,6 +17,8 @@ pub const QUARANTINE: &str = "quarantine";
 const FOLDER_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 /// SYSTEM and administrators only.
 const PRIVATE_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// A secret file (the abuse.ch key): SYSTEM and administrators only.
+pub const SECRET_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 
 /// `%ProgramData%\Phalanx`.
 pub fn machine_data_dir() -> PathBuf {

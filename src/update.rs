@@ -37,7 +37,7 @@ const MIN_ADS: usize = 1000;
 /// Fewest names a domain list download must have to replace its names.
 const MIN_DOMAIN_LIST: usize = 1000;
 /// The saved abuse.ch Auth-Key, encrypted for this Windows user (DPAPI, hex).
-const AUTH_KEY_FILE: &str = "abuse-ch-key";
+pub const AUTH_KEY_FILE: &str = "abuse-ch-key";
 /// Used when no key is saved.
 pub const AUTH_KEY_ENV: &str = "ABUSE_CH_AUTH_KEY";
 /// Where users get a free abuse.ch Auth-Key.

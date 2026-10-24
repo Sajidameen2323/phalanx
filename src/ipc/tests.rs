@@ -28,7 +28,9 @@ fn every_request_reads_back_as_sent() {
         Request::Quarantine { include_restored: true },
         Request::Restore { item: "a".into(), force: false },
         Request::DeleteQuarantined { item: "a".into() },
-        Request::Migrate { from: r"C:\Users\me\AppData\Local\threat-scanner".into() },
+        Request::Migrate { from: r"C:\Users\me\AppData\Local\threat-scanner".into(), auth_key: Some("0123abcd".into()) },
+        Request::ChangeSite { change: crate::web::SiteChange::Allow, site: "https://example.test/".into() },
+        Request::UpdateSignatures { force: true },
     ] {
         let line = serde_json::to_string(&ClientMessage { id: 9, request: request.clone() }).unwrap();
         let back: Result<ClientMessage, _> = serde_json::from_str(&line);
@@ -179,7 +181,7 @@ mod live {
             for request in [
                 Request::Restore { item: "x".into(), force: false },
                 Request::DeleteQuarantined { item: "x".into() },
-                Request::Migrate { from: dir.join("elsewhere") },
+                Request::Migrate { from: dir.join("elsewhere"), auth_key: None },
             ] {
                 assert!(client.call(request).unwrap().needs_approval);
             }
@@ -282,5 +284,78 @@ mod live {
         let events = subscribe(name);
         std::mem::forget(running);
         events
+    }
+
+    /// A free local port (bound, then released).
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn web_protection_goes_through_the_service() {
+        use crate::web::{Mode, SiteChange, WebConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = quiet(tmp.path());
+        let name = private_pipe();
+        let running = crate::service::start(&name, dir).unwrap();
+        let mut client = Client::connect_to(&name, false).unwrap();
+        let admin = elevated();
+
+        let settings: WebConfig = client.call(Request::GetWebSettings).unwrap().into_result().unwrap();
+        assert_eq!(settings, WebConfig::default());
+
+        // Blocking a site strengthens: anyone, and it is saved where the service keeps it.
+        let blocked: serde_json::Value = client
+            .call(Request::ChangeSite { change: SiteChange::Block, site: "https://www.bad.test/x".into() })
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(blocked["site"], "www.bad.test");
+        assert_eq!(WebConfig::load(dir).unwrap().user_block, ["www.bad.test"]);
+
+        // Allowing, unblocking and reporting only weaken: an administrator.
+        if !admin {
+            let allow = client.call(Request::ChangeSite { change: SiteChange::Allow, site: "shady.test".into() }).unwrap();
+            assert!(allow.needs_approval && allow.error.as_deref().unwrap().contains("allows shady.test"), "{allow:?}");
+            let unblock = client.call(Request::ChangeSite { change: SiteChange::Unblock, site: "www.bad.test".into() }).unwrap();
+            assert!(unblock.needs_approval, "{unblock:?}");
+            let report = WebConfig { mode: Mode::ReportOnly, ..WebConfig::load(dir).unwrap() };
+            let reply = client.call(Request::SetWebSettings { settings: report }).unwrap();
+            assert!(reply.needs_approval && reply.error.as_deref().unwrap().contains("only reports"), "{reply:?}");
+            assert_eq!(WebConfig::load(dir).unwrap().user_block, ["www.bad.test"], "unchanged");
+            assert!(client.call(Request::SetAuthKey { key: Some("0123abcd".into()) }).unwrap().needs_approval);
+        }
+
+        // Turning the DNS filter on strengthens; the service runs it.
+        let (dns, page) = (free_port(), free_port());
+        let on = WebConfig {
+            dns_filter: true,
+            dns_listen: format!("127.0.0.1:{dns}"),
+            dns_upstream: vec!["192.0.2.1".into()],
+            sinkhole: std::net::Ipv4Addr::LOCALHOST,
+            block_page_port: page,
+            ..WebConfig::load(dir).unwrap()
+        };
+        if admin {
+            assert!(client.call(Request::SetWebSettings { settings: on }).unwrap().ok);
+        } else {
+            // Moving where it listens weakens, so start it as the service would at start.
+            on.save(dir).unwrap();
+            drop(client);
+            running.stop();
+            let running = crate::service::start(&name, dir).unwrap();
+            client = Client::connect_to(&name, false).unwrap();
+            std::mem::forget(running);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            let status: crate::service::web::WebStatus = client.call(Request::WebStatus).unwrap().into_result().unwrap();
+            if status.dns_filter || std::time::Instant::now() > deadline {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert!(status.dns_filter && status.rules > 0 && status.error.is_none(), "{status:?}");
+        assert!(std::net::UdpSocket::bind(format!("127.0.0.1:{dns}")).is_err(), "the service's DNS filter holds the port");
     }
 }

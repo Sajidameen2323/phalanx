@@ -156,6 +156,46 @@ enum ServiceCommand {
     /// What the service's Run-box reader sees in every user's registry
     /// (diagnostics; administrator).
     RunBox,
+    /// Block, unblock, allow or stop allowing one site everywhere.
+    /// Unblocking and allowing need administrator rights.
+    Site {
+        #[arg(value_enum)]
+        change: SiteChangeArg,
+        site: String,
+    },
+    /// Turn ad and tracker blocking on or off (off needs administrator rights).
+    Ads {
+        #[arg(value_enum)]
+        state: OnOff,
+    },
+    /// Download new signatures and web rules in the service now, showing
+    /// its progress.
+    Update {
+        /// Download every feed again, even if unchanged.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Save the abuse.ch Auth-Key in the service (administrator).
+    AuthKey {
+        key: Option<String>,
+        /// Remove the saved key.
+        #[arg(long, conflicts_with_all = ["key", "from_app"])]
+        remove: bool,
+        /// Use the key saved in the app (Settings > Signatures), so it never
+        /// has to be typed or shown.
+        #[arg(long, conflicts_with = "key")]
+        from_app: bool,
+    },
+    /// The web protection settings and whether the DNS filter runs.
+    Web,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SiteChangeArg {
+    Block,
+    Unblock,
+    Allow,
+    Unallow,
 }
 
 #[derive(Subcommand)]
@@ -946,6 +986,7 @@ fn inspect(args: &InspectArgs, dir: &Path) -> Result<ExitCode> {
 fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
     use threat_scanner::ipc;
     use threat_scanner::service::manage::{self, State};
+    let connect = || ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)));
     match cmd {
         ServiceCommand::Install => {
             let exe = std::env::current_exe()?.with_file_name("phalanx-service.exe");
@@ -969,7 +1010,10 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
         }
         ServiceCommand::Migrate { from } => {
             let from = from.clone().unwrap_or_else(scan::default_data_dir);
-            let reply = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?.call(ipc::Request::Migrate { from: from.clone() })?;
+            // The key is encrypted for this user; the service (SYSTEM) cannot
+            // read the copied file, so it travels decrypted.
+            let auth_key = update::auth_key(&update::signature_dir(&from)).ok().flatten();
+            let reply = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?.call(ipc::Request::Migrate { from: from.clone(), auth_key })?;
             if reply.needs_approval {
                 anyhow::bail!("migrating needs administrator rights: run this from a terminal opened as administrator");
             }
@@ -1031,6 +1075,76 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             }
             let view: threat_scanner::rtp::commands::RunBoxView = reply.into_result()?;
             println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        ServiceCommand::Site { change, site } => {
+            use threat_scanner::web::SiteChange;
+            let change = match change {
+                SiteChangeArg::Block => SiteChange::Block,
+                SiteChangeArg::Unblock => SiteChange::Unblock,
+                SiteChangeArg::Allow => SiteChange::Allow,
+                SiteChangeArg::Unallow => SiteChange::Unallow,
+            };
+            let reply = connect()?.call(ipc::Request::ChangeSite { change, site: site.clone() })?;
+            if reply.needs_approval {
+                anyhow::bail!("{}: run this from a terminal opened as administrator", reply.error.unwrap_or_default());
+            }
+            let done: serde_json::Value = reply.into_result()?;
+            println!("Done: {}", done["site"].as_str().unwrap_or(site));
+        }
+        ServiceCommand::Ads { state } => {
+            let mut client = connect()?;
+            let mut settings: threat_scanner::web::WebConfig = client.call(ipc::Request::GetWebSettings)?.into_result()?;
+            settings.block_ads = matches!(state, OnOff::On);
+            let reply = client.call(ipc::Request::SetWebSettings { settings })?;
+            if reply.needs_approval {
+                anyhow::bail!("{}: run this from a terminal opened as administrator", reply.error.unwrap_or_default());
+            }
+            let _: threat_scanner::web::WebConfig = reply.into_result()?;
+            println!("Ad and tracker blocking is {}.", if matches!(state, OnOff::On) { "on" } else { "off" });
+        }
+        ServiceCommand::Update { force } => {
+            let mut events = connect()?;
+            events.call(ipc::Request::Subscribe)?;
+            let reply = connect()?.call(ipc::Request::UpdateSignatures { force: *force })?;
+            let _: serde_json::Value = reply.into_result()?;
+            loop {
+                let ipc::ServerMessage::Event { event } = events.next_message()? else { continue };
+                match event["type"].as_str() {
+                    Some("update-progress") => println!("  {}", event["step"].as_str().unwrap_or("")),
+                    Some("update-finished") => {
+                        let failed: Vec<&str> = event["failed"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                        println!("Done: {}.", if event["installed"].as_bool() == Some(true) { "new signatures are in use" } else { "nothing new" });
+                        if !failed.is_empty() {
+                            println!("Failed: {}", failed.join(", "));
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    Some("update-failed") => anyhow::bail!("the update failed: {}", event["error"].as_str().unwrap_or("")),
+                    _ => {}
+                }
+            }
+        }
+        ServiceCommand::AuthKey { key, remove, from_app } => {
+            let key = match (remove, from_app) {
+                (true, _) => None,
+                (_, true) => Some(
+                    update::auth_key(&update::signature_dir(&scan::default_data_dir()))?
+                        .ok_or_else(|| anyhow::anyhow!("the app has no abuse.ch Auth-Key saved"))?,
+                ),
+                _ => Some(key.clone().ok_or_else(|| anyhow::anyhow!("give the key, --from-app or --remove"))?),
+            };
+            let reply = connect()?.call(ipc::Request::SetAuthKey { key: key.clone() })?;
+            if reply.needs_approval {
+                anyhow::bail!("saving the key needs administrator rights: run this from a terminal opened as administrator");
+            }
+            let _: serde_json::Value = reply.into_result()?;
+            println!("{}", if key.is_some() { "The abuse.ch Auth-Key is saved in the service." } else { "The abuse.ch Auth-Key is removed." });
+        }
+        ServiceCommand::Web => {
+            let mut client = connect()?;
+            let settings: serde_json::Value = client.call(ipc::Request::GetWebSettings)?.into_result()?;
+            let status: serde_json::Value = client.call(ipc::Request::WebStatus)?.into_result()?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "status": status, "settings": settings }))?);
         }
         ServiceCommand::Events => {
             let mut events = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;

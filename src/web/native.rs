@@ -22,7 +22,7 @@
 //! It reloads the settings and rules when their files change, so changes in
 //! the desktop app apply without restarting the browser.
 
-use super::config::{ads_file, Mode, WebConfig, FEED_FILE};
+use super::config::{ads_file, Mode, SiteChange, SiteError, WebConfig, FEED_FILE};
 use super::events::{self, WebEvent};
 use super::rules::WebRules;
 use anyhow::{bail, Context, Result};
@@ -80,6 +80,9 @@ pub fn is_host_invocation(args: &[String]) -> bool {
 
 struct HostState {
     data_dir: PathBuf,
+    /// The protection service runs: settings are read from its folder and
+    /// changed through its pipe (see [`crate::service`]).
+    service: bool,
     config: WebConfig,
     rules: WebRules,
     loaded_from: [Option<SystemTime>; 3],
@@ -90,20 +93,15 @@ struct HostState {
     threat_domains: Option<Vec<String>>,
 }
 
-fn add(list: &mut Vec<String>, host: &str) {
-    if !list.iter().any(|h| h == host) {
-        list.push(host.to_string());
-    }
-}
-
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 impl HostState {
-    fn new(data_dir: &Path) -> Self {
+    fn new(data_dir: &Path, service: bool) -> Self {
         let mut state = Self {
             data_dir: data_dir.to_path_buf(),
+            service,
             config: WebConfig::default(),
             rules: WebRules::default(),
             loaded_from: [None; 3],
@@ -255,6 +253,16 @@ impl HostState {
                 "threats_revision": self.threats_revision(),
                 "ads_revision": self.ads_revision(),
             }),
+            Some("set_ads") if self.service => {
+                let on = request.get("on").and_then(Value::as_bool).unwrap_or(false);
+                match set_ads_via_service(on) {
+                    Ok(()) => {
+                        self.reload();
+                        json!({ "type": "ads_set", "ok": true, "block_ads": self.config.block_ads, "ads_revision": self.ads_revision() })
+                    }
+                    Err(e) => json!({ "type": "ads_set", "ok": false, "error": e }),
+                }
+            }
             Some("set_ads") => {
                 let on = request.get("on").and_then(Value::as_bool).unwrap_or(false);
                 match WebConfig::update(&self.data_dir, |c| c.block_ads = on) {
@@ -267,22 +275,14 @@ impl HostState {
             }
             // Allow a site: no threat or ad blocking on it (verdict 6). It
             // leaves the user's block list, so the two never disagree.
-            Some("exclude") => self.edit_site("excluded", &text("site"), |c, host| {
-                c.unblock(host);
-                add(&mut c.extension_exclusions, host);
-                true
-            }),
+            // Allow a site: no threat or ad blocking on it (verdict 6). It
+            // leaves the user's block list, so the two never disagree.
+            Some("exclude") => self.edit_site("excluded", &text("site"), SiteChange::Allow),
             // Block a site the rules do not know: the user's block list,
             // which known-good lists do not override. It stops being allowed.
-            Some("block_site") => self.edit_site("site_blocked", &text("site"), |c, host| {
-                c.unallow(host);
-                add(&mut c.user_block, host);
-                true
-            }),
-            // Removing covers the entry that applies: unblocking
-            // www.example.com removes an `example.com` entry.
-            Some("unblock_site") => self.edit_site("site_unblocked", &text("site"), |c, host| !c.unblock(host).is_empty()),
-            Some("unallow_site") => self.edit_site("site_unallowed", &text("site"), |c, host| !c.unallow(host).is_empty()),
+            Some("block_site") => self.edit_site("site_blocked", &text("site"), SiteChange::Block),
+            Some("unblock_site") => self.edit_site("site_unblocked", &text("site"), SiteChange::Unblock),
+            Some("unallow_site") => self.edit_site("site_unallowed", &text("site"), SiteChange::Unallow),
             Some("lists") => self.lists(),
             other => json!({ "type": "error", "error": format!("unknown request {other:?}") }),
         };
@@ -293,27 +293,44 @@ impl HostState {
     /// Changes one site in the user's lists, saves and reloads. `kind` is the
     /// reply type; the reply carries the updated lists. The change applies to
     /// the settings file as it is now (the app may have changed it since this
-    /// connector last read it); `change` returns false when the site was not
-    /// on the list it should leave.
-    fn edit_site(&mut self, kind: &str, site: &str, change: impl FnOnce(&mut WebConfig, &str) -> bool) -> Value {
-        // Only websites: `chrome://settings` must not become a site called "settings".
-        let lower = site.trim().to_ascii_lowercase();
-        let web_scheme = !lower.contains("://") || lower.starts_with("http://") || lower.starts_with("https://");
-        let Some(host) = super::rules::host_of(site).filter(|h| web_scheme && (h.contains('.') || h.parse::<std::net::IpAddr>().is_ok())) else {
-            return json!({ "type": kind, "ok": false, "error": "not a web address" });
-        };
+    /// connector last read it).
+    fn edit_site(&mut self, kind: &str, site: &str, change: SiteChange) -> Value {
+        if self.service {
+            return match change_site_via_service(change, site) {
+                Ok(host) => {
+                    self.reload();
+                    let mut reply = self.lists();
+                    reply["type"] = json!(kind);
+                    reply["ok"] = json!(true);
+                    reply["site"] = json!(host);
+                    reply
+                }
+                Err(e) => {
+                    self.reload();
+                    let mut reply = self.lists();
+                    reply["type"] = json!(kind);
+                    reply["ok"] = json!(false);
+                    reply["error"] = json!(e);
+                    reply
+                }
+            };
+        }
         let mut config = match WebConfig::load(&self.data_dir) {
             Ok(c) => c,
             Err(e) => return json!({ "type": kind, "ok": false, "error": format!("{e:#}") }),
         };
-        if !change(&mut config, &host) {
-            self.reload(); // the lists shown may have been out of date
-            let mut reply = self.lists();
-            reply["type"] = json!(kind);
-            reply["ok"] = json!(false);
-            reply["error"] = json!(format!("{host} is not on that list (it may have been changed in the Phalanx app)"));
-            return reply;
-        }
+        let host = match config.change_site(change, site) {
+            Ok(host) => host,
+            Err(SiteError::NotAWebAddress) => return json!({ "type": kind, "ok": false, "error": SiteError::NotAWebAddress.to_string() }),
+            Err(e) => {
+                self.reload(); // the lists shown may have been out of date
+                let mut reply = self.lists();
+                reply["type"] = json!(kind);
+                reply["ok"] = json!(false);
+                reply["error"] = json!(e.to_string());
+                return reply;
+            }
+        };
         match config.save(&self.data_dir) {
             Ok(()) => {
                 self.reload();
@@ -471,8 +488,67 @@ fn write_message(output: &mut impl Write, value: &Value) -> Result<()> {
 }
 
 /// Serves requests until the browser closes the pipe.
+/// Changes a site through the protection service. A change that weakens
+/// protection (allowing, unblocking) is made by an elevated `phalanx-cli`
+/// after Windows' administrator prompt: a program running as the user
+/// cannot approve it. Returns the host changed, or why not.
+fn change_site_via_service(change: SiteChange, site: &str) -> std::result::Result<String, String> {
+    use crate::ipc::{Client, Request};
+    // Only the host goes on to the service and to a command line.
+    let host = WebConfig::default().change_site(SiteChange::Block, site).map_err(|e| e.to_string())?;
+    let reply = Client::connect()
+        .and_then(|mut c| c.call(Request::ChangeSite { change, site: host.clone() }))
+        .map_err(|e| crate::ipc::describe(&e))?;
+    if reply.ok {
+        return Ok(host);
+    }
+    if !reply.needs_approval {
+        return Err(reply.error.unwrap_or_default());
+    }
+    let action = match change {
+        SiteChange::Block => "block",
+        SiteChange::Unblock => "unblock",
+        SiteChange::Allow => "allow",
+        SiteChange::Unallow => "unallow",
+    };
+    approve(&format!("service site {action} {host}")).map(|()| host)
+}
+
+/// Turns ad blocking on or off through the protection service (off needs
+/// an administrator's approval).
+fn set_ads_via_service(on: bool) -> std::result::Result<(), String> {
+    use crate::ipc::{Client, Request};
+    let mut client = Client::connect().map_err(|e| crate::ipc::describe(&e))?;
+    let mut settings: WebConfig = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+    settings.block_ads = on;
+    let reply = client.call(Request::SetWebSettings { settings }).map_err(|e| e.to_string())?;
+    match (reply.ok, reply.needs_approval) {
+        (true, _) => Ok(()),
+        (false, true) => approve(if on { "service ads on" } else { "service ads off" }),
+        (false, false) => Err(reply.error.unwrap_or_default()),
+    }
+}
+
+/// Runs this program elevated with `arguments` (after Windows'
+/// administrator prompt) and waits for it.
+fn approve(arguments: &str) -> std::result::Result<(), String> {
+    let program = std::env::current_exe().map_err(|e| e.to_string())?;
+    match crate::system::run_elevated(&program, arguments) {
+        Ok(crate::system::Elevated::Exited(0)) => Ok(()),
+        Ok(crate::system::Elevated::Exited(_)) => Err("not changed: the change could not be saved".into()),
+        Ok(crate::system::Elevated::Declined) => Err("not changed: Windows' administrator prompt was declined".into()),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
 pub fn run_host(data_dir: &Path, mut input: impl Read, mut output: impl Write) -> Result<()> {
-    let mut state = HostState::new(data_dir);
+    // With the protection service running, its folder holds the settings
+    // and rules (users may read it), and changes go through its pipe.
+    let service = crate::ipc::status_within(Duration::from_secs(1)).ok();
+    let mut state = match &service {
+        Some(status) => HostState::new(&status.data_dir, true),
+        None => HostState::new(data_dir, false),
+    };
     // Which browser started us, so the app can say it is really protected.
     let caller = calling_browser();
     let mut last_contact: Option<Instant> = None;
@@ -904,7 +980,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = WebConfig { mode: Mode::ReportOnly, ..Default::default() };
         config.save(tmp.path()).unwrap();
-        let mut state = HostState::new(tmp.path());
+        let mut state = HostState::new(tmp.path(), false);
         let reply = state.handle(&json!({"type": "check", "url": "http://blocktest.phalanx.invalid/"}));
         assert_eq!((reply["block"].as_bool(), reply["matched"].as_bool()), (Some(false), Some(true)));
         assert_eq!(events::recent(tmp.path(), 1)[0].action, "reported");
@@ -915,7 +991,7 @@ mod tests {
     #[test]
     fn sites_can_be_blocked_allowed_and_undone() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = HostState::new(tmp.path());
+        let mut state = HostState::new(tmp.path(), false);
         let blocked = state.handle(&json!({"type": "block_site", "site": "https://shady.example/page"}));
         assert_eq!((blocked["ok"].as_bool(), blocked["site"].as_str()), (Some(true), Some("shady.example")));
         assert_eq!(blocked["blocked"], json!(["shady.example"]));
@@ -942,7 +1018,7 @@ mod tests {
     #[test]
     fn hands_out_threat_names_for_pre_request_rules() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = HostState::new(tmp.path());
+        let mut state = HostState::new(tmp.path(), false);
         let first = state.handle(&json!({"type": "threat_domains", "offset": 0}));
         assert_eq!(first["active"], true);
         let domains = first["domains"].as_array().unwrap();
@@ -973,7 +1049,7 @@ mod tests {
         let mut list = String::from("# header\ndomain doubleclick.net ads StevenBlack.Ads\ndomain google.com ads StevenBlack.Ads\n");
         list.extend((0..ADS_PAGE).map(|i| format!("domain t{i}.example ads StevenBlack.Ads\n")));
         std::fs::write(ads_file(tmp.path()), list).unwrap();
-        let mut state = HostState::new(tmp.path());
+        let mut state = HostState::new(tmp.path(), false);
         let off = state.handle(&json!({"type": "ads_domains"}));
         assert_eq!((off["active"].as_bool(), off["total"].as_u64()), (Some(false), Some(0)), "off by default");
         assert!(!state.handle(&json!({"type": "check", "url": "https://doubleclick.net/"}))["block"].as_bool().unwrap());
@@ -1003,7 +1079,7 @@ mod tests {
             // File times can be coarse; make sure the edit is seen as new.
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        let mut state = HostState::new(tmp.path());
+        let mut state = HostState::new(tmp.path(), false);
         let blocked = |state: &mut HostState, url: &str| state.handle(&json!({"type": "check", "url": url}))["block"].as_bool().unwrap();
         let revision = |state: &mut HostState| state.handle(&json!({"type": "revisions"}))["threats_revision"].clone();
 

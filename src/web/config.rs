@@ -24,7 +24,7 @@ pub enum Mode {
     ReportOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
     /// Master switch for the browser connector's checks.
@@ -322,9 +322,157 @@ pub fn windows_uses_filter(listen: &SocketAddr) -> bool {
     }
 }
 
+/// A change to one site, as the browser (or the command line) asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SiteChange {
+    /// Block it everywhere; it stops being allowed.
+    Block,
+    /// Stop blocking it.
+    Unblock,
+    /// Allow it everywhere ("Always allow this site"); it stops being blocked.
+    Allow,
+    /// Stop allowing it.
+    Unallow,
+}
+
+impl SiteChange {
+    /// Unblocking and allowing make web protection weaker.
+    pub fn weakens(self) -> bool {
+        matches!(self, SiteChange::Unblock | SiteChange::Allow)
+    }
+}
+
+/// Why a site change was not made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SiteError {
+    NotAWebAddress,
+    /// The site is not on the list it was to leave.
+    NotListed(String),
+}
+
+impl std::fmt::Display for SiteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SiteError::NotAWebAddress => f.write_str("not a web address"),
+            SiteError::NotListed(host) => write!(f, "{host} is not on that list (it may have been changed in the Phalanx app)"),
+        }
+    }
+}
+
+impl WebConfig {
+    /// Makes `change` to `site` and returns the host it applied to.
+    /// Removing covers the entry that applies: unblocking `www.example.com`
+    /// removes an `example.com` entry.
+    pub fn change_site(&mut self, change: SiteChange, site: &str) -> Result<String, SiteError> {
+        // Only websites: `chrome://settings` must not become a site called "settings".
+        let lower = site.trim().to_ascii_lowercase();
+        let web_scheme = !lower.contains("://") || lower.starts_with("http://") || lower.starts_with("https://");
+        let host = host_of(site)
+            .filter(|h| web_scheme && (h.contains('.') || h.parse::<std::net::IpAddr>().is_ok()))
+            .ok_or(SiteError::NotAWebAddress)?;
+        let add = |list: &mut Vec<String>, host: &str| {
+            if !list.iter().any(|h| h == host) {
+                list.push(host.to_string());
+            }
+        };
+        let changed = match change {
+            SiteChange::Block => {
+                self.unallow(&host);
+                add(&mut self.user_block, &host);
+                true
+            }
+            SiteChange::Unblock => !self.unblock(&host).is_empty(),
+            SiteChange::Allow => {
+                self.unblock(&host);
+                add(&mut self.extension_exclusions, &host);
+                true
+            }
+            SiteChange::Unallow => !self.unallow(&host).is_empty(),
+        };
+        if changed { Ok(host) } else { Err(SiteError::NotListed(host)) }
+    }
+
+    /// How changing from `self` to `new` weakens web protection, in plain
+    /// words; empty when it does not.
+    pub fn weakened_by(&self, new: &WebConfig) -> Vec<String> {
+        let listed = |list: &[String], entry: &str| list.iter().any(|e| list_entry(e).is_some() && list_entry(e) == list_entry(entry));
+        let mut out = Vec::new();
+        if self.enabled && !new.enabled {
+            out.push("turns off checking sites in browsers".into());
+        }
+        if self.mode == Mode::Block && new.mode == Mode::ReportOnly {
+            out.push("only reports dangerous sites instead of blocking them".into());
+        }
+        for entry in new.user_allow.iter().chain(&new.extension_exclusions) {
+            if !listed(&self.user_allow, entry) && !listed(&self.extension_exclusions, entry) {
+                out.push(format!("allows {entry}"));
+            }
+        }
+        for entry in self.user_block.iter().filter(|e| !listed(&new.user_block, e)) {
+            out.push(format!("stops blocking {entry}"));
+        }
+        if self.use_feeds && !new.use_feeds {
+            out.push("stops using the downloaded lists of dangerous sites".into());
+        }
+        if self.block_ads && !new.block_ads {
+            out.push("stops blocking ads and trackers".into());
+        }
+        if self.dns_filter && !new.dns_filter {
+            out.push("turns off the DNS filter".into());
+        }
+        if (&self.dns_listen, &self.dns_upstream, self.sinkhole, self.block_page_port) != (&new.dns_listen, &new.dns_upstream, new.sinkhole, new.block_page_port) {
+            out.push("changes where the DNS filter listens or sends lookups".into());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weakening_web_protection_is_told_apart() {
+        let mut base = WebConfig { dns_filter: true, block_ads: true, ..Default::default() };
+        base.change_site(SiteChange::Block, "https://bad.example/x").unwrap();
+        assert!(base.weakened_by(&base).is_empty());
+
+        let mut allowed = base.clone();
+        allowed.change_site(SiteChange::Allow, "https://www.shady.test/").unwrap();
+        assert_eq!(base.weakened_by(&allowed), ["allows www.shady.test"]);
+        let mut unblocked = base.clone();
+        unblocked.change_site(SiteChange::Unblock, "bad.example").unwrap();
+        assert_eq!(base.weakened_by(&unblocked), ["stops blocking bad.example"]);
+        let cases: Vec<(WebConfig, &str)> = vec![
+            (WebConfig { enabled: false, ..base.clone() }, "turns off checking sites in browsers"),
+            (WebConfig { mode: Mode::ReportOnly, ..base.clone() }, "only reports dangerous sites instead of blocking them"),
+            (WebConfig { use_feeds: false, ..base.clone() }, "stops using the downloaded lists of dangerous sites"),
+            (WebConfig { block_ads: false, ..base.clone() }, "stops blocking ads and trackers"),
+            (WebConfig { dns_filter: false, ..base.clone() }, "turns off the DNS filter"),
+            (WebConfig { dns_upstream: vec!["203.0.113.9".into()], ..base.clone() }, "changes where the DNS filter listens or sends lookups"),
+        ];
+        for (new, why) in cases {
+            assert_eq!(base.weakened_by(&new), [why]);
+        }
+
+        // Strengthening asks nothing: blocking more, allowing less.
+        let mut stronger = allowed.clone();
+        stronger.change_site(SiteChange::Unallow, "www.shady.test").unwrap();
+        stronger.change_site(SiteChange::Block, "another.test").unwrap();
+        assert!(allowed.weakened_by(&stronger).is_empty(), "{:?}", allowed.weakened_by(&stronger));
+        assert!(SiteChange::Allow.weakens() && SiteChange::Unblock.weakens() && !SiteChange::Block.weakens() && !SiteChange::Unallow.weakens());
+    }
+
+    #[test]
+    fn site_changes_take_web_addresses_only() {
+        let mut c = WebConfig::default();
+        assert_eq!(c.change_site(SiteChange::Block, "chrome://settings"), Err(SiteError::NotAWebAddress));
+        assert_eq!(c.change_site(SiteChange::Block, "https://www.Example.com/a?b"), Ok("www.example.com".into()));
+        assert_eq!(c.change_site(SiteChange::Unallow, "www.example.com"), Err(SiteError::NotListed("www.example.com".into())));
+        assert_eq!(c.change_site(SiteChange::Unblock, "example.com"), Ok("example.com".into()), "the entry that applies");
+        assert!(c.user_block.is_empty());
+    }
 
     #[test]
     fn allow_and_block_lists_stay_exclusive() {
