@@ -19,6 +19,7 @@ use crate::risk::{DownloadOrigin, RiskyFile};
 use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
+use crate::store::{DetectionRow, ScanErrorRow};
 use crate::service::web::WebStatus;
 use crate::web::events::WebEvent;
 use crate::web::{SiteChange, WebConfig};
@@ -332,6 +333,13 @@ pub struct Status {
     pub caller: Caller,
     /// Where the service keeps its data.
     pub data_dir: PathBuf,
+}
+
+/// The reply to `ScanDetails`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanDetails {
+    pub detections: Vec<DetectionRow>,
+    pub errors: Vec<ScanErrorRow>,
 }
 
 /// The reply to `ProtectionStatus`.

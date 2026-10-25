@@ -925,9 +925,9 @@ impl App {
         }
         if let Some(id) = toggle && self.expanded.remove(&id).is_none() {
             self.link.run(
-                move || link::read::<(Vec<DetectionRow>, Vec<ScanErrorRow>)>(Request::ScanDetails { scan: id }),
+                move || link::read::<ipc::ScanDetails>(Request::ScanDetails { scan: id }),
                 move |app, details| match details {
-                    Ok((detections, errors)) => {
+                    Ok(ipc::ScanDetails { detections, errors }) => {
                         app.expanded.insert(id, ScanDetails { detections, errors });
                     }
                     Err(e) => app.notify(format!("Could not load scan details: {e}"), false),

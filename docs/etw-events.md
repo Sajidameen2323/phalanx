@@ -142,6 +142,18 @@ Each one ends with the tests passing.
     copy of IPHLPAPI.DLL with bytes appended (unsigned, still loads;
     IPHLPAPI is not a KnownDLL). Checked by hand that the premise holds.
     Skips without administrator rights.
-- **Next:** run `cargo test --lib rtp:: -- --test-threads=1` elevated to
-  confirm milestone 3; then milestone 4 (README, Protection page, setup's
+- **Milestone 3 verified (2026-10-25):** all 30 rtp tests pass elevated,
+  including the side-loading test.
+- **Testing note:** with Phalanx itself installed and its service running,
+  the service also sees the tests' programs: it records their test-marker
+  program (`bad-ping.exe`) and their PowerShell commands in the installed
+  copy's History, and it can stop `bad-ping.exe` before the test's own
+  monitor does, so `a_detected_program_is_stopped_and_quarantined` fails
+  now and then with `stopped=0`. Stop the service (`sc stop Phalanx`,
+  elevated) while running the rtp tests.
+- **Found on the way (fixed):** History's "Show details" failed in 0.5.x
+  ("invalid type: map, expected a tuple of size 2"): the service answered
+  `ScanDetails` with an object, the app read a pair. Both now use
+  `ipc::ScanDetails`; `protection_and_scans_run_in_the_service` covers it.
+- **Next:** milestone 4 (README, Protection page, setup's
   README.txt, version 0.6.0, installed test, idle CPU before/after).
