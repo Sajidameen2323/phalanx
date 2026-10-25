@@ -1,5 +1,7 @@
 # Phalanx hardening plan (user mode only)
 
+> Phases 1 to 3 are done (0.5). What comes next is in [next-plan.md](next-plan.md).
+
 Phalanx has no kernel driver, so it cannot intercept anything before it runs. This
 plan closes the largest gaps that user-mode code *can* close. Each phase is ordered
 by how many real-world attacks it stops for the work involved. Phases 1 and 2 need
