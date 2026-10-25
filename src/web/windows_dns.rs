@@ -54,6 +54,8 @@ fn ps_quote(path: &Path) -> String {
 pub fn apply_script(backup: &Path, fallback: bool) -> String {
     format!(
         r#"$backupPath = {backup}
+# The backup's folder is the service's, which only administrators can change.
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null
 $adapters = @(Get-NetAdapter | Where-Object {{ $_.Status -eq 'Up' }})
 if (-not $adapters) {{ throw 'no connected network adapter' }}
 $records = @(foreach ($a in $adapters) {{
@@ -97,14 +99,12 @@ fn run(script: &str) -> Result<Elevated> {
     system::run_elevated_powershell(&format!("$ErrorActionPreference = 'Stop'; try {{\n{script}\nexit 0 }} catch {{ exit 1 }}"))
 }
 
-/// Points every connected adapter's DNS at the filter (administrator).
+/// Points every connected adapter's DNS at the filter (administrator). The
+/// backup's folder is created by the elevated script: it is in the service's
+/// folder, which the app, running as the user, cannot write to.
 pub fn apply(data_dir: &Path, listen: &SocketAddr, fallback: bool) -> Result<Elevated> {
     usable_listen(listen)?;
-    let backup = backup_path(data_dir);
-    if let Some(dir) = backup.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    run(&apply_script(&backup, fallback))
+    run(&apply_script(&backup_path(data_dir), fallback))
 }
 
 /// Puts back the DNS settings saved by [`apply`] (administrator).
