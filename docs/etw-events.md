@@ -180,7 +180,21 @@ Each one ends with the tests passing.
     through `Diagnostics.Process` (elevated `Start-Process -Wait` fails with
     "Access is denied" once the service has stopped a detected program).
   - New CLI command `phalanx-cli service protection` (ProtectionStatus).
-- **Left:** the clean CPU comparison
-  (`check-installed.ps1 -CpuOnly`, elevated), then the PR.
+- **Clean CPU comparison** (`check-installed.ps1 -CpuOnly`, each measurement
+  after the service settled):
+
+  | | Idle, 60 s | 200 starts of `cmd /c exit` |
+  | --- | --- | --- |
+  | Side-loading on | 1.12% and 1.48% of one core | 0.23 s CPU |
+  | Side-loading off | 0.94% of one core | 0.08 s CPU |
+
+  Image loads cost about 0.2–0.5% of one core at idle: kept on by default.
+  **Milestone 4 done.**
+- **Follow-up, not part of 4a:** the idle service uses about 1% of one core
+  even with side-loading off. Likely suspects: the 5 s process list
+  (`PROCESS_RECONCILE`, which opens every process), the Run-box watcher and
+  the DNS filter. Worth profiling; the lab's cost report (next-plan step 0)
+  is the place for it.
+- **Left:** the PR.
 - **Was next:** milestone 4 (README, Protection page, setup's
   README.txt, version 0.6.0, installed test, idle CPU before/after).
