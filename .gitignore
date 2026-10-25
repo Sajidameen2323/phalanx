@@ -2,3 +2,6 @@
 
 # Local research notes, not published
 malwarebytes-browser-protection-spec.md
+
+# Test output saved locally
+*.log
