@@ -344,10 +344,12 @@ fn a_suspicious_command_line_is_reported_and_left_running() {
     // Started through `cmd /c start`, so its parent is not this process:
     // children of Phalanx itself are never checked. A hidden window only:
     // Microsoft Defender blocks a hidden *encoded* command before it starts
-    // (decoding is tested with the Run box below).
+    // (decoding is tested with the Run box below). It gets a console of its
+    // own: `-w hidden` hides whatever console PowerShell runs in, which with
+    // `start /b` was the terminal running the tests.
     let marker = format!("Start-Sleep -Seconds 20 # phalanx-test-{}", std::process::id());
     std::process::Command::new("cmd")
-        .raw_arg(format!("/c start \"\" /b powershell -NoProfile -w hidden -c \"{marker}\""))
+        .raw_arg(format!("/c start \"\" /min powershell -NoProfile -w hidden -c \"{marker}\""))
         .spawn()
         .unwrap()
         .wait()
