@@ -35,6 +35,7 @@ fn describe(event: RtpEvent) -> String {
         RtpEvent::RiskyFile { path, risk, .. } => format!("risky {} {}", name(&path), risk.disguise.is_some()),
         RtpEvent::RiskyChecked { path, outcome } => format!("checked {} {outcome:?}", name(&path)),
         RtpEvent::ProgramWatch { events, .. } => format!("program-watch {events}"),
+        RtpEvent::SideLoad(hit) => format!("sideload {} {}", hit.program.to_ascii_lowercase(), name(&hit.dll).to_ascii_lowercase()),
         RtpEvent::Command(hit) => {
             let rules: Vec<&str> = hit.matches.iter().map(|m| m.rule.as_str()).collect();
             format!("command {:?} {} {}", hit.source, hit.program.to_ascii_lowercase(), rules.join(","))
@@ -523,4 +524,49 @@ fn the_run_box_view_finds_this_user() {
     let mine = view.hives.iter().find(|h| h.name == sid).unwrap_or_else(|| panic!("{sid} not in {:?}", view.hives.iter().map(|h| &h.name).collect::<Vec<_>>()));
     assert!(mine.person);
     assert!(mine.run_box.is_ok() || mine.run_box.as_ref().err().is_some_and(|e| e.contains("cannot find")), "{:?}", mine.run_box);
+}
+
+/// Needs administrator rights (image loads come from process events);
+/// skipped, and says so, without them.
+#[test]
+fn a_signed_program_loading_a_planted_windows_dll_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let planted = tmp.path().join("app");
+    fs::create_dir_all(&planted).unwrap();
+    // Windows' own ping (still signed through its catalog when copied) and
+    // a copy of a DLL it imports, changed so that it is no longer signed but
+    // still loads. IPHLPAPI is not a known DLL, so the copy next to the
+    // program is the one loaded.
+    let system32 = Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join("System32");
+    let exe = planted.join("ping.exe");
+    fs::copy(system32.join("PING.EXE"), &exe).unwrap();
+    let mut dll = fs::read(system32.join("IPHLPAPI.DLL")).unwrap();
+    dll.extend_from_slice(b"phalanx side-loading test");
+    fs::write(planted.join("IPHLPAPI.DLL"), dll).unwrap();
+
+    let mut cfg = RtpConfig::new(Vec::new());
+    // Tests run in parallel; only the drive test watches for new drives.
+    cfg.scan_new_drives = false;
+    cfg.process_protection = true;
+    cfg.command_rules = false;
+    // Tests run in parallel: never stop another test's programs.
+    cfg.stop_running_threats = false;
+    cfg.defer_when_fullscreen = false;
+    let mut run = Run::start(&data_dir, cfg);
+    assert!(run.until(|m| m.starts_with("program-watch")), "{:?}", run.seen);
+    if run.seen.iter().any(|m| m == "program-watch false") {
+        run.handle.stop();
+        eprintln!("skipped: process events need administrator rights");
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    std::process::Command::new(&exe).args(["-n", "1", "127.0.0.1"]).stdout(std::process::Stdio::null()).status().unwrap();
+    let found = run.until(|m| m == "sideload ping.exe iphlpapi.dll");
+    run.handle.stop();
+    assert!(found, "{:?}", run.seen);
+    let store = scan::open_store(&data_dir).unwrap();
+    let row = &store.recent_scans(5, Some("sideload")).unwrap()[0];
+    assert_eq!(store.scan_detections(row.id).unwrap()[0].threat, "SideLoad.iphlpapi.dll");
 }

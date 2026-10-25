@@ -864,6 +864,7 @@ impl App {
                     let (status, color) = match (&s.finished_at, s.cancelled, s.detections) {
                         // A command line, not a file scan; nothing was stopped.
                         _ if s.kind == "command" => ("Suspicious command".to_string(), theme().amber),
+                        _ if s.kind == "sideload" => ("Possible DLL side-loading".to_string(), theme().amber),
                         (None, _, _) => ("Incomplete".to_string(), theme().amber),
                         (_, true, _) => ("Cancelled".to_string(), theme().amber),
                         (_, _, 0) => ("Clean".to_string(), theme().green),
@@ -873,6 +874,8 @@ impl App {
                 });
                 if s.kind == "command" {
                     facts(ui, &[("Action", "Reported only: command-line rules do not stop programs yet".to_string())]);
+                } else if s.kind == "sideload" {
+                    facts(ui, &[("Action", "Reported only: side-loading checks do not stop programs yet".to_string())]);
                 } else {
                     facts(
                         ui,
@@ -1999,7 +2002,7 @@ fn detection_card(ui: &mut Ui, row: &mut ResultRow, ai_enabled: bool) -> bool {
 
 /// Scans recorded by real-time protection rather than started by the user.
 fn is_protection_kind(kind: &str) -> bool {
-    kind == "watch" || kind == "process" || kind == "command"
+    kind == "watch" || kind == "process" || kind == "command" || kind == "sideload"
 }
 
 fn capitalize(text: &str) -> String {

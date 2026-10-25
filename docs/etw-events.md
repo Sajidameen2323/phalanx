@@ -105,7 +105,8 @@ Each one ends with the tests passing.
   program file, and only falls back to the event's; `Stopped` carries only
   the pid (events arrive in order). The ETW test now also checks that a
   running process's id from an event equals its id in the process list and
-  can be stopped. **Needs one more elevated run to confirm.** The same run
+  can be stopped. **Confirmed by a second elevated run: all 27 rtp tests pass
+  on the event path, so milestones 1 and 2 are verified.** The first run
   showed `a_suspicious_command_line_is_reported_and_left_running` hiding the
   terminal (`start /b` + `-w hidden`); it now uses `start /min`.
 - **Known limit:** the Kernel-Process start event has no command line, so it
@@ -118,5 +119,29 @@ Each one ends with the tests passing.
   `phalanx-service --console` with `PHALANX_PIPE` (or `phalanx-cli watch
   --programs`) and check it says programs are seen through process events;
   start `cmd /c exit` repeatedly and see each one checked.
-- **Next:** milestone 3, side-loading. `etw::start(…, images: true, …)`
-  already delivers `ImageLoaded`; `programs` ignores it for now.
+- **Milestone 3: built, live test not yet run elevated**
+  (`src/rtp/sideload.rs`). The rule was narrowed from the design above to
+  keep false positives down, since per-user apps (Electron's `ffmpeg.dll`
+  and so on) load unsigned DLLs from AppData all the time: flagged is an
+  **unsigned DLL whose name is that of a DLL in System32**, loaded from
+  outside `%SystemRoot%` and Program Files, by a **signed** program.
+  - `Filter` (cheap, on the program monitor's thread): `.dll`, not under a
+    protected folder, name present in System32 (cached by name).
+  - Candidates go over a bounded queue (`SIDE_LOAD_QUEUE`, 256, dropped
+    when full) to the `side-load-check` part, which verifies signatures
+    (`trust::verify`), judges each program+DLL `FileKey` pair once per run,
+    records a `sideload` history entry (`SideLoad.<dll>`, Suspicious,
+    report-only), sends the DLL to the urgent lane to be scanned and emits
+    `RtpEvent::SideLoad(SideLoadHit)` → `ipc::Event::SideLoad`.
+  - App: activity entry (Threat), notification (with threat notifications
+    on), History badge "Possible DLL side-loading". CLI `watch` prints it.
+  - `RtpConfig::side_loading` (default on; needs `process_events`). Image
+    loads are only requested from ETW when it is on.
+  - Test `a_signed_program_loading_a_planted_windows_dll_is_reported`
+    (`src/rtp/tests.rs`): a copy of ping (still catalog-signed) next to a
+    copy of IPHLPAPI.DLL with bytes appended (unsigned, still loads;
+    IPHLPAPI is not a KnownDLL). Checked by hand that the premise holds.
+    Skips without administrator rights.
+- **Next:** run `cargo test --lib rtp:: -- --test-threads=1` elevated to
+  confirm milestone 3; then milestone 4 (README, Protection page, setup's
+  README.txt, version 0.6.0, installed test, idle CPU before/after).

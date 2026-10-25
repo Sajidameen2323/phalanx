@@ -16,7 +16,7 @@
 mod pipe;
 
 use crate::risk::{DownloadOrigin, RiskyFile};
-use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent};
+use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
 use crate::service::web::WebStatus;
@@ -142,6 +142,8 @@ pub enum Event {
     /// How programs are watched: through Windows' process events, or by
     /// reading the process list (`reason` says why not events).
     ProgramWatch { events: bool, reason: Option<String> },
+    /// A signed program loaded an unsigned copy of a Windows DLL (reported only).
+    SideLoad { hit: SideLoadHit },
     /// Real-time protection was turned off in the settings.
     ProtectionOff,
     FolderLost { folder: PathBuf, reason: String },
@@ -187,6 +189,7 @@ impl From<RtpEvent> for Event {
             RtpEvent::RiskyFile { path, risk, origin } => Event::RiskyFile { path, risk, origin },
             RtpEvent::RiskyChecked { path, outcome } => Event::RiskyChecked { path, outcome },
             RtpEvent::ProgramWatch { events, reason } => Event::ProgramWatch { events, reason },
+            RtpEvent::SideLoad(hit) => Event::SideLoad { hit },
             RtpEvent::Command(hit) => Event::Command { hit },
             RtpEvent::DriveAdded { root, files } => Event::DriveAdded { root, files },
             RtpEvent::Restarting { error, retry_in } => Event::Restarting { error, retry_in_secs: retry_in.as_secs() },

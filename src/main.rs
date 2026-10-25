@@ -929,6 +929,11 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
             let reason = reason.map(|r| format!(" ({r})")).unwrap_or_default();
             println!("programs are found by reading the process list twice a second{reason}");
         }
+        RtpEvent::SideLoad(hit) => {
+            println!("[possible DLL side-loading] {} (pid {})", hit.headline(), hit.pid);
+            println!("    program: {}{}", hit.image.display(), hit.signer.map(|s| format!(", signed by {s}")).unwrap_or_default());
+            println!("    report-only: nothing was stopped; the DLL is scanned");
+        }
         RtpEvent::Command(hit) => {
             let at = match (hit.source, hit.pid) {
                 (rtp::CommandSource::RunBox, _) => "Run box".to_string(),

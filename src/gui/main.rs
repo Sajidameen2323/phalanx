@@ -31,7 +31,7 @@ use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
 use threat_scanner::cmdline::Confidence;
-use threat_scanner::rtp::{CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome};
+use threat_scanner::rtp::{CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome, SideLoadHit};
 use threat_scanner::Category;
 use widgets::APP_TITLE;
 
@@ -343,6 +343,7 @@ enum WatchMsg {
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
     ProgramWatch { events: bool, reason: Option<String> },
+    SideLoad(SideLoadHit),
     Command(CommandHit),
     DriveAdded { root: PathBuf, files: usize },
     Error(String),
@@ -1604,6 +1605,15 @@ impl App {
                         );
                     }
                 }
+                WatchMsg::SideLoad(hit) => {
+                    let mut detail = vec![format!("program: {} (pid {})", hit.image.display(), hit.pid)];
+                    if let Some(signer) = &hit.signer {
+                        detail.push(format!("signed by {signer}"));
+                    }
+                    detail.push("Malware often hides in a trusted program this way. Report-only: nothing was stopped; the DLL is being scanned".into());
+                    self.log_activity(ActivityKind::Threat, format!("Possible DLL side-loading: {}", hit.headline()), detail.join(" · "));
+                    changed_history = true;
+                }
                 WatchMsg::Command(hit) => {
                     let kind = if hit.confidence() == Confidence::High { ActivityKind::Threat } else { ActivityKind::Risky };
                     let mut detail: Vec<String> = hit.matches.iter().map(|m| m.reason.clone()).collect();
@@ -1732,6 +1742,7 @@ fn watch_msg(event: Event) -> Option<WatchMsg> {
         Event::RiskyFile { path, risk, origin } => WatchMsg::RiskyFile { path, risk, origin },
         Event::RiskyChecked { path, outcome } => WatchMsg::RiskyChecked { path, outcome },
         Event::ProgramWatch { events, reason } => WatchMsg::ProgramWatch { events, reason },
+        Event::SideLoad { hit } => WatchMsg::SideLoad(hit),
         Event::Command { hit } => WatchMsg::Command(hit),
         Event::DriveAdded { root, files } => WatchMsg::DriveAdded { root, files },
         Event::Restarting { error, retry_in_secs } => WatchMsg::Restarting { error, retry_in: Duration::from_secs(retry_in_secs) },
@@ -1769,6 +1780,11 @@ fn notify_event(event: &Event, prefs: &link::NotifyPrefs) {
             &format!("{} ({}). Phalanx stopped this connection.", event.threat, event.category),
         ),
         // Medium-confidence matches are common in admin tools; only logged.
+        Event::SideLoad { hit } if prefs.threats() => {
+            let title = format!("Possible DLL side-loading in {}", hit.program);
+            let body = format!("{}. Phalanx only reported it and is scanning the DLL. If you did not just install or update this program, check it.", capitalize_first(&hit.headline()));
+            system::notify(&title, &body);
+        }
         Event::Command { hit } if prefs.threats() && hit.confidence() == Confidence::High => {
             let (title, body) = command_notification(hit);
             system::notify(&title, &body);

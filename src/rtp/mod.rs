@@ -27,7 +27,9 @@
 //!
 //! With program protection on, the command lines of script hosts and Windows
 //! tools, and commands entered in the Run box, are also checked against
-//! [`crate::cmdline`]'s rules (see [`commands`]; report-only for now).
+//! [`crate::cmdline`]'s rules (see [`commands`]; report-only for now), and,
+//! with process events, the DLLs programs load are checked for side-loading
+//! (see [`sideload`]; report-only too).
 //!
 //! A supervisor restarts the whole pipeline if any part fails or panics,
 //! with backoff, and catches up on files that changed while it was down.
@@ -41,10 +43,12 @@ mod drives;
 mod etw;
 mod files;
 pub mod process;
+pub mod sideload;
 
 use serde::{Deserialize, Serialize};
 use self::cache::{Disposition, DispositionCache, FileKey};
 pub use self::commands::{CommandHit, CommandSource};
+pub use self::sideload::SideLoadHit;
 use self::process::ProcessInfo;
 use crate::engine::Engine;
 use crate::risk::{DownloadOrigin, RiskyFile};
@@ -56,7 +60,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -68,6 +72,8 @@ const PROCESS_POLL: Duration = Duration::from_millis(500);
 /// With process events, how often the list is still read, for anything the
 /// event session lost.
 const PROCESS_RECONCILE: Duration = Duration::from_secs(5);
+/// Image loads waiting for the side-loading checker at most.
+const SIDE_LOAD_QUEUE: usize = 256;
 /// Without process events, how often the session is tried again.
 const EVENTS_RETRY: Duration = Duration::from_secs(60);
 /// Consecutive failures to list programs before the monitor gives up (and is restarted).
@@ -101,6 +107,9 @@ pub struct RtpConfig {
     /// process events (ETW, administrators only) rather than only by reading
     /// the process list twice a second.
     pub process_events: bool,
+    /// With `process_events`: flag a signed program loading an unsigned copy
+    /// of a Windows DLL from a folder users can write to. Report-only.
+    pub side_loading: bool,
     /// With `process_protection`: check the command lines of script hosts
     /// and Windows tools as they start, and commands entered in the Run box.
     /// Matches are only reported.
@@ -136,6 +145,7 @@ impl RtpConfig {
             alert_risky: true,
             process_protection: false,
             process_events: true,
+            side_loading: true,
             command_rules: true,
             run_box_all_users: false,
             stop_running_threats: true,
@@ -199,6 +209,8 @@ pub enum RtpEvent {
     /// process list (`reason` says why not events). Sent when program
     /// protection starts and whenever this changes.
     ProgramWatch { events: bool, reason: Option<String> },
+    /// A signed program loaded an unsigned copy of a Windows DLL (reported only).
+    SideLoad(SideLoadHit),
     /// A command line matched the command-line rules (reported only).
     Command(CommandHit),
     /// A drive appeared (a mounted disk image or a USB drive); `files` near
@@ -297,6 +309,10 @@ impl Ctx<'_> {
         self.config.process_protection && process::SUPPORTED
     }
 
+    fn side_loading_enabled(&self) -> bool {
+        self.programs_enabled() && self.config.process_events && self.config.side_loading
+    }
+
     fn commands_enabled(&self) -> bool {
         self.programs_enabled() && self.config.command_rules
     }
@@ -383,8 +399,17 @@ fn run_once(ctx: &Ctx<'_>, catch_up: Option<SystemTime>) -> Result<(), String> {
         add(spawn_part(s, ctx, "bulk-lane", true, move || lane(ctx, bulk_rx, true)), "bulk-lane");
         if ctx.programs_enabled() {
             add(spawn_part(s, ctx, "sweep-lane", true, move || lane(ctx, sweep_rx, true)), "sweep-lane");
+            let side = if ctx.side_loading_enabled() {
+                let (side_tx, side_rx) = mpsc::sync_channel(SIDE_LOAD_QUEUE);
+                let urgent = urgent_tx.clone();
+                let check = move || sideload::run(ctx, &scan::open_store(ctx.data_dir)?, side_rx, &urgent);
+                add(spawn_part(s, ctx, "side-load-check", true, check), "side-load-check");
+                Some(side_tx)
+            } else {
+                None
+            };
             let urgent = urgent_tx.clone();
-            add(spawn_part(s, ctx, "program-monitor", false, move || programs(ctx, &urgent, &sweep_tx)), "program-monitor");
+            add(spawn_part(s, ctx, "program-monitor", false, move || programs(ctx, &urgent, &sweep_tx, side)), "program-monitor");
             #[cfg(windows)]
             if ctx.commands_enabled() {
                 let all_users = ctx.config.run_box_all_users;
@@ -451,10 +476,12 @@ fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
 /// session lost. Without events (no administrator rights, or the session was
 /// refused or ended) the list is read twice a second, and the session is
 /// tried again now and then.
-fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Result<()> {
+fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>, side: Option<SyncSender<sideload::Candidate>>) -> Result<()> {
+    let images = side.is_some();
+    let mut filter = sideload::Filter::new();
     let store = if ctx.commands_enabled() { Some(scan::open_store(ctx.data_dir)?) } else { None };
     // Started before the first list, so nothing starts unseen in between.
-    let mut events = start_events(ctx, false);
+    let mut events = start_events(ctx, images, false);
     let mut retry_events = Instant::now() + EVENTS_RETRY;
     let mut known: HashSet<process::ProcessId> = HashSet::new();
     let mut live: HashMap<u32, ProcessInfo> = HashMap::new();
@@ -490,7 +517,7 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Resul
         let Some((_, rx)) = &events else {
             ctx.pause(next_list.saturating_duration_since(Instant::now()));
             if ctx.config.process_events && Instant::now() >= retry_events && !ctx.halted() {
-                events = start_events(ctx, true);
+                events = start_events(ctx, images, true);
                 retry_events = Instant::now() + EVENTS_RETRY;
             }
             continue;
@@ -509,7 +536,17 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Resul
                 live.remove(&pid);
                 known.retain(|id| id.pid != pid);
             }
-            Ok(etw::Event::ImageLoaded { .. }) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(etw::Event::ImageLoaded { pid, image: dll }) => {
+                if let Some(side) = &side && filter.candidate(&dll) {
+                    let image = live.get(&pid).map(|p| p.image.clone()).or_else(|| process::identify(pid).map(|(_, image)| image));
+                    // A full queue drops the load: the checker is far behind,
+                    // and a program loading it again is seen again.
+                    if let Some(image) = image {
+                        let _ = side.try_send(sideload::Candidate { pid, image, dll });
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 events = None;
                 retry_events = Instant::now() + EVENTS_RETRY;
@@ -521,15 +558,16 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Resul
     Ok(())
 }
 
-/// Starts the process-event session, saying how programs are watched. A
-/// `retry` that fails changes nothing, so it is not announced.
-fn start_events(ctx: &Ctx<'_>, retry: bool) -> Option<(etw::Session, Receiver<etw::Event>)> {
+/// Starts the process-event session (with image loads, for side-loading
+/// checks, when `images`), saying how programs are watched. A `retry` that
+/// fails changes nothing, so it is not announced.
+fn start_events(ctx: &Ctx<'_>, images: bool, retry: bool) -> Option<(etw::Session, Receiver<etw::Event>)> {
     if !ctx.config.process_events {
         ctx.emit(RtpEvent::ProgramWatch { events: false, reason: Some("process events are turned off".into()) });
         return None;
     }
     let (tx, rx) = mpsc::channel();
-    match etw::start(&etw::session_name(), false, tx) {
+    match etw::start(&etw::session_name(), images, tx) {
         Ok(session) => {
             ctx.emit(RtpEvent::ProgramWatch { events: true, reason: None });
             Some((session, rx))
