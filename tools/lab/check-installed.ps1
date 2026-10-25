@@ -51,6 +51,33 @@ function Set-SideLoading([bool]$on) {
     Start-Sleep -Seconds 5
 }
 
+# Starts a program, without a window, and waits for it to exit. Not
+# Start-Process -Wait: elevated, it fails with "Access is denied" when the
+# service has already stopped the program (as it does with a detected one).
+# Windows' on-access scan can hold a program file it has just seen, so a
+# start is tried for up to 10 seconds. Returns the milliseconds from start
+# to exit, or $null if it never started.
+function Start-Waiting([string]$exe, [string[]]$arguments) {
+    $deadline = (Get-Date).AddSeconds(10)
+    while ($true) {
+        try {
+            $info = New-Object Diagnostics.ProcessStartInfo $exe, ($arguments -join ' ')
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $process = [Diagnostics.Process]::Start($info)
+            $null = $process.WaitForExit(30000)
+            return $watch.ElapsedMilliseconds
+        } catch {
+            if ((Get-Date) -gt $deadline) {
+                Say "   could not start $(Split-Path $exe -Leaf): $($_.Exception.Message)"
+                return $null
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
 # CPU seconds the service uses over $seconds, and the share of one core.
 function Measure-ServiceCpu([int]$seconds, [scriptblock]$during) {
     $service = Get-Process phalanx-service
@@ -96,11 +123,16 @@ for ($i = 1; $i -le $ShortLived; $i++) {
     [IO.File]::WriteAllBytes($exe, $cmd)
     $names += Split-Path $exe -Leaf
 }
+# Let Windows' on-access scan look at the new files first.
+Start-Sleep -Seconds 5
 $timings = @()
+$ran = @()
 foreach ($name in $names) {
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    Start-Process (Join-Path $short $name) -ArgumentList '/c', 'exit' -WindowStyle Hidden -Wait
-    $timings += $watch.ElapsedMilliseconds
+    $ms = Start-Waiting (Join-Path $short $name) @('/c', 'exit')
+    if ($null -ne $ms) {
+        $timings += $ms
+        $ran += $name
+    }
 }
 Start-Sleep -Seconds 10
 
@@ -110,16 +142,17 @@ New-Item -ItemType Directory -Force $side | Out-Null
 Copy-Item "$env:SystemRoot\System32\PING.EXE" (Join-Path $side 'ping.exe') -Force
 $dll = [IO.File]::ReadAllBytes("$env:SystemRoot\System32\IPHLPAPI.DLL") + [Text.Encoding]::ASCII.GetBytes('phalanx side-loading test')
 [IO.File]::WriteAllBytes((Join-Path $side 'IPHLPAPI.DLL'), $dll)
-Start-Process (Join-Path $side 'ping.exe') -ArgumentList '-n', '1', '127.0.0.1' -WindowStyle Hidden -Wait
+Start-Sleep -Seconds 3
+$null = Start-Waiting (Join-Path $side 'ping.exe') @('-n', '1', '127.0.0.1')
 Start-Sleep -Seconds 10
 
 Stop-Process $listener -ErrorAction SilentlyContinue
 $seen = Get-Content $events -ErrorAction SilentlyContinue | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} }
 
-$detected = @($names | Where-Object { $n = $_; $seen | Where-Object { $_.type -eq 'detection' -and $_.report.path -like "*\$n" } })
+$detected = @($ran | Where-Object { $n = $_; $seen | Where-Object { $_.type -eq 'detection' -and $_.report.path -like "*\$n" } })
 Say ''
-Say ("2. Short-lived programs: {0} of {1} reported (each ran {2:N0}-{3:N0} ms, as Start-Process measures it)" -f $detected.Count, $names.Count, ($timings | Measure-Object -Minimum).Minimum, ($timings | Measure-Object -Maximum).Maximum)
-Say $(if ($detected.Count -eq $names.Count) { '   PASS' } else { "   FAIL: missed $(@($names | Where-Object { $detected -notcontains $_ }) -join ', ')" })
+Say ("2. Short-lived programs: {0} of {1} that started were reported ({4} of {5} started; each ran {2:N0}-{3:N0} ms from start to exit)" -f $detected.Count, $ran.Count, ($timings | Measure-Object -Minimum).Minimum, ($timings | Measure-Object -Maximum).Maximum, $ran.Count, $names.Count)
+Say $(if ($ran.Count -eq 0) { '   NOT TESTED: none could be started' } elseif ($detected.Count -eq $ran.Count) { '   PASS' } else { "   FAIL: missed $(@($ran | Where-Object { $detected -notcontains $_ }) -join ', ')" })
 
 $sideHit = $seen | Where-Object { $_.type -eq 'side-load' } | Select-Object -First 1
 Say ''
@@ -133,7 +166,7 @@ if ($sideHit) {
 Say ''
 Say "4. Service CPU (idle: $IdleSeconds s; burst: $Burst starts of cmd /c exit)"
 # The service checks programs as they start; give it a moment to finish.
-$burstStarts = { for ($i = 0; $i -lt $Burst; $i++) { Start-Process cmd.exe -ArgumentList '/c', 'exit' -WindowStyle Hidden -Wait }; Start-Sleep -Seconds 5 }
+$burstStarts = { for ($i = 0; $i -lt $Burst; $i++) { $null = Start-Waiting "$env:SystemRoot\System32\cmd.exe" @('/c', 'exit') }; Start-Sleep -Seconds 5 }
 Say "   side-loading on,  idle:  $(Measure-ServiceCpu $IdleSeconds $null)"
 Say "   side-loading on,  burst: $(Measure-ServiceCpu 1 $burstStarts)"
 Set-SideLoading $false
