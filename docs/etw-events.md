@@ -163,11 +163,24 @@ Each one ends with the tests passing.
   "Flag DLL side-loading" switch on the Protection page under program
   protection. The page's "Programs seen" line (milestone 2) shows events or
   polling.
-- **Left:** build setup (`installer/phalanx.iss`), install over 0.5.1, and
-  check in the installed service: the Protection page says "As they start
-  (Windows events)"; `cmd /c exit` run repeatedly is checked every time; the
-  planted ping + IPHLPAPI.DLL from the test is reported in History as
-  `SIDELOAD`; idle CPU of `phalanx-service.exe` compared with 0.5.1 (image
-  loads are the busiest events). Then merge.
+- **Installed test (2026-10-25), setup 0.6.0, fresh install** (0.5.1 had
+  been uninstalled, so CPU is compared with side-loading on and off, not with
+  0.5.1). `tools/lab/check-installed.ps1`, elevated:
+  - Programs seen through process events: **pass**.
+  - 20 marked copies of `cmd /c exit`, each running 65–106 ms from start to
+    exit: **20 of 20 reported**.
+  - Planted ping + `IPHLPAPI.DLL`: **pass**, reported as side-loading.
+  - CPU, side-loading on: idle 1.15% of one core (0.69 s in 60 s), 53 MB;
+    200 starts of `cmd /c exit`: 0.30 s CPU. The "off" idle figure (14.7%)
+    was taken 5 s after the settings change restarted protection, so it
+    measured the restart's sweep of running programs, not idle. The script
+    now waits for the service to settle before each measurement and has
+    `-CpuOnly`; **a clean on/off comparison is still to be run.**
+  - Script fixes on the way: report written line by line; programs started
+    through `Diagnostics.Process` (elevated `Start-Process -Wait` fails with
+    "Access is denied" once the service has stopped a detected program).
+  - New CLI command `phalanx-cli service protection` (ProtectionStatus).
+- **Left:** the clean CPU comparison
+  (`check-installed.ps1 -CpuOnly`, elevated), then the PR.
 - **Was next:** milestone 4 (README, Protection page, setup's
   README.txt, version 0.6.0, installed test, idle CPU before/after).

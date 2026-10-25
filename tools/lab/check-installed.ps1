@@ -2,6 +2,7 @@
 # idle CPU. Run from a terminal opened as administrator, after setup:
 #
 #   powershell -ExecutionPolicy Bypass -File tools\lab\check-installed.ps1
+#   ... check-installed.ps1 -CpuOnly     # only the CPU measurements
 #
 # It starts harmless programs only: copies of Windows' cmd.exe carrying
 # Phalanx's test marker (detected as Test.ThreatScanner.Marker, so each
@@ -13,7 +14,8 @@
 param(
     [int]$ShortLived = 20,
     [int]$IdleSeconds = 60,
-    [int]$Burst = 200
+    [int]$Burst = 200,
+    [switch]$CpuOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +80,21 @@ function Start-Waiting([string]$exe, [string[]]$arguments) {
     }
 }
 
+# Waits until the service is idle: after protection (re)starts it checks
+# every running program and recent files, which takes a while. Idle is under
+# 1% of one core over 10 s; gives up after 5 minutes.
+function Wait-Settled {
+    $service = Get-Process phalanx-service
+    $started = Get-Date
+    do {
+        $before = $service.TotalProcessorTime
+        Start-Sleep -Seconds 10
+        $service.Refresh()
+        $share = ($service.TotalProcessorTime - $before).TotalSeconds / 10
+    } until ($share -lt 0.01 -or ((Get-Date) - $started).TotalMinutes -ge 5)
+    '{0:N0} s' -f ((Get-Date) - $started).TotalSeconds
+}
+
 # CPU seconds the service uses over $seconds, and the share of one core.
 function Measure-ServiceCpu([int]$seconds, [scriptblock]$during) {
     $service = Get-Process phalanx-service
@@ -101,6 +118,7 @@ New-Item -ItemType Directory -Force $lab | Out-Null
 Say "Version: $((Get-Item $cli).VersionInfo.ProductVersion)"
 Say "Service: $((Get-Service Phalanx).Status)"
 
+if (-not $CpuOnly) {
 # 1. Programs are seen through process events.
 $p = Get-Protection
 Say ''
@@ -161,20 +179,26 @@ if ($sideHit) {
 } else {
     Say '3. Side-loading: FAIL: no side-load event'
 }
+}
 
 # 4. CPU: idle and during a burst of program starts, side-loading on and off.
 Say ''
 Say "4. Service CPU (idle: $IdleSeconds s; burst: $Burst starts of cmd /c exit)"
 # The service checks programs as they start; give it a moment to finish.
 $burstStarts = { for ($i = 0; $i -lt $Burst; $i++) { $null = Start-Waiting "$env:SystemRoot\System32\cmd.exe" @('/c', 'exit') }; Start-Sleep -Seconds 5 }
+# Each setting change restarts protection, which then checks every running
+# program: measure only once that is over.
+Say "   settled after $(Wait-Settled)"
 Say "   side-loading on,  idle:  $(Measure-ServiceCpu $IdleSeconds $null)"
 Say "   side-loading on,  burst: $(Measure-ServiceCpu 1 $burstStarts)"
 Set-SideLoading $false
+Say "   off; settled after $(Wait-Settled)"
 Say "   side-loading off, idle:  $(Measure-ServiceCpu $IdleSeconds $null)"
 Say "   side-loading off, burst: $(Measure-ServiceCpu 1 $burstStarts)"
 Set-SideLoading $true
 $p = Get-Protection
-Say "   side-loading back on: program_events=$($p.program_events)"
+Say "   on again (program_events=$($p.program_events)); settled after $(Wait-Settled)"
+Say "   side-loading on,  idle:  $(Measure-ServiceCpu $IdleSeconds $null)"
 
 } catch {
     Say ''
