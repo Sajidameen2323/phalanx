@@ -490,7 +490,8 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>, side: Op
     let mut next_list = Instant::now();
     while !ctx.halted() {
         if Instant::now() >= next_list {
-            match process::running() {
+            let listing = if events.is_some() { reconcile(&live) } else { process::running() };
+            match listing {
                 Ok(list) => {
                     failures = 0;
                     let lane = if first { sweep } else { urgent };
@@ -556,6 +557,17 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>, side: Op
         }
     }
     Ok(())
+}
+
+/// The running processes, for the check behind process events: a process
+/// the monitor already knows (same id, parent and program name in Windows'
+/// snapshot) is not opened again, so this costs a snapshot plus whatever the
+/// events missed, not a look at every process every few seconds.
+fn reconcile(live: &HashMap<u32, ProcessInfo>) -> std::io::Result<Vec<ProcessInfo>> {
+    let known = |entry: &process::Listed| {
+        live.get(&entry.pid).filter(|p| p.parent == entry.parent && p.name.eq_ignore_ascii_case(&entry.name)).cloned()
+    };
+    Ok(process::listed()?.iter().filter_map(|entry| known(entry).or_else(|| process::open(entry))).collect())
 }
 
 /// Starts the process-event session (with image loads, for side-loading

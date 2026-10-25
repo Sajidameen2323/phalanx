@@ -570,3 +570,33 @@ fn a_signed_program_loading_a_planted_windows_dll_is_reported() {
     let row = &store.recent_scans(5, Some("sideload")).unwrap()[0];
     assert_eq!(store.scan_detections(row.id).unwrap()[0].threat, "SideLoad.iphlpapi.dll");
 }
+
+#[test]
+fn the_check_behind_process_events_reopens_only_unknown_processes() {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let mut child = std::process::Command::new(Path::new(&root).join(r"System32\PING.EXE"))
+        .args(["-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let opened = process::running().unwrap().into_iter().find(|p| p.id.pid == pid).expect("ping is listed");
+
+    // Not known: opened, as the process list sees it.
+    let found = reconcile(&HashMap::new()).unwrap();
+    assert_eq!(found.iter().find(|p| p.id.pid == pid), Some(&opened));
+
+    // Known (same id, parent and name): taken from the table, not reopened,
+    // which the made-up image shows.
+    let known = ProcessInfo { image: PathBuf::from(r"C:\from-the-table\PING.EXE"), ..opened.clone() };
+    let live = HashMap::from([(pid, known.clone())]);
+    assert_eq!(reconcile(&live).unwrap().iter().find(|p| p.id.pid == pid), Some(&known));
+
+    // Same id but another parent: a different process, so opened.
+    let other = ProcessInfo { parent: opened.parent.wrapping_add(1), ..known };
+    let live = HashMap::from([(pid, other)]);
+    assert_eq!(reconcile(&live).unwrap().iter().find(|p| p.id.pid == pid), Some(&opened));
+
+    let _ = process::terminate(&opened.id);
+    child.wait().unwrap();
+}

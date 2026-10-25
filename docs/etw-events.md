@@ -195,6 +195,30 @@ Each one ends with the tests passing.
   (`PROCESS_RECONCILE`, which opens every process), the Run-box watcher and
   the DNS filter. Worth profiling; the lab's cost report (next-plan step 0)
   is the place for it.
-- **Left:** the PR.
+- **Idle CPU profiled (2026-10-25).** Per-call CPU of the periodic work,
+  measured with a throwaway probe (unelevated, 106 of 271 processes
+  openable):
+
+  | Work | CPU per call | How often |
+  | --- | --- | --- |
+  | `process::running()` (opens every process) | 10.9 ms | every 5 s |
+  | Run-box pass, all users | 0.08 ms | every 1 s |
+  | Drive list | ~0 | every 2 s |
+
+  As SYSTEM, `running()` opens all ~270 processes: ~25–30 ms every 5 s,
+  about half a core-percent, so most of the idle cost. Fixed:
+  `process::listed()` (snapshot only) and `process::open()` split
+  `running()`; with process events, `programs` uses `reconcile`, which takes
+  a process from its table when id, parent and name match the snapshot and
+  opens only the rest (4.1 ms a call, the snapshot's cost, whoever runs it).
+  The 0.5 s polling path, used without events, still opens every process.
+  `image()` tries a 1 KB buffer before 64 KB (10.9 → 7.2 ms for the full
+  list). Test: `the_check_behind_process_events_reopens_only_unknown_processes`.
+  **Installed confirmation pending** (`check-installed.ps1 -CpuOnly`).
+- **Test caveat:** with 0.6.0 installed, its service sees the test's
+  `bad-ping.exe` through events and stops it before the test's polling
+  monitor does, so `a_detected_program_is_stopped_and_quarantined` fails
+  often. Run it with the service stopped (`sc stop Phalanx`, elevated).
+- **Left:** installed CPU confirmation, then the PR.
 - **Was next:** milestone 4 (README, Protection page, setup's
   README.txt, version 0.6.0, installed test, idle CPU before/after).
