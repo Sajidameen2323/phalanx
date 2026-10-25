@@ -737,8 +737,9 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
+        let filter_in_use = self.web.dns_running() && self.web.windows_dns;
         std::thread::spawn(move || {
-            let _ = tx.send(threat_scanner::web::hardening::check(true));
+            let _ = tx.send(threat_scanner::web::hardening::check(true, filter_in_use));
             ctx.request_repaint();
         });
         self.web.hardening_rx = Some(rx);
@@ -870,7 +871,8 @@ impl App {
                             self.web.dns_confirm = Some(DnsChange::Apply);
                         }
                     });
-                    if backup {
+                    // A backup Windows no longer uses is stale.
+                    if backup && self.web.windows_dns {
                         ui.add_enabled_ui(!busy, |ui| {
                             if small_button(ui, "Restore previous DNS…").clicked() {
                                 self.web.dns_confirm = Some(DnsChange::Restore);

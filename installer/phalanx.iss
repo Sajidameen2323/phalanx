@@ -114,7 +114,6 @@ Type: files; Name: "{commonprograms}\{#AppName}.lnk"
 [Code]
 const
   DataFolder = '{commonappdata}\Phalanx';
-  DnsBackup = '{commonappdata}\Phalanx\web\windows-dns-backup.json';
   { A 0.4.x install: per user, with its data in the user's profile. }
   OldUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGuid}}_is1';
   OldDataFolder = '{localappdata}\threat-scanner';
@@ -287,7 +286,9 @@ end;
   websites unreachable: put back the settings saved when it was set up. }
 procedure RestoreDns();
 begin
-  if not FileExists(ExpandConstant(DnsBackup)) then
+  { Only while Windows still uses the filter: an older backup is stale (the
+    check discards it). }
+  if Cli('web restore-dns --check') <> 0 then
     Exit;
   if not UninstallSilent() then
     if MsgBox('Windows is set to use Phalanx''s DNS filter. Put your previous DNS settings back now?' + #13#10#13#10 +
