@@ -924,6 +924,11 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
             RiskyOutcome::NotScanned(reason) => println!("    not scanned ({reason}): {}", path.display()),
             RiskyOutcome::Threat(_) => {}
         },
+        RtpEvent::ProgramWatch { events: true, .. } => println!("programs are seen through Windows' process events"),
+        RtpEvent::ProgramWatch { events: false, reason } => {
+            let reason = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            println!("programs are found by reading the process list twice a second{reason}");
+        }
         RtpEvent::Command(hit) => {
             let at = match (hit.source, hit.pid) {
                 (rtp::CommandSource::RunBox, _) => "Run box".to_string(),

@@ -342,6 +342,7 @@ enum WatchMsg {
     Restarting { error: String, retry_in: Duration },
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
+    ProgramWatch { events: bool, reason: Option<String> },
     Command(CommandHit),
     DriveAdded { root: PathBuf, files: usize },
     Error(String),
@@ -386,6 +387,9 @@ struct WatchState {
     failed: Vec<(PathBuf, String)>,
     /// Programs are scanned as they start.
     programs: bool,
+    /// Programs are seen through Windows' process events, not by reading
+    /// the process list twice a second.
+    program_events: bool,
     files_checked: i64,
     programs_checked: i64,
     /// Times protection recovered from a failure this session.
@@ -1365,6 +1369,7 @@ impl App {
                         app.watch.running = true;
                         app.watch.watching = protection.folders;
                         app.watch.programs = protection.programs;
+                        app.watch.program_events = protection.program_events;
                     }
                     app.manifest = update::load_manifest(&update::signature_dir(app.signatures_home()));
                     if moved || app.engine.is_none() {
@@ -1589,6 +1594,16 @@ impl App {
                         RiskyOutcome::Threat(_) => {}
                     }
                 }
+                WatchMsg::ProgramWatch { events, reason } => {
+                    self.watch.program_events = events;
+                    if !events && let Some(reason) = reason {
+                        self.log_activity(
+                            ActivityKind::Info,
+                            "Programs are checked twice a second".to_string(),
+                            format!("Windows' process events are not available: {reason}. Very short-lived programs can finish unseen."),
+                        );
+                    }
+                }
                 WatchMsg::Command(hit) => {
                     let kind = if hit.confidence() == Confidence::High { ActivityKind::Threat } else { ActivityKind::Risky };
                     let mut detail: Vec<String> = hit.matches.iter().map(|m| m.reason.clone()).collect();
@@ -1716,6 +1731,7 @@ fn watch_msg(event: Event) -> Option<WatchMsg> {
         Event::Scanned { origin, files, threats } => WatchMsg::Scanned { origin, files, threats },
         Event::RiskyFile { path, risk, origin } => WatchMsg::RiskyFile { path, risk, origin },
         Event::RiskyChecked { path, outcome } => WatchMsg::RiskyChecked { path, outcome },
+        Event::ProgramWatch { events, reason } => WatchMsg::ProgramWatch { events, reason },
         Event::Command { hit } => WatchMsg::Command(hit),
         Event::DriveAdded { root, files } => WatchMsg::DriveAdded { root, files },
         Event::Restarting { error, retry_in_secs } => WatchMsg::Restarting { error, retry_in: Duration::from_secs(retry_in_secs) },

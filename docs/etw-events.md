@@ -80,4 +80,31 @@ Each one ends with the tests passing.
   terminal; it prints "skipped" if it did not really run). A session left
   over from a crash is stopped by name at start; `Drop` does not stop a
   session that has already ended, since its handle may name another by then.
-- **Next:** milestone 2, in `programs` (`src/rtp/mod.rs`).
+- **Milestone 2: built, ETW path not yet run live.** `programs`
+  (`src/rtp/mod.rs`) starts the session before its first process list,
+  takes `etw::Event::Started` to the urgent lane (command-line check first),
+  drops `Stopped` processes from its tables, and still reads the list every
+  5 s (`PROCESS_RECONCILE`). Without a session it reads the list every 0.5 s
+  and tries the session again every 60 s (`EVENTS_RETRY`), quietly. If the
+  session ends, it falls back and says so. `RtpConfig::process_events`
+  (default on) turns events off. New `RtpEvent::ProgramWatch { events,
+  reason }` → `ipc::Event::ProgramWatch`; `ProtectionStatus::program_events`
+  (`serde(default)`); the app's Protection page shows "Programs seen: As they
+  start (Windows events) / Twice a second (process list)" and logs why when
+  it falls back; `phalanx-cli watch --programs` prints it.
+  `check_program` now takes `&HashMap<u32, ProcessInfo>` (the monitor's live
+  table, which also holds processes known only from events). The rtp tests
+  pass here on the polling path; with administrator rights they would take
+  the event path.
+- **Known limit:** the Kernel-Process start event has no command line, so it
+  is still read from the process; a program that exits before its event
+  arrives (about 100 ms) is scanned but its command line is not checked. If
+  that matters, the system process provider (Windows 11) carries the command
+  line in the event.
+- **To verify before milestone 3** (administrator terminal):
+  `cargo test --lib rtp:: -- --nocapture`, then
+  `phalanx-service --console` with `PHALANX_PIPE` (or `phalanx-cli watch
+  --programs`) and check it says programs are seen through process events;
+  start `cmd /c exit` repeatedly and see each one checked.
+- **Next:** milestone 3, side-loading. `etw::start(…, images: true, …)`
+  already delivers `ImageLoaded`; `programs` ignores it for now.

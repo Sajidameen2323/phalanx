@@ -141,9 +141,9 @@ pub const ACTION: &str = "reported (command-line rules are in report-only mode)"
 /// Hosts a fake verification page tells the user to run from the Run box.
 const CLICKFIX_HOSTS: &[&str] = &["powershell", "pwsh", "mshta", "cmd", "conhost"];
 
-/// Checks a program that just started. `by_pid` is the same process list,
+/// Checks a program that just started. `by_pid` holds the running processes,
 /// for naming its parent.
-pub(super) fn check_program(ctx: &Ctx<'_>, info: &ProcessInfo, by_pid: &HashMap<u32, &ProcessInfo>) -> Option<CommandHit> {
+pub(super) fn check_program(ctx: &Ctx<'_>, info: &ProcessInfo, by_pid: &HashMap<u32, ProcessInfo>) -> Option<CommandHit> {
     let host = cmdline::host(&info.name)?;
     let own_exe = std::env::current_exe().ok();
     if started_by_phalanx(info, by_pid, std::process::id(), own_exe.as_deref().and_then(Path::parent)) {
@@ -186,7 +186,7 @@ const PHALANX_PROGRAMS: &[&str] = &["phalanx.exe", "phalanx-cli.exe"];
 /// Whether `info` was started by this process, or by a Phalanx program in
 /// `own_dir` (the folder this copy runs from). Only that folder counts, so
 /// malware cannot hide by naming itself `phalanx.exe`.
-fn started_by_phalanx(info: &ProcessInfo, by_pid: &HashMap<u32, &ProcessInfo>, own_pid: u32, own_dir: Option<&Path>) -> bool {
+fn started_by_phalanx(info: &ProcessInfo, by_pid: &HashMap<u32, ProcessInfo>, own_pid: u32, own_dir: Option<&Path>) -> bool {
     if info.parent == own_pid {
         return true;
     }
@@ -555,7 +555,7 @@ mod tests {
         let app = proc(11, 100, r"c:\program files\phalanx\PHALANX.EXE", 1);
         let impostor = proc(12, 100, r"C:\Users\u\Downloads\phalanx.exe", 1);
         let other = proc(13, 100, r"C:\Program Files\Phalanx\helper.exe", 1);
-        let by_pid: HashMap<u32, &ProcessInfo> = [&cli, &app, &impostor, &other].into_iter().map(|p| (p.id.pid, p)).collect();
+        let by_pid: HashMap<u32, ProcessInfo> = [cli, app, impostor, other].into_iter().map(|p| (p.id.pid, p)).collect();
         let child = |parent: u32, created: u64| proc(50, created, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", parent);
 
         assert!(started_by_phalanx(&child(99, 200), &by_pid, 99, Some(own_dir)), "this process");

@@ -630,6 +630,8 @@ impl App {
                     ("New files checked", self.watch.files_checked.to_string()),
                 ];
                 if self.watch.programs {
+                    let seen = if self.watch.program_events { "As they start (Windows events)" } else { "Twice a second (process list)" };
+                    items.push(("Programs seen", seen.to_string()));
                     items.push(("Programs checked", self.watch.programs_checked.to_string()));
                 }
                 items.push(("Threats", self.watch.threats.to_string()));
@@ -701,7 +703,7 @@ impl App {
                 ui,
                 &mut self.settings.program_protection,
                 "Scan programs as they start",
-                "Each program is checked once (until it changes), within about a second of starting. Very short-lived programs can finish first.",
+                "Each program is checked once (until it changes), as soon as Windows reports it started. Programs that exit within moments are still scanned, though their command line may be gone by then.",
             );
             row_divider(ui);
             ui.add_enabled_ui(self.settings.program_protection, |ui| {

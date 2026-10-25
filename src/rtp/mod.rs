@@ -20,8 +20,10 @@
 //! ```
 //!
 //! Without a kernel driver nothing is intercepted *before* it runs: a program
-//! is checked within about half a second of starting and stopped if it is
-//! known malware, and very short-lived programs can finish before that.
+//! is checked as soon as Windows reports it started (ETW process events, see
+//! [`etw`]; within about half a second when only the process list can be
+//! read) and stopped if it is known malware. A program that exits within
+//! moments is still scanned, but its command line may be gone by then.
 //!
 //! With program protection on, the command lines of script hosts and Windows
 //! tools, and commands entered in the Run box, are also checked against
@@ -61,8 +63,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Items a lane scans together (one history entry).
 const MAX_BATCH: usize = 32;
-/// How often the list of running programs is read.
+/// How often the list of running programs is read without process events.
 const PROCESS_POLL: Duration = Duration::from_millis(500);
+/// With process events, how often the list is still read, for anything the
+/// event session lost.
+const PROCESS_RECONCILE: Duration = Duration::from_secs(5);
+/// Without process events, how often the session is tried again.
+const EVENTS_RETRY: Duration = Duration::from_secs(60);
 /// Consecutive failures to list programs before the monitor gives up (and is restarted).
 const MAX_PROCESS_LIST_FAILURES: u32 = 10;
 /// Longest the bulk lane waits for a full-screen game or presentation to end.
@@ -90,6 +97,10 @@ pub struct RtpConfig {
     pub alert_risky: bool,
     /// Scan the program file of every process that starts (Windows).
     pub process_protection: bool,
+    /// With `process_protection`: learn of programs starting from Windows'
+    /// process events (ETW, administrators only) rather than only by reading
+    /// the process list twice a second.
+    pub process_events: bool,
     /// With `process_protection`: check the command lines of script hosts
     /// and Windows tools as they start, and commands entered in the Run box.
     /// Matches are only reported.
@@ -124,6 +135,7 @@ impl RtpConfig {
             settle: Duration::from_secs(3),
             alert_risky: true,
             process_protection: false,
+            process_events: true,
             command_rules: true,
             run_box_all_users: false,
             stop_running_threats: true,
@@ -183,6 +195,10 @@ pub enum RtpEvent {
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     /// The scan of a file announced by `RiskyFile` finished.
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
+    /// How programs are watched: through process events, or by reading the
+    /// process list (`reason` says why not events). Sent when program
+    /// protection starts and whenever this changes.
+    ProgramWatch { events: bool, reason: Option<String> },
     /// A command line matched the command-line rules (reported only).
     Command(CommandHit),
     /// A drive appeared (a mounted disk image or a USB drive); `files` near
@@ -429,41 +445,119 @@ fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
 /// Watches for programs starting. Programs already running when protection
 /// starts go to the sweep lane, so they never hold up new files; new ones go
 /// to the urgent lane. Command lines are checked here, before the scan.
+///
+/// Process-start events (ETW) report a program within milliseconds; the
+/// process list is then still read every few seconds for anything the event
+/// session lost. Without events (no administrator rights, or the session was
+/// refused or ended) the list is read twice a second, and the session is
+/// tried again now and then.
 fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Result<()> {
     let store = if ctx.commands_enabled() { Some(scan::open_store(ctx.data_dir)?) } else { None };
+    // Started before the first list, so nothing starts unseen in between.
+    let mut events = start_events(ctx, false);
+    let mut retry_events = Instant::now() + EVENTS_RETRY;
     let mut known: HashSet<process::ProcessId> = HashSet::new();
+    let mut live: HashMap<u32, ProcessInfo> = HashMap::new();
     let mut first = true;
     let mut failures = 0;
+    let mut next_list = Instant::now();
     while !ctx.halted() {
-        match process::running() {
-            Ok(list) => {
-                failures = 0;
-                let lane = if first { sweep } else { urgent };
-                let mut current = HashSet::with_capacity(list.len());
-                let by_pid: HashMap<u32, &ProcessInfo> = list.iter().map(|p| (p.id.pid, p)).collect();
-                for info in &list {
-                    current.insert(info.id.clone());
-                    if known.contains(&info.id) || ctx.is_excluded(&info.image) {
-                        continue;
+        if Instant::now() >= next_list {
+            match process::running() {
+                Ok(list) => {
+                    failures = 0;
+                    let lane = if first { sweep } else { urgent };
+                    live = list.into_iter().map(|p| (p.id.pid, p)).collect();
+                    let mut current = HashSet::with_capacity(live.len());
+                    for info in live.values() {
+                        current.insert(info.id.clone());
+                        if !known.contains(&info.id) {
+                            consider_program(ctx, store.as_ref(), info, &live, lane)?;
+                        }
                     }
-                    if let Some(store) = &store && let Some(hit) = commands::check_program(ctx, info, &by_pid) {
-                        commands::report(ctx, store, hit);
-                    }
-                    lane.send(Item::Program(info.clone())).map_err(|_| anyhow!("the scan lane stopped"))?;
+                    known = current;
+                    first = false;
                 }
-                known = current;
-                first = false;
+                Err(e) => {
+                    failures += 1;
+                    if failures >= MAX_PROCESS_LIST_FAILURES {
+                        bail!("cannot list running programs: {e}");
+                    }
+                }
             }
-            Err(e) => {
-                failures += 1;
-                if failures >= MAX_PROCESS_LIST_FAILURES {
-                    bail!("cannot list running programs: {e}");
+            next_list = Instant::now() + if events.is_some() { PROCESS_RECONCILE } else { PROCESS_POLL };
+        }
+        let Some((_, rx)) = &events else {
+            ctx.pause(next_list.saturating_duration_since(Instant::now()));
+            if ctx.config.process_events && Instant::now() >= retry_events && !ctx.halted() {
+                events = start_events(ctx, true);
+                retry_events = Instant::now() + EVENTS_RETRY;
+            }
+            continue;
+        };
+        let wait = next_list.saturating_duration_since(Instant::now()).min(Duration::from_millis(100));
+        match rx.recv_timeout(wait) {
+            Ok(etw::Event::Started(info)) => {
+                if known.insert(info.id.clone()) {
+                    live.insert(info.id.pid, info.clone());
+                    consider_program(ctx, store.as_ref(), &info, &live, urgent)?;
                 }
+            }
+            Ok(etw::Event::Stopped(id)) => {
+                if live.get(&id.pid).is_some_and(|p| p.id == id) {
+                    live.remove(&id.pid);
+                }
+                known.remove(&id);
+            }
+            Ok(etw::Event::ImageLoaded { .. }) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                events = None;
+                retry_events = Instant::now() + EVENTS_RETRY;
+                next_list = Instant::now();
+                ctx.emit(RtpEvent::ProgramWatch { events: false, reason: Some("the event session ended".into()) });
             }
         }
-        ctx.pause(PROCESS_POLL);
     }
     Ok(())
+}
+
+/// Starts the process-event session, saying how programs are watched. A
+/// `retry` that fails changes nothing, so it is not announced.
+fn start_events(ctx: &Ctx<'_>, retry: bool) -> Option<(etw::Session, Receiver<etw::Event>)> {
+    if !ctx.config.process_events {
+        ctx.emit(RtpEvent::ProgramWatch { events: false, reason: Some("process events are turned off".into()) });
+        return None;
+    }
+    let (tx, rx) = mpsc::channel();
+    match etw::start(&etw::session_name(), false, tx) {
+        Ok(session) => {
+            ctx.emit(RtpEvent::ProgramWatch { events: true, reason: None });
+            Some((session, rx))
+        }
+        Err(_) if retry => None,
+        Err(e) => {
+            let reason = if e.raw_os_error() == Some(5) { "it needs administrator rights".to_string() } else { e.to_string() };
+            ctx.emit(RtpEvent::ProgramWatch { events: false, reason: Some(reason) });
+            None
+        }
+    }
+}
+
+/// Checks the command line of a program that started and queues its file.
+fn consider_program(
+    ctx: &Ctx<'_>,
+    store: Option<&Store>,
+    info: &ProcessInfo,
+    live: &HashMap<u32, ProcessInfo>,
+    lane: &Sender<Item>,
+) -> Result<()> {
+    if ctx.is_excluded(&info.image) {
+        return Ok(());
+    }
+    if let Some(store) = store && let Some(hit) = commands::check_program(ctx, info, live) {
+        commands::report(ctx, store, hit);
+    }
+    lane.send(Item::Program(info.clone())).map_err(|_| anyhow!("the scan lane stopped"))
 }
 
 /// Scans what arrives on `rx`, a batch at a time, until halted or every

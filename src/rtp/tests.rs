@@ -34,6 +34,7 @@ fn describe(event: RtpEvent) -> String {
         RtpEvent::Scanned { origin, report } => format!("scanned {origin:?} {}", report.stats.files_scanned),
         RtpEvent::RiskyFile { path, risk, .. } => format!("risky {} {}", name(&path), risk.disguise.is_some()),
         RtpEvent::RiskyChecked { path, outcome } => format!("checked {} {outcome:?}", name(&path)),
+        RtpEvent::ProgramWatch { events, .. } => format!("program-watch {events}"),
         RtpEvent::Command(hit) => {
             let rules: Vec<&str> = hit.matches.iter().map(|m| m.rule.as_str()).collect();
             format!("command {:?} {} {}", hit.source, hit.program.to_ascii_lowercase(), rules.join(","))
@@ -219,8 +220,12 @@ fn a_detected_program_is_stopped_and_quarantined() {
     cfg.max_size_bytes = 1 << 20;
     let mut run = Run::start(&data_dir, cfg);
     assert!(run.until(|m| m.starts_with("started")));
-    // The sweep of programs already running can report before this.
-    assert_eq!(run.seen.last().unwrap(), "started 0 true");
+    // The sweep of programs already running can report before this, and how
+    // programs are watched (events with administrator rights, polling
+    // without) around it.
+    assert!(run.seen.iter().any(|m| m == "started 0 true"), "{:?}", run.seen);
+    let watch_reported = run.seen.iter().any(|m| m.starts_with("program-watch"));
+    assert!(watch_reported || run.until(|m| m.starts_with("program-watch")), "{:?}", run.seen);
     // Let the first look at running programs pass, so this one counts as new.
     std::thread::sleep(Duration::from_millis(1500));
 

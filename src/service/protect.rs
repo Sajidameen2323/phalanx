@@ -72,6 +72,8 @@ struct State {
     /// Set when real-time protection reports it has started: folders
     /// watched and whether programs are.
     started: Arc<Mutex<Option<(usize, bool)>>>,
+    /// Programs are seen through process events.
+    program_events: Arc<AtomicBool>,
 }
 
 pub(crate) struct Protector {
@@ -97,6 +99,7 @@ impl Protector {
             watching: started.is_some(),
             folders: started.map_or(0, |(folders, _)| folders),
             programs: started.is_some_and(|(_, programs)| programs),
+            program_events: started.is_some_and(|(_, programs)| programs) && state.program_events.load(Ordering::Relaxed),
             scans: self.jobs.lock().unwrap_or_else(PoisonError::into_inner).len(),
         }
     }
@@ -146,12 +149,17 @@ impl Protector {
         }
         let started = Arc::new(Mutex::new(None));
         let on_started = Arc::clone(&started);
+        let program_events = Arc::new(AtomicBool::new(false));
+        let on_program_events = Arc::clone(&program_events);
         let hub = Arc::clone(&self.hub);
         let dir = self.data_dir.clone();
         let mut checkpoint_saved: Option<Instant> = None;
         let on_event = move |event: RtpEvent| {
             if let RtpEvent::Started { watching, programs, .. } = &event {
                 *on_started.lock().unwrap_or_else(PoisonError::into_inner) = Some((*watching, *programs));
+            }
+            if let RtpEvent::ProgramWatch { events, .. } = &event {
+                on_program_events.store(*events, Ordering::Relaxed);
             }
             if matches!(event, RtpEvent::Started { .. } | RtpEvent::Scanned { .. }) && checkpoint_saved.is_none_or(|t| t.elapsed() >= CHECKPOINT_EVERY) {
                 save_checkpoint(&dir);
@@ -162,6 +170,7 @@ impl Protector {
         let result = rtp::start(engine, self.data_dir.clone(), rtp_config(&self.data_dir, settings), on_event);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.started = started;
+        state.program_events = program_events;
         match result {
             Ok(running) => state.rtp = Some(running),
             Err(e) => self.hub.send(&Event::ProtectionError { message: format!("{e:#}") }),
