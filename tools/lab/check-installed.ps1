@@ -23,11 +23,13 @@ $lab = Join-Path $env:SystemDrive 'phalanx-lab'
 $outDir = Join-Path $repo 'target\lab'
 $report = Join-Path $outDir 'installed-check.txt'
 $events = Join-Path $lab 'events.jsonl'
-$lines = New-Object System.Collections.Generic.List[string]
+New-Item -ItemType Directory -Force $outDir | Out-Null
+Set-Content -Encoding utf8 $report "Phalanx installed check, $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
 
+# Each line goes to the report at once, so a run that stops still leaves one.
 function Say([string]$text) {
     Write-Host $text
-    $lines.Add($text)
+    Add-Content -Encoding utf8 $report $text
 }
 
 function Get-Protection {
@@ -63,12 +65,12 @@ function Measure-ServiceCpu([int]$seconds, [scriptblock]$during) {
     '{0:N2} s CPU in {1:N0} s ({2:N2}% of one core), working set {3:N0} MB' -f $used, $wall, (100 * $used / $wall), ($service.WorkingSet64 / 1MB)
 }
 
+try {
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) { throw 'Run this from a terminal opened as administrator.' }
 if (-not (Test-Path $cli)) { throw "Phalanx is not installed ($cli not found)." }
-New-Item -ItemType Directory -Force $outDir, $lab | Out-Null
+New-Item -ItemType Directory -Force $lab | Out-Null
 
-Say "Phalanx installed check, $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
 Say "Version: $((Get-Item $cli).VersionInfo.ProductVersion)"
 Say "Service: $((Get-Service Phalanx).Status)"
 
@@ -141,7 +143,13 @@ Set-SideLoading $true
 $p = Get-Protection
 Say "   side-loading back on: program_events=$($p.program_events)"
 
-Remove-Item -Recurse -Force $lab -ErrorAction SilentlyContinue
-$lines | Set-Content -Encoding utf8 $report
-Write-Host ''
-Write-Host "Report: $report"
+} catch {
+    Say ''
+    Say "STOPPED: $($_.Exception.Message)"
+    Say "   at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())"
+} finally {
+    if ($listener) { Stop-Process $listener -ErrorAction SilentlyContinue }
+    Remove-Item -Recurse -Force $lab -ErrorAction SilentlyContinue
+    Write-Host ''
+    Write-Host "Report: $report"
+}
