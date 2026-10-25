@@ -541,10 +541,15 @@ fn approve(arguments: &str) -> std::result::Result<(), String> {
     }
 }
 
-pub fn run_host(data_dir: &Path, mut input: impl Read, mut output: impl Write) -> Result<()> {
+pub fn run_host(data_dir: &Path, input: impl Read, output: impl Write) -> Result<()> {
     // With the protection service running, its folder holds the settings
     // and rules (users may read it), and changes go through its pipe.
     let service = crate::ipc::status_within(Duration::from_secs(1)).ok();
+    serve_host(data_dir, service, input, output)
+}
+
+/// [`run_host`] with the service found (or not) already.
+fn serve_host(data_dir: &Path, service: Option<crate::ipc::Status>, mut input: impl Read, mut output: impl Write) -> Result<()> {
     let mut state = match &service {
         Some(status) => HostState::new(&status.data_dir, true),
         None => HostState::new(data_dir, false),
@@ -957,7 +962,8 @@ mod tests {
         input.extend(frame(&json!({"id": 6, "type": "bogus"})));
         input.extend(frame(&json!({"id": 7, "type": "check_many", "urls": ["https://phishtest.phalanx.invalid/", "https://example.org/"]})));
         let mut output = Vec::new();
-        run_host(tmp.path(), input.as_slice(), &mut output).unwrap();
+        // Without a service: one installed on this PC must not answer.
+        serve_host(tmp.path(), None, input.as_slice(), &mut output).unwrap();
         let r = replies(&output);
         assert_eq!(r.len(), 7);
         let batch = r[6]["verdicts"].as_array().unwrap();

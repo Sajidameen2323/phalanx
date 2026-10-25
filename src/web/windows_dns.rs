@@ -26,6 +26,16 @@ pub fn has_backup(data_dir: &Path) -> bool {
     backup_path(data_dir).is_file()
 }
 
+/// Whether Windows uses the DNS filter configured in `data_dir` now. A
+/// backup with no adapter pointing at the filter any more is stale:
+/// restoring it could put back settings from another time.
+pub fn filter_in_use(data_dir: &Path) -> bool {
+    crate::web::WebConfig::load(data_dir)
+        .ok()
+        .and_then(|config| config.dns_listen_addr().ok())
+        .is_some_and(|listen| crate::web::config::windows_uses_filter(&listen))
+}
+
 /// Whether Windows can be pointed at a filter listening on `listen`.
 pub fn usable_listen(listen: &SocketAddr) -> Result<()> {
     if listen.port() != 53 {

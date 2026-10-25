@@ -262,14 +262,16 @@ fn read_json(path: &Path) -> Option<Value> {
 }
 
 /// Checks one profile from its preference files and password store.
-pub fn profile_checks(browser: &Browser, dir: &str, local_state: Option<&Value>) -> Vec<Check> {
+pub fn profile_checks(browser: &Browser, dir: &str, local_state: Option<&Value>, filter_in_use: bool) -> Vec<Check> {
     let profile = browser.user_data.join(dir);
     let prefs = read_json(&profile.join("Preferences")).unwrap_or(Value::Null);
     let secure = read_json(&profile.join("Secure Preferences")).unwrap_or(Value::Null);
-    build_profile_checks(&browser.name, &prefs, &secure, local_state, count_passwords(&profile))
+    build_profile_checks(&browser.name, &prefs, &secure, local_state, count_passwords(&profile), filter_in_use)
 }
 
-pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_state: Option<&Value>, passwords: Option<u64>) -> Vec<Check> {
+/// `filter_in_use`: Windows uses Phalanx's DNS filter, which a browser with
+/// secure DNS on its own provider goes around.
+pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_state: Option<&Value>, passwords: Option<u64>, filter_in_use: bool) -> Vec<Check> {
     let link = settings_link(name);
     let mut checks = Vec::new();
     let edge = name == "Microsoft Edge";
@@ -318,18 +320,26 @@ pub fn build_profile_checks(name: &str, prefs: &Value, secure: &Value, local_sta
 
     // Secure DNS lives in Local State, for all profiles.
     let mode = local_state.and_then(|s| s.pointer("/dns_over_https/mode")).and_then(Value::as_str);
+    // "Secure" is a provider chosen by hand (or by a program running as
+    // you); "automatic" only upgrades to one the DNS server offers, which
+    // the filter does not, so its lookups still go through it.
     let (status, detail) = match mode {
+        Some("secure") if filter_in_use => (
+            Status::Attention,
+            "On, with its own provider: this browser's lookups go around Phalanx's DNS filter (Browser Guard still blocks). Set Use secure DNS back to your current service provider, or turn it off, so they go through the filter".to_string(),
+        ),
         Some("secure") => (Status::Info, "Always on: Phalanx's DNS filter does not see this browser's lookups (Browser Guard still blocks)".to_string()),
         Some("off") => (Status::Info, "Off: lookups go through Windows, so Phalanx's DNS filter applies".to_string()),
         _ => (Status::Info, "Automatic: used only when your DNS provider supports it".to_string()),
     };
+    let weight = if status == Status::Attention { 1 } else { 0 };
     checks.push(Check {
         id: "secure_dns",
         title: "Secure DNS",
         why: "Encrypted DNS hides lookups from the network, but also from Phalanx's DNS filter.",
         status,
         detail,
-        weight: 0,
+        weight,
         link,
         fix: None,
         toggle: None,
@@ -397,8 +407,9 @@ fn count_passwords(profile: &Path) -> Option<u64> {
 }
 
 /// Checks every Chromium browser profile of this user. `online` also asks
-/// the public version feeds for the newest stable versions.
-pub fn check(online: bool) -> HardeningReport {
+/// the public version feeds for the newest stable versions;
+/// `filter_in_use` says Windows uses Phalanx's DNS filter.
+pub fn check(online: bool, filter_in_use: bool) -> HardeningReport {
     let latest = if online { latest_versions(Duration::from_secs(8)) } else { Vec::new() };
     let mut report = HardeningReport::default();
     for browser in extensions::browsers() {
@@ -415,7 +426,7 @@ pub fn check(online: bool) -> HardeningReport {
             report.profiles.push(ProfileReport {
                 browser: browser.name.clone(),
                 profile: display,
-                checks: profile_checks(&browser, &dir, local_state.as_ref()),
+                checks: profile_checks(&browser, &dir, local_state.as_ref(), filter_in_use),
                 profile_dir: dir,
             });
         }
@@ -483,20 +494,27 @@ mod tests {
         });
         let secure = json!({"extensions": {"settings": {super::super::native::CHROMIUM_EXTENSION_ID: {}}}});
         let local = json!({"dns_over_https": {"mode": "secure"}});
-        let c = build_profile_checks("Google Chrome", &prefs, &secure, Some(&local), Some(0));
+        let c = build_profile_checks("Google Chrome", &prefs, &secure, Some(&local), Some(0), false);
         assert_eq!(find(&c, "safe_browsing").status, Status::Good);
         assert_eq!(find(&c, "js_optimizer").status, Status::Good);
         assert!(find(&c, "secure_dns").detail.contains("does not see"));
+        assert_eq!(find(&c, "secure_dns").status, Status::Info);
+        // With Windows using the filter, a provider of its own goes around it.
+        let around = build_profile_checks("Google Chrome", &prefs, &secure, Some(&local), Some(0), true);
+        assert_eq!(find(&around, "secure_dns").status, Status::Attention);
+        assert!(find(&around, "secure_dns").weight > 0);
+        let automatic = json!({"dns_over_https": {"mode": "automatic"}});
+        assert_eq!(find(&build_profile_checks("Google Chrome", &prefs, &secure, Some(&automatic), Some(0), true), "secure_dns").status, Status::Info);
         assert_eq!(find(&c, "browser_guard").status, Status::Good);
         assert_eq!(find(&c, "saved_passwords").status, Status::Good);
 
-        let bare = build_profile_checks("Google Chrome", &json!({}), &json!({}), None, Some(42));
+        let bare = build_profile_checks("Google Chrome", &json!({}), &json!({}), None, Some(42), false);
         assert_eq!(find(&bare, "safe_browsing").status, Status::Attention, "default is standard protection");
         assert_eq!(find(&bare, "js_optimizer").status, Status::Attention);
         assert_eq!(find(&bare, "browser_guard").status, Status::Risk);
         assert!(find(&bare, "saved_passwords").detail.starts_with("42 passwords"));
 
-        let off = build_profile_checks("Google Chrome", &json!({"safebrowsing": {"enabled": false}}), &json!({}), None, None);
+        let off = build_profile_checks("Google Chrome", &json!({"safebrowsing": {"enabled": false}}), &json!({}), None, None, false);
         assert_eq!(find(&off, "safe_browsing").status, Status::Risk);
         assert_eq!(find(&off, "saved_passwords").status, Status::Unknown);
     }

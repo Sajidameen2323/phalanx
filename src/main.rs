@@ -309,8 +309,15 @@ enum WebCommand {
     /// Put back an extension removed by `remove-extension`.
     RestoreExtension { backup: PathBuf },
     /// Put back the Windows DNS settings saved when the DNS filter was set up
-    /// (asks for administrator). The uninstaller runs this.
-    RestoreDns,
+    /// (asks for administrator). The uninstaller runs this. A backup is only
+    /// used while Windows still points at the filter; otherwise it is stale
+    /// and discarded.
+    RestoreDns {
+        /// Only say whether there is anything to put back: exit code 0 if
+        /// Windows uses the filter, 1 if not.
+        #[arg(long)]
+        check: bool,
+    },
     /// Serve the browser connector on stdin/stdout (browsers start this).
     #[command(hide = true)]
     NativeHost,
@@ -704,7 +711,10 @@ fn run() -> Result<ExitCode> {
             Ok(if report.count(threat_scanner::audit::Severity::High) > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
         }
         Command::Browsers { offline, json } => {
-            let report = web::hardening::check(!offline);
+            // The service's DNS filter, else this user's (before 0.5).
+            let machine = threat_scanner::service::data::machine_data_dir();
+            let filter_in_use = web::windows_dns::filter_in_use(&machine) || web::windows_dns::filter_in_use(&dir);
+            let report = web::hardening::check(!offline, filter_in_use);
             if *json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1508,12 +1518,22 @@ fn web_command(cmd: &WebCommand, dir: &Path) -> Result<ExitCode> {
             println!("{}", extensions::restore_extension(backup)?);
             Ok(ExitCode::SUCCESS)
         }
-        WebCommand::RestoreDns => {
+        WebCommand::RestoreDns { check } => {
             // Since 0.5 the backup is kept in the service's folder.
             let machine = threat_scanner::service::data::machine_data_dir();
             let dir = if web::windows_dns::has_backup(&machine) { machine.as_path() } else { dir };
+            let nothing = if *check { ExitCode::from(1) } else { ExitCode::SUCCESS };
             if !web::windows_dns::has_backup(dir) {
                 println!("Phalanx did not change Windows' DNS settings; nothing to restore.");
+                return Ok(nothing);
+            }
+            if !web::windows_dns::filter_in_use(dir) {
+                let _ = std::fs::remove_file(web::windows_dns::backup_path(dir));
+                println!("Windows does not use Phalanx's DNS filter, so there is nothing to put back; the old backup was discarded.");
+                return Ok(nothing);
+            }
+            if *check {
+                println!("Windows uses Phalanx's DNS filter; restore-dns puts the previous settings back.");
                 return Ok(ExitCode::SUCCESS);
             }
             match web::windows_dns::restore(dir)? {

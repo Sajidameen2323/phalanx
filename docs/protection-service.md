@@ -278,6 +278,16 @@ in one step.
    setup from Explorer, not from a sandboxed shell: the "as you" steps
    (connecting browsers, opening the app) run in the shell's session.
 
+   *0.5.1.* The test also showed the uninstaller offering to restore a
+   DNS backup Windows no longer used (restoring it would have put back
+   settings from an earlier setup). DNS is now restored only while an
+   adapter still points at the filter; a stale backup is discarded
+   (`web restore-dns --check`). Browsers are not forced off DNS over
+   HTTPS by policy (the "Managed by your organization" banner and no
+   encrypted DNS for anyone were judged too costly); instead, while
+   Windows uses the filter, browser hardening flags a browser whose
+   secure DNS uses a provider of its own and so goes around it.
+
 ## Testing
 
 - Unit tests for the pipe protocol, request authorisation and migration.

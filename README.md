@@ -151,7 +151,7 @@ the installing user's settings, history, quarantine, web lists and abuse.ch key 
 brought into the service's folder, the old copy is removed, and its data folder is
 kept. If Windows' DNS was pointed at the DNS filter, it stays that way: the
 service answers on the same address. The uninstaller puts Windows' DNS settings
-back if the DNS filter was set up (`phalanx-cli web restore-dns`), removes the
+back if Windows uses the DNS filter (`phalanx-cli web restore-dns`), removes the
 service, and asks before deleting the data. The setup program is not code-signed,
 so SmartScreen warns about it until it is.
 
@@ -454,9 +454,16 @@ servers, which Windows would otherwise ask directly. **Keep a fallback DNS serve
 (on by default) leaves the adapter's previous first server second in line, so the
 internet still works when Phalanx is closed; turning it off means nothing resolves
 without Phalanx, but no lookup can slip past it. **Restore previous DNS…** puts back
-exactly what was saved (automatic from the router, or the servers you had).
-Browsers with "secure DNS" (DNS over HTTPS) turned on bypass the filter, but Browser
-Guard still covers them.
+exactly what was saved (automatic from the router, or the servers you had). It is
+offered only while Windows uses the filter: a backup from an earlier setup that
+Windows no longer uses is stale and discarded rather than restored
+(`phalanx-cli web restore-dns --check` says which; the uninstaller asks only then).
+A browser whose "secure DNS" (DNS over HTTPS) is set to a provider of its own
+bypasses the filter, but Browser Guard still covers it. Chrome's and Edge's default,
+"automatic", does not: it only switches to a provider the DNS server offers. While
+Windows uses the filter, browser hardening (below) flags a browser that bypasses it.
+Phalanx does not force this with browser policies, which would show "Managed by
+your organization" and turn encrypted DNS off for everyone.
 
 **Browser hardening.** The Web protection page also checks each Chromium browser
 and profile, read-only: whether an update is downloaded but waiting for a restart
