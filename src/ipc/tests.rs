@@ -294,6 +294,9 @@ mod live {
         let finished = wait_for(&events, |e| e["type"] == "scan-finished" && e["job"] == job);
         assert_eq!(finished["report"]["infected"].as_array().unwrap().len(), 1, "{finished}");
         let scan_id = finished["report"]["scan_id"].as_i64().unwrap();
+        // History's "Show details" for it.
+        let details: ScanDetails = client.call(Request::ScanDetails { scan: scan_id }).unwrap().into_result().unwrap();
+        assert!(details.detections.len() == 1 && details.detections[0].path.ends_with("setup.txt"), "{details:?}");
 
         // Only what the service detected can be quarantined, once.
         let not_detected = client.call(Request::QuarantineDetection { scan: scan_id, path: elsewhere.join("other.txt") }).unwrap();

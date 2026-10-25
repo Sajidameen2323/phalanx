@@ -630,6 +630,8 @@ impl App {
                     ("New files checked", self.watch.files_checked.to_string()),
                 ];
                 if self.watch.programs {
+                    let seen = if self.watch.program_events { "As they start (Windows events)" } else { "Twice a second (process list)" };
+                    items.push(("Programs seen", seen.to_string()));
                     items.push(("Programs checked", self.watch.programs_checked.to_string()));
                 }
                 items.push(("Threats", self.watch.threats.to_string()));
@@ -701,7 +703,7 @@ impl App {
                 ui,
                 &mut self.settings.program_protection,
                 "Scan programs as they start",
-                "Each program is checked once (until it changes), within about a second of starting. Very short-lived programs can finish first.",
+                "Each program is checked once (until it changes), as soon as Windows reports it started. Programs that exit within moments are still scanned, though their command line may be gone by then.",
             );
             row_divider(ui);
             ui.add_enabled_ui(self.settings.program_protection, |ui| {
@@ -710,6 +712,13 @@ impl App {
                     &mut self.settings.stop_running_threats,
                     "Stop malware that is running",
                     "End a running program found to be malware. Potentially unwanted programs, hacking tools and suspicious (heuristic) findings are reported but left running. Programs running as administrator can only be stopped if Phalanx runs as administrator too.",
+                );
+                row_divider(ui);
+                setting_toggle(
+                    ui,
+                    &mut self.settings.side_loading,
+                    "Flag DLL side-loading",
+                    "Report a signed program that loads an unsigned copy of a Windows DLL from a folder users can write to: a common way to run malware inside a trusted program. Reported only; nothing is stopped.",
                 );
             });
         });
@@ -862,6 +871,7 @@ impl App {
                     let (status, color) = match (&s.finished_at, s.cancelled, s.detections) {
                         // A command line, not a file scan; nothing was stopped.
                         _ if s.kind == "command" => ("Suspicious command".to_string(), theme().amber),
+                        _ if s.kind == "sideload" => ("Possible DLL side-loading".to_string(), theme().amber),
                         (None, _, _) => ("Incomplete".to_string(), theme().amber),
                         (_, true, _) => ("Cancelled".to_string(), theme().amber),
                         (_, _, 0) => ("Clean".to_string(), theme().green),
@@ -871,6 +881,8 @@ impl App {
                 });
                 if s.kind == "command" {
                     facts(ui, &[("Action", "Reported only: command-line rules do not stop programs yet".to_string())]);
+                } else if s.kind == "sideload" {
+                    facts(ui, &[("Action", "Reported only: side-loading checks do not stop programs yet".to_string())]);
                 } else {
                     facts(
                         ui,
@@ -920,9 +932,9 @@ impl App {
         }
         if let Some(id) = toggle && self.expanded.remove(&id).is_none() {
             self.link.run(
-                move || link::read::<(Vec<DetectionRow>, Vec<ScanErrorRow>)>(Request::ScanDetails { scan: id }),
+                move || link::read::<ipc::ScanDetails>(Request::ScanDetails { scan: id }),
                 move |app, details| match details {
-                    Ok((detections, errors)) => {
+                    Ok(ipc::ScanDetails { detections, errors }) => {
                         app.expanded.insert(id, ScanDetails { detections, errors });
                     }
                     Err(e) => app.notify(format!("Could not load scan details: {e}"), false),
@@ -1997,7 +2009,7 @@ fn detection_card(ui: &mut Ui, row: &mut ResultRow, ai_enabled: bool) -> bool {
 
 /// Scans recorded by real-time protection rather than started by the user.
 fn is_protection_kind(kind: &str) -> bool {
-    kind == "watch" || kind == "process" || kind == "command"
+    kind == "watch" || kind == "process" || kind == "command" || kind == "sideload"
 }
 
 fn capitalize(text: &str) -> String {

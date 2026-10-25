@@ -16,9 +16,10 @@
 mod pipe;
 
 use crate::risk::{DownloadOrigin, RiskyFile};
-use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent};
+use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
+use crate::store::{DetectionRow, ScanErrorRow};
 use crate::service::web::WebStatus;
 use crate::web::events::WebEvent;
 use crate::web::{SiteChange, WebConfig};
@@ -139,6 +140,11 @@ pub enum Event {
     /// Signatures could not be loaded; nothing is scanned until they are.
     EngineFailed { error: String },
     ProtectionStarted { watching: usize, failed: Vec<(PathBuf, String)>, programs: bool },
+    /// How programs are watched: through Windows' process events, or by
+    /// reading the process list (`reason` says why not events).
+    ProgramWatch { events: bool, reason: Option<String> },
+    /// A signed program loaded an unsigned copy of a Windows DLL (reported only).
+    SideLoad { hit: SideLoadHit },
     /// Real-time protection was turned off in the settings.
     ProtectionOff,
     FolderLost { folder: PathBuf, reason: String },
@@ -183,6 +189,8 @@ impl From<RtpEvent> for Event {
             RtpEvent::Scanned { origin, report } => Event::Scanned { origin, files: report.stats.files_scanned, threats: report.infected.len() },
             RtpEvent::RiskyFile { path, risk, origin } => Event::RiskyFile { path, risk, origin },
             RtpEvent::RiskyChecked { path, outcome } => Event::RiskyChecked { path, outcome },
+            RtpEvent::ProgramWatch { events, reason } => Event::ProgramWatch { events, reason },
+            RtpEvent::SideLoad(hit) => Event::SideLoad { hit },
             RtpEvent::Command(hit) => Event::Command { hit },
             RtpEvent::DriveAdded { root, files } => Event::DriveAdded { root, files },
             RtpEvent::Restarting { error, retry_in } => Event::Restarting { error, retry_in_secs: retry_in.as_secs() },
@@ -327,6 +335,13 @@ pub struct Status {
     pub data_dir: PathBuf,
 }
 
+/// The reply to `ScanDetails`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanDetails {
+    pub detections: Vec<DetectionRow>,
+    pub errors: Vec<ScanErrorRow>,
+}
+
 /// The reply to `ProtectionStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectionStatus {
@@ -340,6 +355,10 @@ pub struct ProtectionStatus {
     /// Programs are scanned as they start.
     #[serde(default)]
     pub programs: bool,
+    /// Programs are seen through Windows' process events (rather than by
+    /// reading the process list twice a second).
+    #[serde(default)]
+    pub program_events: bool,
     /// Scans running now.
     pub scans: usize,
 }

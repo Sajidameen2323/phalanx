@@ -26,6 +26,8 @@ pub struct ProtectionSettings {
     pub stop_running_threats: bool,
     /// Check command lines and the Run box (report only for now).
     pub command_rules: bool,
+    /// Flag signed programs loading a planted Windows DLL (report only for now).
+    pub side_loading: bool,
     /// Check drives as they appear.
     pub scan_new_drives: bool,
     /// Hold back non-urgent scans during full-screen games.
@@ -56,6 +58,7 @@ impl Default for ProtectionSettings {
             program_protection: true,
             stop_running_threats: true,
             command_rules: true,
+            side_loading: true,
             scan_new_drives: true,
             defer_when_fullscreen: true,
             heuristics: true,
@@ -104,6 +107,7 @@ impl ProtectionSettings {
         off(self.program_protection, new.program_protection, "scanning programs as they start");
         off(self.stop_running_threats, new.stop_running_threats, "stopping running malware");
         off(self.command_rules, new.command_rules, "command-line checks");
+        off(self.side_loading, new.side_loading, "DLL side-loading checks");
         off(self.scan_new_drives, new.scan_new_drives, "checking new drives");
         off(self.heuristics, new.heuristics, "PE heuristics");
         off(self.scan_archives, new.scan_archives, "scanning inside archives");
@@ -151,6 +155,7 @@ mod tests {
         let cases: Vec<(ProtectionSettings, &str)> = vec![
             (ProtectionSettings { watch_enabled: false, ..base.clone() }, "turns off real-time protection"),
             (ProtectionSettings { command_rules: false, ..base.clone() }, "turns off command-line checks"),
+            (ProtectionSettings { side_loading: false, ..base.clone() }, "turns off DLL side-loading checks"),
             (ProtectionSettings { scan_archives: false, ..base.clone() }, "turns off scanning inside archives"),
             (ProtectionSettings { max_size_mb: 10, ..base.clone() }, "skips files over 10 MiB instead of 100 MiB"),
             (ProtectionSettings { auto_update_hours: 48, ..base.clone() }, "checks for signatures every 48 hours instead of 4"),

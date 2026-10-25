@@ -12,7 +12,7 @@ pub mod web;
 #[cfg(windows)]
 pub mod manage;
 
-use crate::ipc::{Caller, ClientMessage, Reply, Request, Status};
+use crate::ipc::{Caller, ClientMessage, Reply, Request, ScanDetails, Status};
 use crate::web::WebConfig;
 use protect::{Hub, Protector};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,7 +131,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
         Request::RecentScans { limit, kind } => reply(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
         Request::ScanDetails { scan } => reply(
             id,
-            session.store(dir).and_then(|s| Ok(json!({ "detections": s.scan_detections(scan)?, "errors": s.scan_errors(scan)? }))),
+            session.store(dir).and_then(|s| Ok(ScanDetails { detections: s.scan_detections(scan)?, errors: s.scan_errors(scan)? })),
         ),
         Request::RecentDetections { limit } => reply(id, session.store(dir).and_then(|s| s.recent_detections(limit))),
         Request::MonthlySummary => reply(id, session.store(dir).and_then(|s| s.monthly_summary())),

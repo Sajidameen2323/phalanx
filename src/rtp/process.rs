@@ -26,10 +26,32 @@ pub struct ProcessInfo {
     pub parent: u32,
 }
 
+/// A process as Windows' process snapshot lists it, without opening it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub pid: u32,
+    pub parent: u32,
+    /// The executable's name (e.g. `setup.exe`).
+    pub name: String,
+}
+
 /// Every running process whose program file could be found. Protected and
 /// system processes Windows does not let us query are left out.
 pub fn running() -> std::io::Result<Vec<ProcessInfo>> {
-    imp::running()
+    Ok(listed()?.iter().filter_map(open).collect())
+}
+
+/// Every running process (but this one and the kernel's), from a snapshot:
+/// cheap, since no process is opened. See [`open`] for the rest.
+pub fn listed() -> std::io::Result<Vec<Listed>> {
+    imp::listed()
+}
+
+/// The creation time and program file of a listed process; `None` if it
+/// exited or Windows denies access.
+pub fn open(listed: &Listed) -> Option<ProcessInfo> {
+    let (created, image) = identify(listed.pid)?;
+    Some(ProcessInfo { id: ProcessId { pid: listed.pid, created }, name: listed.name.clone(), image, parent: listed.parent })
 }
 
 /// Stops `id`, waiting up to a few seconds for it to exit. Refuses if the
@@ -44,12 +66,18 @@ pub fn command_line(id: &ProcessId) -> Option<String> {
     imp::command_line(id)
 }
 
+/// The creation time and program file of process `pid`, as [`running`]
+/// reads them. `None` if it exited or Windows denies access.
+pub fn identify(pid: u32) -> Option<(u64, PathBuf)> {
+    imp::identify(pid)
+}
+
 /// Whether process listing is supported here.
 pub const SUPPORTED: bool = cfg!(windows);
 
 #[cfg(windows)]
 mod imp {
-    use super::{ProcessId, ProcessInfo};
+    use super::{Listed, ProcessId};
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
     use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
@@ -83,14 +111,25 @@ mod imp {
     }
 
     fn image(process: &Handle) -> Option<PathBuf> {
-        let mut buf = vec![0u16; 32 * 1024];
-        let mut len = buf.len() as u32;
-        // SAFETY: `buf` holds `len` UTF-16 units.
-        let ok = unsafe { QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) };
-        (ok != 0 && len > 0).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize])))
+        // Most paths fit the small buffer; the long one is for the rest.
+        for size in [1024, 32 * 1024] {
+            let mut buf = vec![0u16; size];
+            let mut len = buf.len() as u32;
+            // SAFETY: `buf` holds `len` UTF-16 units.
+            let ok = unsafe { QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) };
+            if ok != 0 && len > 0 {
+                return Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize])));
+            }
+        }
+        None
     }
 
-    pub fn running() -> std::io::Result<Vec<ProcessInfo>> {
+    pub fn identify(pid: u32) -> Option<(u64, PathBuf)> {
+        let process = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        Some((created(&process)?, image(&process)?))
+    }
+
+    pub fn listed() -> std::io::Result<Vec<Listed>> {
         let own = unsafe { GetCurrentProcessId() };
         // SAFETY: the snapshot handle is closed by `Handle`.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -107,11 +146,7 @@ mod imp {
             if pid > 4 && pid != own {
                 let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if let Some(process) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)
-                    && let (Some(created), Some(image)) = (created(&process), image(&process))
-                {
-                    found.push(ProcessInfo { id: ProcessId { pid, created }, name, image, parent: entry.th32ParentProcessID });
-                }
+                found.push(Listed { pid, parent: entry.th32ParentProcessID, name });
             }
             more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
         }
@@ -182,10 +217,14 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::{ProcessId, ProcessInfo};
+    use super::{Listed, ProcessId};
 
-    pub fn running() -> std::io::Result<Vec<ProcessInfo>> {
+    pub fn listed() -> std::io::Result<Vec<Listed>> {
         Ok(Vec::new())
+    }
+
+    pub fn identify(_pid: u32) -> Option<(u64, std::path::PathBuf)> {
+        None
     }
 
     pub fn command_line(_id: &ProcessId) -> Option<String> {

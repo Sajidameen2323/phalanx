@@ -146,6 +146,9 @@ enum ServiceCommand {
     },
     /// The protection settings, as the service keeps them (JSON).
     Settings,
+    /// Where real-time protection is: signatures loaded, folders watched,
+    /// and whether programs are seen through process events (JSON).
+    Protection,
     /// Scan files or folders in the service, showing its progress.
     Scan {
         #[arg(required = true)]
@@ -924,6 +927,16 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
             RiskyOutcome::NotScanned(reason) => println!("    not scanned ({reason}): {}", path.display()),
             RiskyOutcome::Threat(_) => {}
         },
+        RtpEvent::ProgramWatch { events: true, .. } => println!("programs are seen through Windows' process events"),
+        RtpEvent::ProgramWatch { events: false, reason } => {
+            let reason = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            println!("programs are found by reading the process list twice a second{reason}");
+        }
+        RtpEvent::SideLoad(hit) => {
+            println!("[possible DLL side-loading] {} (pid {})", hit.headline(), hit.pid);
+            println!("    program: {}{}", hit.image.display(), hit.signer.map(|s| format!(", signed by {s}")).unwrap_or_default());
+            println!("    report-only: nothing was stopped; the DLL is scanned");
+        }
         RtpEvent::Command(hit) => {
             let at = match (hit.source, hit.pid) {
                 (rtp::CommandSource::RunBox, _) => "Run box".to_string(),
@@ -1222,6 +1235,11 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
                     println!("{event}");
                 }
             }
+        }
+        ServiceCommand::Protection => {
+            let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            let status: ipc::ProtectionStatus = client.call(ipc::Request::ProtectionStatus)?.into_result()?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         ServiceCommand::Settings => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;

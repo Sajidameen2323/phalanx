@@ -11,7 +11,7 @@ account, and shows you exactly what it found and why.
 | Area | What Phalanx does |
 | --- | --- |
 | **Scanning** | Quick, full and custom scans with hash signatures, YARA rules and Windows-program heuristics, plus a reversible quarantine and a complete history. It also looks inside ZIP and 7z archives, scans programs padded past the size limit, and checks what shortcuts run. |
-| **Real-time protection** | Scans new downloads, every program that starts, and the files on a disk image or USB drive as soon as it appears, and stops running malware. It also reads the command lines of PowerShell and other Windows tools, and the commands pasted into the Run box, to catch attacks that never drop a file, such as fake CAPTCHA (ClickFix) pages. This part only reports for now. |
+| **Real-time protection** | Scans new downloads, every program that starts (Windows reports each one within milliseconds, so even very short-lived programs are seen), and the files on a disk image or USB drive as soon as it appears, and stops running malware. It also reads the command lines of PowerShell and other Windows tools, and the commands pasted into the Run box, to catch attacks that never drop a file, such as fake CAPTCHA (ClickFix) pages, and spots a trusted program made to load a planted DLL (side-loading). These two only report for now. |
 | **Web protection** | Browser Guard blocks malware and phishing sites before your browser sends them a single request, marks dangerous search results, and can block ads and trackers. A DNS filter extends the blocking to every program on the PC. It also finds malicious browser extensions and checks each browser's security settings. |
 | **Stealer check** | Looks for the start-up entries, scheduled tasks, browser switches, policies, proxies and hosts-file changes that infostealers use. |
 | **Windows protection and privacy** | Checks Microsoft Defender, SmartScreen, the firewall, memory integrity and more, and can switch on what is off. A privacy checklist does the same for Windows privacy settings. |
@@ -115,6 +115,7 @@ phalanx-cli service migrate     # as administrator, once: bring a 0.4 user's dat
 phalanx-cli service scan D:\    # scan in the service, with progress
 phalanx-cli service events      # watch what the service reports
 phalanx-cli service settings | history
+phalanx-cli service protection  # watching? programs through process events?
 phalanx-cli service update      # download signatures in the service, with progress
 phalanx-cli service web         # web settings and whether the DNS filter runs
 phalanx-cli service site block example.test   # allow / unblock need administrator
@@ -216,8 +217,14 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
 * **Scans finished downloads only.** A file is scanned once it has *settled*: no
   changes and an unchanged size for 3 seconds. Partial downloads (`.crdownload`,
   `.part`, `.tmp`…) are ignored until they are renamed to their final name.
-* **Programs as they start.** The list of running programs is read twice a second,
-  and the program file of each new process is scanned in the urgent lane. A program
+* **Programs as they start.** The service learns of every process that starts from
+  Windows' own process events (ETW, the Microsoft-Windows-Kernel-Process provider,
+  `src/rtp/etw.rs`), within about 100 ms, with its exact parent, so a program that
+  runs for only a moment is still seen. The list of running programs is still read
+  every 5 seconds, for anything the event session lost. Without administrator
+  rights (a `phalanx-cli watch` in a normal terminal) the list is read twice a
+  second instead, as before 0.6; the Protection page shows which ("Programs seen").
+  The program file of each new process is scanned in the urgent lane. A program
   found to be malware is stopped (the process is identified
   by id *and* creation time, so a reused process id is never mistaken for it) and,
   with automatic quarantine on, quarantined once it has exited. A known threat that
@@ -247,7 +254,20 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
   not kept. The same command line is reported once every 10 minutes, however often
   it runs. **Nothing is stopped yet**: this release only
   reports, so false positives surface before any rule acts. Programs that Phalanx
-  itself starts are not checked.
+  itself starts are not checked. A program that exits before its start event is
+  handled (about 100 ms) is still scanned, but its command line is gone by then.
+* **DLL side-loading is flagged (report only).** Many current loaders bring a
+  validly signed program (often Microsoft's or a security vendor's) together with a
+  planted DLL named after one it imports; Windows looks next to the program first,
+  so the planted copy runs inside a trusted process. With process events, every
+  DLL a program loads is seen (`src/rtp/sideload.rs`). Phalanx reports a signed
+  program loading an **unsigned DLL named after one in `System32`**, from outside
+  Windows' and Program Files' folders (which only administrators can change). Apps
+  installed per user load unsigned DLLs of their own all the time (`ffmpeg.dll`
+  and the like), but rarely an unsigned copy of a Windows DLL, so this stays quiet
+  on normal software. A finding is shown in the activity log, notifies, is recorded
+  in History (kind `SIDELOAD`, category suspicious), and the DLL is scanned. Nothing
+  is stopped yet. Needs administrator rights, so it runs in the service.
 * **Disk images and USB drives are checked as they appear.** Opening an ISO or VHD
   adds a drive letter, and the files inside carry no Mark of the Web, so Windows'
   download warnings stay quiet. When a local drive appears (a mounted image or a USB
@@ -769,11 +789,13 @@ The app only uses the bundled and downloaded signatures. For your own, pass them
 
 * Real-time protection runs in user mode, without a kernel driver, so nothing is
   intercepted *before* it happens. Files are scanned after they land in watched
-  folders (not on every open elsewhere on the disk). Programs are checked within
-  about half a second of starting and stopped if they are known malware; a program
-  that runs for less than that can finish first, and it can act during that time.
-  DLLs a program loads, scripts run in memory (AMSI) and process memory are not
-  scanned, and there is no self-protection against malware stopping the app.
+  folders (not on every open elsewhere on the disk). Programs are checked as soon
+  as Windows reports them started and stopped if they are known malware, but a
+  program can act before that, and one that exits within moments is only scanned
+  afterwards. DLLs are checked for side-loading only, not scanned as they load;
+  scripts run in memory (AMSI) and process memory are not scanned. The service
+  cannot be stopped by malware running as the user, but malware with administrator
+  rights can stop it.
 * Without administrator rights, programs running as administrator cannot be
   stopped; the detection still reports them.
 * Coverage is only as good as the feeds. YARA Forge core is tuned for low false

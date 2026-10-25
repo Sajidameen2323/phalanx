@@ -31,7 +31,7 @@ use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
 use threat_scanner::cmdline::Confidence;
-use threat_scanner::rtp::{CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome};
+use threat_scanner::rtp::{CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome, SideLoadHit};
 use threat_scanner::Category;
 use widgets::APP_TITLE;
 
@@ -151,6 +151,8 @@ struct Settings {
     program_protection: bool,
     /// Stop a running program detected as malware.
     stop_running_threats: bool,
+    /// Flag signed programs loading a planted Windows DLL.
+    side_loading: bool,
     /// Ignore heuristic-only findings on validly signed files.
     trust_signed: bool,
     /// Look inside ZIP and 7z archives.
@@ -195,6 +197,7 @@ impl Default for Settings {
             risky_file_alerts: true,
             program_protection: true,
             stop_running_threats: true,
+            side_loading: true,
             trust_signed: true,
             scan_archives: true,
             scan_new_drives: true,
@@ -342,6 +345,8 @@ enum WatchMsg {
     Restarting { error: String, retry_in: Duration },
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
+    ProgramWatch { events: bool, reason: Option<String> },
+    SideLoad(SideLoadHit),
     Command(CommandHit),
     DriveAdded { root: PathBuf, files: usize },
     Error(String),
@@ -386,6 +391,9 @@ struct WatchState {
     failed: Vec<(PathBuf, String)>,
     /// Programs are scanned as they start.
     programs: bool,
+    /// Programs are seen through Windows' process events, not by reading
+    /// the process list twice a second.
+    program_events: bool,
     files_checked: i64,
     programs_checked: i64,
     /// Times protection recovered from a failure this session.
@@ -1365,6 +1373,7 @@ impl App {
                         app.watch.running = true;
                         app.watch.watching = protection.folders;
                         app.watch.programs = protection.programs;
+                        app.watch.program_events = protection.program_events;
                     }
                     app.manifest = update::load_manifest(&update::signature_dir(app.signatures_home()));
                     if moved || app.engine.is_none() {
@@ -1589,6 +1598,25 @@ impl App {
                         RiskyOutcome::Threat(_) => {}
                     }
                 }
+                WatchMsg::ProgramWatch { events, reason } => {
+                    self.watch.program_events = events;
+                    if !events && let Some(reason) = reason {
+                        self.log_activity(
+                            ActivityKind::Info,
+                            "Programs are checked twice a second".to_string(),
+                            format!("Windows' process events are not available: {reason}. Very short-lived programs can finish unseen."),
+                        );
+                    }
+                }
+                WatchMsg::SideLoad(hit) => {
+                    let mut detail = vec![format!("program: {} (pid {})", hit.image.display(), hit.pid)];
+                    if let Some(signer) = &hit.signer {
+                        detail.push(format!("signed by {signer}"));
+                    }
+                    detail.push("Malware often hides in a trusted program this way. Report-only: nothing was stopped; the DLL is being scanned".into());
+                    self.log_activity(ActivityKind::Threat, format!("Possible DLL side-loading: {}", hit.headline()), detail.join(" · "));
+                    changed_history = true;
+                }
                 WatchMsg::Command(hit) => {
                     let kind = if hit.confidence() == Confidence::High { ActivityKind::Threat } else { ActivityKind::Risky };
                     let mut detail: Vec<String> = hit.matches.iter().map(|m| m.reason.clone()).collect();
@@ -1667,6 +1695,7 @@ fn copy_protection(s: &mut Settings, p: &ProtectionSettings) {
     s.watch_folders = p.watch_folders.clone();
     s.program_protection = p.program_protection;
     s.stop_running_threats = p.stop_running_threats;
+    s.side_loading = p.side_loading;
     s.scan_new_drives = p.scan_new_drives;
     s.defer_when_fullscreen = p.defer_when_fullscreen;
     s.heuristics = p.heuristics;
@@ -1689,6 +1718,7 @@ fn protection_from(s: &Settings, service: &ProtectionSettings) -> ProtectionSett
         watch_folders: s.watch_folders.clone(),
         program_protection: s.program_protection,
         stop_running_threats: s.stop_running_threats,
+        side_loading: s.side_loading,
         scan_new_drives: s.scan_new_drives,
         defer_when_fullscreen: s.defer_when_fullscreen,
         heuristics: s.heuristics,
@@ -1716,6 +1746,8 @@ fn watch_msg(event: Event) -> Option<WatchMsg> {
         Event::Scanned { origin, files, threats } => WatchMsg::Scanned { origin, files, threats },
         Event::RiskyFile { path, risk, origin } => WatchMsg::RiskyFile { path, risk, origin },
         Event::RiskyChecked { path, outcome } => WatchMsg::RiskyChecked { path, outcome },
+        Event::ProgramWatch { events, reason } => WatchMsg::ProgramWatch { events, reason },
+        Event::SideLoad { hit } => WatchMsg::SideLoad(hit),
         Event::Command { hit } => WatchMsg::Command(hit),
         Event::DriveAdded { root, files } => WatchMsg::DriveAdded { root, files },
         Event::Restarting { error, retry_in_secs } => WatchMsg::Restarting { error, retry_in: Duration::from_secs(retry_in_secs) },
@@ -1753,6 +1785,11 @@ fn notify_event(event: &Event, prefs: &link::NotifyPrefs) {
             &format!("{} ({}). Phalanx stopped this connection.", event.threat, event.category),
         ),
         // Medium-confidence matches are common in admin tools; only logged.
+        Event::SideLoad { hit } if prefs.threats() => {
+            let title = format!("Possible DLL side-loading in {}", hit.program);
+            let body = format!("{}. Phalanx only reported it and is scanning the DLL. If you did not just install or update this program, check it.", capitalize_first(&hit.headline()));
+            system::notify(&title, &body);
+        }
         Event::Command { hit } if prefs.threats() && hit.confidence() == Confidence::High => {
             let (title, body) = command_notification(hit);
             system::notify(&title, &body);
