@@ -11,8 +11,9 @@ GETTING STARTED
 Protection starts as soon as setup finishes: it runs in the Phalanx
 protection service, for the whole PC, whether or not the app is open and
 even with nobody signed in. It watches everyone's Downloads folder, checks
-every program as it starts, and scans disk images and USB drives when they
-appear.
+every program as it starts (Windows tells it within moments, so even
+programs that run only briefly are seen), and scans disk images and USB
+drives when they appear.
 
 1. Open Phalanx from the Start menu.
 2. Web protection: choose "Connect browsers" (setup did this for you if you
@@ -46,6 +47,8 @@ WHAT IT DOES
 - Reports suspicious commands, such as ones a fake "verify you are human"
   page asks you to paste into the Run box. If a website ever asks you to
   press Win+R and paste something, don't.
+- Reports a trusted program made to load a planted copy of a Windows DLL
+  (side-loading), a common way to hide malware inside signed software.
 
 
 YOUR DATA

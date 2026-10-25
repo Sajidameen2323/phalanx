@@ -713,6 +713,13 @@ impl App {
                     "Stop malware that is running",
                     "End a running program found to be malware. Potentially unwanted programs, hacking tools and suspicious (heuristic) findings are reported but left running. Programs running as administrator can only be stopped if Phalanx runs as administrator too.",
                 );
+                row_divider(ui);
+                setting_toggle(
+                    ui,
+                    &mut self.settings.side_loading,
+                    "Flag DLL side-loading",
+                    "Report a signed program that loads an unsigned copy of a Windows DLL from a folder users can write to: a common way to run malware inside a trusted program. Reported only; nothing is stopped.",
+                );
             });
         });
         ui.add_space(14.0);

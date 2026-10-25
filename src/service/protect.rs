@@ -268,6 +268,7 @@ fn rtp_config(data_dir: &Path, s: &ProtectionSettings) -> RtpConfig {
     config.process_protection = s.program_protection;
     config.stop_running_threats = s.stop_running_threats;
     config.command_rules = s.command_rules;
+    config.side_loading = s.side_loading;
     config.run_box_all_users = true;
     config.trust_signed = s.trust_signed;
     config.scan_archives = s.scan_archives;

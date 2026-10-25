@@ -155,5 +155,19 @@ Each one ends with the tests passing.
   ("invalid type: map, expected a tuple of size 2"): the service answered
   `ScanDetails` with an object, the app read a pair. Both now use
   `ipc::ScanDetails`; `protection_and_scans_run_in_the_service` covers it.
-- **Next:** milestone 4 (README, Protection page, setup's
+- **Milestone 4: written, installed test not done.** README (overview
+  table, "Programs as they start", new "DLL side-loading" bullet,
+  Limitations), setup's `installer/README.txt`, version 0.6.0. Side-loading
+  became a protection setting (`ProtectionSettings::side_loading`, default
+  on; turning it off needs an administrator, like the other checks) with a
+  "Flag DLL side-loading" switch on the Protection page under program
+  protection. The page's "Programs seen" line (milestone 2) shows events or
+  polling.
+- **Left:** build setup (`installer/phalanx.iss`), install over 0.5.1, and
+  check in the installed service: the Protection page says "As they start
+  (Windows events)"; `cmd /c exit` run repeatedly is checked every time; the
+  planted ping + IPHLPAPI.DLL from the test is reported in History as
+  `SIDELOAD`; idle CPU of `phalanx-service.exe` compared with 0.5.1 (image
+  loads are the busiest events). Then merge.
+- **Was next:** milestone 4 (README, Protection page, setup's
   README.txt, version 0.6.0, installed test, idle CPU before/after).

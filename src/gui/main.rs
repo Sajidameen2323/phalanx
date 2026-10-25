@@ -151,6 +151,8 @@ struct Settings {
     program_protection: bool,
     /// Stop a running program detected as malware.
     stop_running_threats: bool,
+    /// Flag signed programs loading a planted Windows DLL.
+    side_loading: bool,
     /// Ignore heuristic-only findings on validly signed files.
     trust_signed: bool,
     /// Look inside ZIP and 7z archives.
@@ -195,6 +197,7 @@ impl Default for Settings {
             risky_file_alerts: true,
             program_protection: true,
             stop_running_threats: true,
+            side_loading: true,
             trust_signed: true,
             scan_archives: true,
             scan_new_drives: true,
@@ -1692,6 +1695,7 @@ fn copy_protection(s: &mut Settings, p: &ProtectionSettings) {
     s.watch_folders = p.watch_folders.clone();
     s.program_protection = p.program_protection;
     s.stop_running_threats = p.stop_running_threats;
+    s.side_loading = p.side_loading;
     s.scan_new_drives = p.scan_new_drives;
     s.defer_when_fullscreen = p.defer_when_fullscreen;
     s.heuristics = p.heuristics;
@@ -1714,6 +1718,7 @@ fn protection_from(s: &Settings, service: &ProtectionSettings) -> ProtectionSett
         watch_folders: s.watch_folders.clone(),
         program_protection: s.program_protection,
         stop_running_threats: s.stop_running_threats,
+        side_loading: s.side_loading,
         scan_new_drives: s.scan_new_drives,
         defer_when_fullscreen: s.defer_when_fullscreen,
         heuristics: s.heuristics,
