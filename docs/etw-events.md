@@ -214,11 +214,20 @@ Each one ends with the tests passing.
   The 0.5 s polling path, used without events, still opens every process.
   `image()` tries a 1 KB buffer before 64 KB (10.9 → 7.2 ms for the full
   list). Test: `the_check_behind_process_events_reopens_only_unknown_processes`.
-  **Installed confirmation pending** (`check-installed.ps1 -CpuOnly`).
+  **Confirmed installed** (`check-installed.ps1 -CpuOnly`, settled):
+
+  | Idle, 60 s | Before | After |
+  | --- | --- | --- |
+  | Side-loading on | 1.12%, 1.48% of one core | 0.83%, 0.42% |
+  | Side-loading off | 0.94% | 0.49% |
+  | 200 starts, side-loading on | 0.23 s CPU | 0.14 s CPU |
+
+  With the installed service stopped, `a_detected_program_is_stopped_and_quarantined`
+  passed 3 of 3, so its failures with Phalanx running are the race below.
 - **Test caveat:** with 0.6.0 installed, its service sees the test's
   `bad-ping.exe` through events and stops it before the test's polling
   monitor does, so `a_detected_program_is_stopped_and_quarantined` fails
   often. Run it with the service stopped (`sc stop Phalanx`, elevated).
-- **Left:** installed CPU confirmation, then the PR.
+- **Left:** the PR.
 - **Was next:** milestone 4 (README, Protection page, setup's
   README.txt, version 0.6.0, installed test, idle CPU before/after).
