@@ -146,6 +146,9 @@ enum ServiceCommand {
     },
     /// The protection settings, as the service keeps them (JSON).
     Settings,
+    /// Where real-time protection is: signatures loaded, folders watched,
+    /// and whether programs are seen through process events (JSON).
+    Protection,
     /// Scan files or folders in the service, showing its progress.
     Scan {
         #[arg(required = true)]
@@ -1232,6 +1235,11 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
                     println!("{event}");
                 }
             }
+        }
+        ServiceCommand::Protection => {
+            let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            let status: ipc::ProtectionStatus = client.call(ipc::Request::ProtectionStatus)?.into_result()?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         ServiceCommand::Settings => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;

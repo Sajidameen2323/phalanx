@@ -115,6 +115,7 @@ phalanx-cli service migrate     # as administrator, once: bring a 0.4 user's dat
 phalanx-cli service scan D:\    # scan in the service, with progress
 phalanx-cli service events      # watch what the service reports
 phalanx-cli service settings | history
+phalanx-cli service protection  # watching? programs through process events?
 phalanx-cli service update      # download signatures in the service, with progress
 phalanx-cli service web         # web settings and whether the DNS filter runs
 phalanx-cli service site block example.test   # allow / unblock need administrator
