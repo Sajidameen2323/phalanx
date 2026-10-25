@@ -36,6 +36,7 @@ mod cache;
 pub mod commands;
 mod dirwatch;
 mod drives;
+mod etw;
 mod files;
 pub mod process;
 
