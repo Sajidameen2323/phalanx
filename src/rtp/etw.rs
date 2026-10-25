@@ -10,7 +10,7 @@
 //! version adds or moves does not matter. Paths arrive as NT paths
 //! (`\Device\HarddiskVolume3\…`) and are turned into drive paths.
 
-use super::process::{ProcessId, ProcessInfo};
+use super::process::{self, ProcessId, ProcessInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
@@ -19,7 +19,7 @@ pub enum Event {
     /// A process started.
     Started(ProcessInfo),
     /// A process exited.
-    Stopped(ProcessId),
+    Stopped { pid: u32 },
     /// A process loaded an image: a DLL, or its own program file.
     ImageLoaded { pid: u32, image: PathBuf },
 }
@@ -70,7 +70,7 @@ fn dos_path(nt: &str, devices: &[(String, String)]) -> Option<PathBuf> {
 
 #[cfg(windows)]
 mod imp {
-    use super::{dos_path, Event, ProcessId, ProcessInfo};
+    use super::{dos_path, process, Event, ProcessId, ProcessInfo};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::mpsc::Sender;
     use std::thread::JoinHandle;
@@ -307,17 +307,20 @@ mod imp {
             PROCESS_START => {
                 let pid = u32_field(record, &names.process_id)?;
                 let parent = u32_field(record, &names.parent_id)?;
-                let created = u64_field(record, &names.create_time)?;
+                let event_created = u64_field(record, &names.create_time)?;
                 let nt = string_field(record, &names.image_name)?;
                 let image = path(ctx, &nt)?;
                 let name = image.file_name()?.to_string_lossy().into_owned();
+                // The creation time as the process list and `terminate` read
+                // it, which the event's need not match exactly; only if it is
+                // still this program (its id not already reused).
+                let created = match process::identify(pid) {
+                    Some((created, running)) if same_file(&running, &image) => created,
+                    _ => event_created,
+                };
                 Some(Event::Started(ProcessInfo { id: ProcessId { pid, created }, name, image, parent }))
             }
-            PROCESS_STOP => {
-                let pid = u32_field(record, &names.process_id)?;
-                let created = u64_field(record, &names.create_time)?;
-                Some(Event::Stopped(ProcessId { pid, created }))
-            }
+            PROCESS_STOP => Some(Event::Stopped { pid: u32_field(record, &names.process_id)? }),
             IMAGE_LOAD => {
                 let pid = u32_field(record, &names.process_id)?;
                 let nt = string_field(record, &names.image_name)?;
@@ -325,6 +328,10 @@ mod imp {
             }
             _ => None,
         }
+    }
+
+    fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+        a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
     }
 
     /// The drive path of `nt`, reading the drive letters again (at most once
@@ -449,7 +456,7 @@ mod tests {
         while Instant::now() < until && !(started.is_some() && stopped && loaded) {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Event::Started(info)) if info.id.pid == pid => started = Some(info),
-                Ok(Event::Stopped(id)) if id.pid == pid => stopped = true,
+                Ok(Event::Stopped { pid: p }) if p == pid => stopped = true,
                 Ok(Event::ImageLoaded { pid: p, image }) if p == pid => {
                     loaded |= image.to_string_lossy().to_ascii_lowercase().ends_with("ntdll.dll");
                 }
@@ -462,6 +469,29 @@ mod tests {
         assert!(info.image.to_string_lossy().eq_ignore_ascii_case(&cmd.to_string_lossy()), "{info:?}");
         assert!(stopped, "the exit was reported");
         assert!(loaded, "its DLL loads were reported");
+
+        // A process that is still running is identified as the process list
+        // identifies it, so `terminate` accepts the id.
+        let ping = Path::new(&root).join(r"System32\PING.EXE");
+        let mut child = std::process::Command::new(&ping)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut reported = None;
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && reported.is_none() {
+            if let Ok(Event::Started(info)) = rx.recv_timeout(Duration::from_millis(200))
+                && info.id.pid == child.id()
+            {
+                reported = Some(info);
+            }
+        }
+        let reported = reported.expect("the ping start was reported");
+        let listed = process::running().unwrap().into_iter().find(|p| p.id.pid == child.id()).expect("ping is listed");
+        assert_eq!(reported.id, listed.id);
+        process::terminate(&reported.id).unwrap();
+        child.wait().unwrap();
 
         // A second session of the same name replaces the first, whose
         // channel then closes.

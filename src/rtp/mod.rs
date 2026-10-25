@@ -503,11 +503,11 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>) -> Resul
                     consider_program(ctx, store.as_ref(), &info, &live, urgent)?;
                 }
             }
-            Ok(etw::Event::Stopped(id)) => {
-                if live.get(&id.pid).is_some_and(|p| p.id == id) {
-                    live.remove(&id.pid);
-                }
-                known.remove(&id);
+            // Events come in order, so this is the process last started
+            // with this id.
+            Ok(etw::Event::Stopped { pid }) => {
+                live.remove(&pid);
+                known.retain(|id| id.pid != pid);
             }
             Ok(etw::Event::ImageLoaded { .. }) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {

@@ -96,6 +96,18 @@ Each one ends with the tests passing.
   table, which also holds processes known only from events). The rtp tests
   pass here on the polling path; with administrator rights they would take
   the event path.
+- **First elevated run (2026-10-25):** the ETW session test passed for real.
+  `a_detected_program_is_stopped_and_quarantined` failed on the event path:
+  detected and quarantined, but `stopped=0`. The event's `CreateTime` did not
+  match what `GetProcessTimes` reads, so `terminate` took the process for
+  a reused id and refused. Fixed: a start event now takes the creation time
+  from the process itself (`process::identify`) when it is still the same
+  program file, and only falls back to the event's; `Stopped` carries only
+  the pid (events arrive in order). The ETW test now also checks that a
+  running process's id from an event equals its id in the process list and
+  can be stopped. **Needs one more elevated run to confirm.** The same run
+  showed `a_suspicious_command_line_is_reported_and_left_running` hiding the
+  terminal (`start /b` + `-w hidden`); it now uses `start /min`.
 - **Known limit:** the Kernel-Process start event has no command line, so it
   is still read from the process; a program that exits before its event
   arrives (about 100 ms) is scanned but its command line is not checked. If

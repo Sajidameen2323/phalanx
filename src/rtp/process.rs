@@ -44,6 +44,12 @@ pub fn command_line(id: &ProcessId) -> Option<String> {
     imp::command_line(id)
 }
 
+/// The creation time and program file of process `pid`, as [`running`]
+/// reads them. `None` if it exited or Windows denies access.
+pub fn identify(pid: u32) -> Option<(u64, PathBuf)> {
+    imp::identify(pid)
+}
+
 /// Whether process listing is supported here.
 pub const SUPPORTED: bool = cfg!(windows);
 
@@ -88,6 +94,11 @@ mod imp {
         // SAFETY: `buf` holds `len` UTF-16 units.
         let ok = unsafe { QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) };
         (ok != 0 && len > 0).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize])))
+    }
+
+    pub fn identify(pid: u32) -> Option<(u64, PathBuf)> {
+        let process = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        Some((created(&process)?, image(&process)?))
     }
 
     pub fn running() -> std::io::Result<Vec<ProcessInfo>> {
@@ -186,6 +197,10 @@ mod imp {
 
     pub fn running() -> std::io::Result<Vec<ProcessInfo>> {
         Ok(Vec::new())
+    }
+
+    pub fn identify(_pid: u32) -> Option<(u64, std::path::PathBuf)> {
+        None
     }
 
     pub fn command_line(_id: &ProcessId) -> Option<String> {
