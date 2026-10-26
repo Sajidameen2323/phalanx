@@ -11,7 +11,8 @@ use crate::engine::Engine;
 use crate::engine::Verdict;
 use crate::quarantine::Quarantine;
 use crate::store::{ScanMeta, ScanStats, Store, MAX_STORED_ERRORS};
-use crate::{contents, system, trust, Category, Finding, Source};
+use crate::trust::{self, Trust};
+use crate::{contents, system, Category, Finding, Source};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -249,9 +250,7 @@ pub fn run(
                         Ok(None) => WorkerMsg::Skipped,
                         Ok(Some(examined)) => {
                             let mut verdict = examined.verdict;
-                            if options.trust_signed {
-                                trust_signed(&mut verdict, &path);
-                            }
+                            weigh_signature(&mut verdict, &path, options.trust_signed);
                             WorkerMsg::Scanned {
                                 bytes: examined.bytes,
                                 data: if verdict.findings.is_empty() { None } else { examined.data },
@@ -357,15 +356,40 @@ pub fn run(
     })
 }
 
-/// On a file with a valid Authenticode signature only hash matches stand.
-/// Rules and heuristics match code that signed software shares with malware
-/// (open-source libraries, installers, embedded scripts), and the signature
-/// is the stronger evidence; the file is only checked when there is
-/// something to drop. Data appended to a signed program voids its signature
-/// (catalog or embedded), so a payload cannot hide behind one that way.
-fn trust_signed(verdict: &mut Verdict, path: &Path) {
-    if verdict.findings.iter().any(|f| f.source != Source::Hash) && trust::verify(path).is_signed() {
-        verdict.findings.retain(|f| f.source == Source::Hash);
+/// Threat name for a signed file changed after signing.
+pub const TAMPERED_THREAT: &str = "Tampered.SignedFile";
+
+/// Weighs the signature of a file that rules or heuristics flagged; files
+/// without such findings are not checked.
+///
+/// With `trust_signed`, on a valid Authenticode signature only hash matches
+/// stand: rules and heuristics match code that signed software shares with
+/// malware (open-source libraries, installers, embedded scripts), and the
+/// signature is the stronger evidence. Data appended to a signed program
+/// voids its signature (catalog or embedded), so a payload cannot hide
+/// behind one that way.
+///
+/// A publisher's signature that no longer matches the file means it was
+/// changed after signing (cracked, patched or infected). Together with a
+/// flag of its own, that is reported as malware.
+fn weigh_signature(verdict: &mut Verdict, path: &Path, trust_signed: bool) {
+    if !verdict.findings.iter().any(|f| f.source != Source::Hash) {
+        return;
+    }
+    match trust::verify(path) {
+        Trust::Signed { .. } if trust_signed => verdict.findings.retain(|f| f.source == Source::Hash),
+        Trust::Tampered => {
+            verdict.findings.insert(
+                0,
+                Finding {
+                    threat: TAMPERED_THREAT.to_string(),
+                    category: Category::Malware,
+                    source: Source::Heuristic,
+                    details: "changed after it was signed: the publisher's signature no longer matches".to_string(),
+                },
+            );
+        }
+        _ => {}
     }
 }
 
@@ -550,14 +574,14 @@ mod tests {
 
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         let mut signed = verdict();
-        trust_signed(&mut signed, &Path::new(&root).join(r"System32\notepad.exe"));
+        weigh_signature(&mut signed, &Path::new(&root).join(r"System32\notepad.exe"), true);
         assert_eq!(sources(&signed), [Source::Hash]);
 
         let tmp = tempfile::tempdir().unwrap();
         let unsigned_path = tmp.path().join("tool.exe");
         fs::write(&unsigned_path, b"MZ not really a program").unwrap();
         let mut unsigned = verdict();
-        trust_signed(&mut unsigned, &unsigned_path);
+        weigh_signature(&mut unsigned, &unsigned_path, true);
         assert_eq!(sources(&unsigned), [Source::Hash, Source::Yara, Source::Heuristic]);
 
         // A payload appended to a signed program voids the signature.
@@ -566,8 +590,44 @@ mod tests {
         data.extend_from_slice(b"appended payload");
         fs::write(&padded_path, data).unwrap();
         let mut padded = verdict();
-        trust_signed(&mut padded, &padded_path);
+        weigh_signature(&mut padded, &padded_path, true);
         assert_eq!(sources(&padded), [Source::Hash, Source::Yara, Source::Heuristic]);
+
+        // With trust turned off a signed file keeps everything.
+        let mut untrusted = verdict();
+        weigh_signature(&mut untrusted, &Path::new(&root).join(r"System32\notepad.exe"), false);
+        assert_eq!(sources(&untrusted), [Source::Hash, Source::Yara, Source::Heuristic]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_flagged_file_changed_after_signing_is_malware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(tampered) = trust::tampered_copy(tmp.path()) else {
+            eprintln!("no program with an embedded signature in System32; skipped");
+            return;
+        };
+        let flagged = || Verdict {
+            sha256: String::new(),
+            findings: vec![Finding {
+                threat: "Suspicious.Heuristic.PE".into(),
+                category: Category::Suspicious,
+                source: Source::Heuristic,
+                details: String::new(),
+            }],
+            warnings: Vec::new(),
+        };
+        for trust_signed in [true, false] {
+            let mut verdict = flagged();
+            weigh_signature(&mut verdict, &tampered, trust_signed);
+            assert_eq!(verdict.findings.len(), 2);
+            assert_eq!((verdict.findings[0].threat.as_str(), verdict.findings[0].category), (TAMPERED_THREAT, Category::Malware));
+        }
+
+        // Nothing flagged: the signature is not checked, nothing is added.
+        let mut clean = Verdict { sha256: String::new(), findings: Vec::new(), warnings: Vec::new() };
+        weigh_signature(&mut clean, &tampered, true);
+        assert!(clean.findings.is_empty());
     }
 
     /// The scan workflow end to end: the test marker appended to a signed
