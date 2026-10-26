@@ -153,7 +153,7 @@ struct Settings {
     stop_running_threats: bool,
     /// Flag signed programs loading a planted Windows DLL.
     side_loading: bool,
-    /// Ignore heuristic-only findings on validly signed files.
+    /// Ignore rule and heuristic findings on validly signed files.
     trust_signed: bool,
     /// Look inside ZIP and 7z archives.
     scan_archives: bool,

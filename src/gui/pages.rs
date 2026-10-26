@@ -1122,7 +1122,7 @@ impl App {
                 ui,
                 &mut self.settings.trust_signed,
                 "Trust signed software",
-                "Don't report heuristic findings on programs with a valid publisher signature (including Windows' own). Signature and hash matches are always reported.",
+                "Don't report rule or heuristic findings on programs with a valid publisher signature (including Windows' own). Matches against known-malware hashes are always reported.",
             );
             row_divider(ui);
             setting_toggle(

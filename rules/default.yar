@@ -54,6 +54,9 @@ rule Suspicious_PowerShell_Downloader
         $encoded = /\x2D\x45\x6E\x63\x6F\x64\x65\x64\x43\x6F\x6D\x6D\x61\x6E\x64/ ascii wide nocase
         $base64 = /\x46\x72\x6F\x6D\x42\x61\x73\x65\x36\x34\x53\x74\x72\x69\x6E\x67/ ascii wide nocase
     condition:
+        // Scripts only: .NET libraries (Azure.Identity, Kestrel...) carry
+        // these names in their own code without running anything.
+        uint16(0) != 0x5A4D and
         filesize < 5MB and
         ((($download or $webclient) and $invoke) or ($encoded and $base64))
 }
