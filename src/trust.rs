@@ -18,8 +18,11 @@ pub enum Trust {
         catalog: bool,
     },
     Unsigned,
-    /// A signature is present but does not verify (tampered, untrusted root,
-    /// expired without a timestamp...): the WinVerifyTrust result.
+    /// An embedded signature whose hash no longer matches the file: it was
+    /// changed after it was signed (patched, cracked or infected).
+    Tampered,
+    /// A signature is present but does not verify (untrusted root, expired
+    /// without a timestamp...): the WinVerifyTrust result.
     Invalid(String),
     /// The check could not run (unreadable file, or not Windows).
     Unknown(String),
@@ -48,7 +51,7 @@ mod imp {
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{HANDLE, TRUST_E_NOSIGNATURE, TRUST_E_PROVIDER_UNKNOWN, TRUST_E_SUBJECT_FORM_UNKNOWN};
+    use windows_sys::Win32::Foundation::{HANDLE, TRUST_E_BAD_DIGEST, TRUST_E_NOSIGNATURE, TRUST_E_PROVIDER_UNKNOWN, TRUST_E_SUBJECT_FORM_UNKNOWN};
     use windows_sys::Win32::Security::Cryptography::Catalog::{
         CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2, CryptCATAdminEnumCatalogFromHash,
         CryptCATAdminReleaseCatalogContext, CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext, CATALOG_INFO,
@@ -81,6 +84,7 @@ mod imp {
                     None => Trust::Unsigned,
                 }
             }
+            Err(TRUST_E_BAD_DIGEST) => Trust::Tampered,
             Err(code) => Trust::Invalid(format!("signature does not verify (0x{code:08X})")),
         }
     }
@@ -200,6 +204,26 @@ mod imp {
     }
 }
 
+/// A copy, in `dir`, of a System32 program with an embedded signature, one
+/// byte of its code changed. `None` when no such program is found.
+#[cfg(all(test, windows))]
+pub(crate) fn tampered_copy(dir: &Path) -> Option<std::path::PathBuf> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let mut programs: Vec<_> = std::fs::read_dir(Path::new(&root).join("System32"))
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() < 8 << 20))
+        .collect();
+    programs.sort();
+    let original = programs.into_iter().find(|p| matches!(verify(p), Trust::Signed { catalog: false, .. }))?;
+    let mut data = std::fs::read(&original).ok()?;
+    data[0x400] ^= 0xFF;
+    let copy = dir.join("tampered.exe");
+    std::fs::write(&copy, data).ok()?;
+    Some(copy)
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -219,5 +243,15 @@ mod tests {
         std::fs::write(&plain, b"MZ not really a program").unwrap();
         assert!(!verify(&plain).is_signed());
         assert!(matches!(verify(&tmp.path().join("missing.exe")), Trust::Unknown(_)));
+    }
+
+    #[test]
+    fn a_program_changed_after_signing_is_tampered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(copy) = tampered_copy(tmp.path()) else {
+            eprintln!("no program with an embedded signature in System32; skipped");
+            return;
+        };
+        assert_eq!(verify(&copy), Trust::Tampered);
     }
 }

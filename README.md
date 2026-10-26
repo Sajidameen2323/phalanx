@@ -280,7 +280,10 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
   libraries, installers and embedded scripts that signed programs share with
   malware. Revocation is not checked and nothing is fetched from the network.
   Known-malware hash matches are always reported. This also applies to manual
-  scans (Settings > Scanning > Trust signed software).
+  scans (Settings > Scanning > Trust signed software). The other way round, a
+  flagged file whose embedded signature no longer matches it (changed after
+  signing: cracked, patched or infected) is also reported as
+  `Tampered.SignedFile`, malware, whatever this setting says.
 * **Disposition cache.** Each file version (path, size, modification and creation
   time) is scanned once; opening, renaming back or relaunching it costs nothing.
   The cache is cleared whenever signatures or settings change.
