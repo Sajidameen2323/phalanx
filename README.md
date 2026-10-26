@@ -205,8 +205,8 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
                      disposition cache     │  (background priority)
                                            └─ sweep lane: programs already running
                                               at start (background priority)
-        ──▶ engine (hashes, YARA, heuristics; heuristic-only hits on signed
-            files dropped) ──▶ verdict cached ──▶ report, quarantine, stop
+        ──▶ engine (hashes, YARA, heuristics; rule and heuristic hits on
+            signed files dropped) ──▶ verdict cached ──▶ report, quarantine, stop
 ```
 
 * **Watched folders.** Each folder has its own `ReadDirectoryChangesW` watch with a
@@ -274,11 +274,13 @@ program monitor ─┴─▶ exclusions, then the ─┼─ bulk lane: other fil
   drive), the files on it up to two folders deep (at most 500, top level first) are
   scanned in the urgent lane, and the activity log notes the new drive. Network drives
   are left out. Turn this off on the Protection page (`--no-new-drives`).
-* **Signed software is trusted by heuristics.** A heuristic-only finding on a file
-  with a valid Authenticode signature, embedded or through a Windows security catalog
-  (how most of Windows is signed), is dropped. Revocation is not checked and nothing
-  is fetched from the network. Hash and YARA matches are always reported. This also
-  applies to manual scans (Settings > Scanning > Trust signed software).
+* **Signed software is trusted.** YARA and heuristic findings on a file with a
+  valid Authenticode signature, embedded or through a Windows security catalog
+  (how most of Windows is signed), are dropped: public rules match open-source
+  libraries, installers and embedded scripts that signed programs share with
+  malware. Revocation is not checked and nothing is fetched from the network.
+  Known-malware hash matches are always reported. This also applies to manual
+  scans (Settings > Scanning > Trust signed software).
 * **Disposition cache.** Each file version (path, size, modification and creation
   time) is scanned once; opening, renaming back or relaunching it costs nothing.
   The cache is cleared whenever signatures or settings change.

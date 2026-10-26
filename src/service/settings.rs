@@ -34,7 +34,7 @@ pub struct ProtectionSettings {
     pub defer_when_fullscreen: bool,
     // Scanning
     pub heuristics: bool,
-    /// Ignore heuristic-only findings on validly signed files.
+    /// Ignore rule and heuristic findings on validly signed files.
     pub trust_signed: bool,
     pub scan_archives: bool,
     pub max_size_mb: u64,
@@ -115,7 +115,7 @@ impl ProtectionSettings {
         off(self.quarantine_suspicious, new.quarantine_suspicious, "quarantining suspicious files");
         off(self.auto_update, new.auto_update, "automatic signature updates");
         if !self.trust_signed && new.trust_signed {
-            out.push("ignores heuristic findings on signed programs".into());
+            out.push("ignores rule and heuristic findings on signed programs".into());
         }
         if !self.defer_when_fullscreen && new.defer_when_fullscreen {
             out.push("delays scans during games and presentations".into());
@@ -166,7 +166,7 @@ mod tests {
             assert_eq!(base.weakened_by(&new), [why]);
         }
         let trusting = ProtectionSettings { trust_signed: false, ..base.clone() };
-        assert_eq!(trusting.weakened_by(&base), ["ignores heuristic findings on signed programs"]);
+        assert_eq!(trusting.weakened_by(&base), ["ignores rule and heuristic findings on signed programs"]);
 
         // Strengthening asks nothing.
         let stronger = ProtectionSettings {

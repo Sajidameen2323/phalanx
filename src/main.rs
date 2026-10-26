@@ -448,7 +448,7 @@ struct WatchArgs {
     /// With --programs, only report detected programs; never stop them.
     #[arg(long, requires = "programs")]
     report_only: bool,
-    /// Report heuristic findings even on validly signed files.
+    /// Report rule and heuristic findings even on validly signed files.
     #[arg(long)]
     no_trust_signed: bool,
     /// Don't look inside ZIP and 7z archives.

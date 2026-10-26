@@ -13,7 +13,7 @@
 //!                                              running at start; background)
 //!                         │
 //!                         ▼  engine: hashes → YARA → heuristics, with
-//!                            heuristic-only hits on signed files dropped
+//!                            rule and heuristic hits on signed files dropped
 //!                         ▼
 //!          verdict cached; threats reported, quarantined and, for a
 //!          running program, the process stopped
@@ -120,7 +120,7 @@ pub struct RtpConfig {
     /// Stop a running program found to be malware. PUPs and hacking tools
     /// (often run on purpose) and heuristic findings are only reported.
     pub stop_running_threats: bool,
-    /// Ignore heuristic-only findings on files with a valid signature.
+    /// Ignore rule and heuristic findings on files with a valid signature.
     pub trust_signed: bool,
     /// Look inside ZIP and 7z archives.
     pub scan_archives: bool,
