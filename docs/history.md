@@ -97,6 +97,7 @@ round-trip test.
     300 test scans: paging, search (with `_`), kind, days and "No scans
     match" all as expected from the CLI. Start the console service from
     PowerShell: Git Bash rewrites `\\.\pipe\…` to `\.\pipe\…`.
-- **Left in milestone 2:** look at the page in the app (filters, search,
-  Load more, the dashboard's tiles).
+- **Page seen in the app (2026-10-28)** against the console service: filter
+  and time-range chips, badges and Show details render as intended. The
+  search box sits a little shorter than the chips beside it (cosmetic).
 - **Next:** milestone 3, retention.
