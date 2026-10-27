@@ -26,7 +26,7 @@ use threat_scanner::posture::{self, Check};
 use threat_scanner::ipc::{self, replies, Event, Request};
 use threat_scanner::scan::{self, FileReport, ScanOptions, ScanReport};
 use threat_scanner::service::settings::ProtectionSettings;
-use threat_scanner::store::{self, DetectionRow, HistoryQuery, MonthRow, QuarantineRow, ScanErrorRow, ScanRow};
+use threat_scanner::store::{self, DeleteTarget, DetectionRow, HistoryQuery, MonthRow, QuarantineRow, ScanErrorRow, ScanRow, Verdict};
 use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
@@ -506,9 +506,35 @@ struct HistoryView {
     rows: Vec<ScanRow>,
     /// Where the next page starts; `None` when everything is loaded.
     next: Option<i64>,
+    /// Scans the query matches on all pages.
+    matching: i64,
     loading: bool,
     /// Bumped by every new query, so a reply to an older one is dropped.
     generation: u64,
+}
+
+/// A finding's review mark being written.
+struct ReviewEdit {
+    scan: i64,
+    detection: i64,
+    verdict: Verdict,
+    note: String,
+}
+
+/// What was clicked in a finding's review controls.
+enum ReviewStep {
+    Start(ReviewEdit),
+    Save,
+    Cancel,
+    Clear { scan: i64, detection: i64 },
+}
+
+/// History about to be deleted, waiting for the user's yes.
+struct HistoryDelete {
+    target: DeleteTarget,
+    /// What it is, for the question ("entry #42", "the 37 entries shown").
+    what: String,
+    running: bool,
 }
 
 /// What [`App::load_history`] loads.
@@ -576,6 +602,8 @@ struct App {
     // History
     history: HistoryView,
     expanded: HashMap<i64, ScanDetails>,
+    review_edit: Option<ReviewEdit>,
+    history_delete: Option<HistoryDelete>,
     // Desktop
     tray: Option<desktop::Tray>,
     quitting: Arc<AtomicBool>,
@@ -760,9 +788,12 @@ impl App {
                 search_edited: None,
                 rows: Vec::new(),
                 next: None,
+                matching: 0,
                 loading: false,
                 generation: 0,
             },
+            review_edit: None,
+            history_delete: None,
             expanded: HashMap::new(),
             tray,
             quitting,
@@ -846,6 +877,61 @@ impl App {
         self.load_history(Load::Again);
     }
 
+    /// Saves a finding's review mark (`None` clears it) and shows it.
+    fn save_review(&mut self, scan: i64, detection: i64, verdict: Option<Verdict>, note: String) {
+        self.link.run(
+            move || link::read::<replies::ReviewFinding>(Request::ReviewFinding { detection, verdict, note }),
+            move |app, mark| match mark {
+                Ok(mark) => {
+                    if let Some(found) = app.expanded.get_mut(&scan).and_then(|d| d.detections.iter_mut().find(|d| d.id == detection)) {
+                        found.review = mark;
+                    }
+                }
+                Err(e) => app.notify(format!("Could not save the mark: {e}"), false),
+            },
+        );
+    }
+
+    /// Asks before deleting history; it needs an administrator, so Windows'
+    /// prompt follows a yes.
+    fn history_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.history_delete else { return };
+        let busy = pending.running;
+        let text = format!(
+            "Deletes {} from history, with the findings, marks and errors recorded there, for good. The monthly totals drop by as much. Quarantined files are not touched.",
+            pending.what
+        );
+        let run = widgets::danger_button("Delete");
+        match widgets::dialog(ctx, "history-delete", "Delete from history?", busy, |ui| widgets::admin_command_body(ui, &text, None, run, busy)) {
+            Some(widgets::DialogChoice::Confirm) => self.delete_history(),
+            Some(widgets::DialogChoice::Cancel) => self.history_delete = None,
+            None => {}
+        }
+    }
+
+    fn delete_history(&mut self) {
+        let Some(pending) = &mut self.history_delete else { return };
+        pending.running = true;
+        let target = pending.target.clone();
+        // The target travels hex-encoded, so no search text is misread on
+        // the elevated command line.
+        let args = format!("service delete-history --json {}", link::hex_json(&target));
+        self.link.run(
+            // After the elevated copy, the count is not known here.
+            move || link::with_approval::<replies::DeleteHistory>(Request::DeleteHistory { target }, &args, || Ok(0)),
+            |app, outcome| {
+                app.history_delete = None;
+                match outcome {
+                    link::Approval::Done(0) => app.notify("History updated", true),
+                    link::Approval::Done(n) => app.notify(format!("Deleted {n} entries from history"), true),
+                    link::Approval::Declined => app.notify("Not deleted: Windows' administrator prompt was declined", false),
+                    link::Approval::Failed(e) => app.notify(format!("Could not delete: {e}"), false),
+                }
+                app.refresh();
+            },
+        );
+    }
+
     /// The History query for what the page shows now.
     fn history_query(&self, before: Option<i64>, limit: u32) -> HistoryQuery {
         let (kinds, threats_only) = self.history.filter.query();
@@ -896,6 +982,7 @@ impl App {
                             app.history.rows = page.scans;
                         }
                         app.history.next = page.next;
+                        app.history.matching = page.matching;
                     }
                     Err(e) => app.notify(format!("Could not read history: {e}"), false),
                 }

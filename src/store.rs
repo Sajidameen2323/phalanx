@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS ScanErrors (
     Message  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ScanErrorsByScan ON ScanErrors(ScanId);
+-- Findings someone has looked at, and what they made of them.
+CREATE TABLE IF NOT EXISTS Reviews (
+    DetectionId  INTEGER PRIMARY KEY REFERENCES Detections(Id),
+    Verdict      TEXT NOT NULL,
+    Note         TEXT NOT NULL,
+    At           TEXT NOT NULL,
+    By           TEXT NOT NULL
+);
 -- What retention removed, per month, so the monthly totals stay true.
 CREATE TABLE IF NOT EXISTS PrunedTotals (
     Month         TEXT PRIMARY KEY,
@@ -128,6 +136,9 @@ pub struct DetectionRow {
     pub category: String,
     pub source: String,
     pub action: String,
+    /// What someone made of it, if anyone has looked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<Review>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +195,80 @@ fn like_escape(text: &str) -> String {
     text.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_")
 }
 
+/// Which scans a [`HistoryQuery`] matches, before paging: `?1` since, `?2`
+/// threats only, `?3` kinds (comma-separated), `?4` text (a `LIKE` pattern).
+/// Every filter is always there and switches itself off when its parameter
+/// is empty, so one statement serves every query.
+const HISTORY_FILTER: &str = r"(?1 IS NULL OR StartedAt >= ?1)
+    AND (?2 = 0 OR Detections > 0)
+    AND (?3 = '' OR instr(',' || ?3 || ',', ',' || Kind || ',') > 0)
+    AND (?4 IS NULL OR Targets LIKE ?4 ESCAPE '\' OR EXISTS (
+          SELECT 1 FROM Detections d WHERE d.ScanId = Scans.Id
+            AND (d.Path LIKE ?4 ESCAPE '\' OR d.Threat LIKE ?4 ESCAPE '\')))";
+
+/// [`HISTORY_FILTER`]'s parameters for `query`.
+fn filter_params(query: &HistoryQuery) -> (Option<String>, bool, String, Option<String>) {
+    let text = query.text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("%{}%", like_escape(t)));
+    (query.since.clone(), query.threats_only, query.kinds.join(","), text)
+}
+
+/// Removes the scans listed in `temp.Pruning`, with their findings, the
+/// findings' reviews and their errors; returns how many scans went.
+fn remove_marked(tx: &rusqlite::Transaction<'_>) -> Result<usize> {
+    tx.execute_batch(
+        "DELETE FROM Reviews WHERE DetectionId IN (SELECT Id FROM Detections WHERE ScanId IN (SELECT Id FROM temp.Pruning));
+         DELETE FROM Detections WHERE ScanId IN (SELECT Id FROM temp.Pruning);
+         DELETE FROM ScanErrors WHERE ScanId IN (SELECT Id FROM temp.Pruning);",
+    )?;
+    let removed = tx.execute("DELETE FROM Scans WHERE Id IN (SELECT Id FROM temp.Pruning)", [])?;
+    tx.execute("DELETE FROM temp.Pruning", [])?;
+    Ok(removed)
+}
+
+/// What someone made of a finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Looked at; real, or dealt with.
+    Reviewed,
+    /// Not a threat after all.
+    FalsePositive,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Reviewed => "reviewed",
+            Verdict::FalsePositive => "false_positive",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        if text == "false_positive" { Verdict::FalsePositive } else { Verdict::Reviewed }
+    }
+}
+
+/// A finding's review mark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    pub verdict: Verdict,
+    pub note: String,
+    /// When it was marked (RFC 3339).
+    pub at: String,
+    /// Who marked it, as the protection service saw them (`DOMAIN\user`).
+    pub by: String,
+}
+
+/// Which scans to delete from history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteTarget {
+    /// These scans.
+    Scans { ids: Vec<i64> },
+    /// Every scan the query matches, on any page.
+    Matching { query: HistoryQuery },
+}
+
 /// Real-time protection's routine checks: kept only [`Retention::clean_days`]
 /// when they found nothing.
 pub const CLEAN_KINDS: [&str; 2] = ["watch", "process"];
@@ -227,6 +312,9 @@ pub struct HistoryPage {
     /// Where the next page starts (its [`HistoryQuery::before`]); `None` on
     /// the last page.
     pub next: Option<i64>,
+    /// Scans the query matches on all pages together.
+    #[serde(default)]
+    pub matching: i64,
 }
 
 /// How long a connection waits for another to finish writing.
@@ -378,8 +466,9 @@ impl Store {
 
     pub fn scan_detections(&self, scan_id: i64) -> Result<Vec<DetectionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT Id, ScanId, DetectedAt, Path, Threat, Category, Source, Action
-             FROM Detections WHERE ScanId = ?1 ORDER BY Id",
+            "SELECT d.Id, d.ScanId, d.DetectedAt, d.Path, d.Threat, d.Category, d.Source, d.Action,
+                    r.Verdict, r.Note, r.At, r.By
+             FROM Detections d LEFT JOIN Reviews r ON r.DetectionId = d.Id WHERE d.ScanId = ?1 ORDER BY d.Id",
         )?;
         let rows = stmt.query_map([scan_id], detection_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -459,43 +548,72 @@ impl Store {
     /// where the next page starts.
     pub fn history(&self, query: &HistoryQuery) -> Result<HistoryPage> {
         let limit = query.limit.clamp(1, MAX_HISTORY_PAGE);
-        // Every filter is always in the statement and switches itself off
-        // when its parameter is empty, so one statement serves every query.
-        // Kinds go in as one comma-separated list.
-        let sql = format!(
-            r"SELECT {SCAN_ROW} FROM Scans
-              WHERE (?1 IS NULL OR Id < ?1)
-                AND (?2 IS NULL OR StartedAt >= ?2)
-                AND (?3 = 0 OR Detections > 0)
-                AND (?4 = '' OR instr(',' || ?4 || ',', ',' || Kind || ',') > 0)
-                AND (?5 IS NULL OR Targets LIKE ?5 ESCAPE '\' OR EXISTS (
-                      SELECT 1 FROM Detections d WHERE d.ScanId = Scans.Id
-                        AND (d.Path LIKE ?5 ESCAPE '\' OR d.Threat LIKE ?5 ESCAPE '\')))
-              ORDER BY Id DESC LIMIT ?6"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
-        let kinds = query.kinds.join(",");
-        let text = query.text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("%{}%", like_escape(t)));
+        let (since, threats, kinds, text) = filter_params(query);
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT {SCAN_ROW} FROM Scans WHERE (?5 IS NULL OR Id < ?5) AND {HISTORY_FILTER} ORDER BY Id DESC LIMIT ?6"))?;
         // One more than asked: whether there is a next page.
-        let rows = stmt.query_map(params![query.before, query.since, query.threats_only, kinds, text, limit + 1], scan_row)?;
+        let rows = stmt.query_map(params![since, threats, kinds, text, query.before, limit + 1], scan_row)?;
         let mut scans: Vec<ScanRow> = rows.collect::<rusqlite::Result<_>>()?;
         let next = (scans.len() > limit as usize).then(|| {
             scans.truncate(limit as usize);
             scans.last().map(|s| s.id)
         });
-        Ok(HistoryPage { scans, next: next.flatten() })
+        let mut count = self.conn.prepare_cached(&format!("SELECT COUNT(*) FROM Scans WHERE {HISTORY_FILTER}"))?;
+        let matching = count.query_row(params![since, threats, kinds, text], |r| r.get(0))?;
+        Ok(HistoryPage { scans, next: next.flatten(), matching })
+    }
+
+    /// Marks a finding as reviewed or a false positive, with a note, or
+    /// clears the mark with `None`; `by` is who did it. Returns the mark.
+    pub fn review(&self, detection: i64, mark: Option<(Verdict, &str)>, by: &str) -> Result<Option<Review>> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS (SELECT 1 FROM Detections WHERE Id = ?1)", [detection], |r| r.get(0))?;
+        if !exists {
+            anyhow::bail!("there is no finding {detection} in history");
+        }
+        let Some((verdict, note)) = mark else {
+            self.conn.execute("DELETE FROM Reviews WHERE DetectionId = ?1", [detection])?;
+            return Ok(None);
+        };
+        let review = Review { verdict, note: note.trim().to_string(), at: now(), by: by.to_string() };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO Reviews (DetectionId, Verdict, Note, At, By) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![detection, review.verdict.as_str(), review.note, review.at, review.by],
+        )?;
+        Ok(Some(review))
+    }
+
+    /// Deletes scans from history, with their findings, reviews and errors;
+    /// unlike [`Store::prune`], they leave the monthly totals too. Returns
+    /// how many went. Quarantine records stay.
+    pub fn delete_history(&self, target: &DeleteTarget) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS Pruning (Id INTEGER PRIMARY KEY); DELETE FROM temp.Pruning;")?;
+        match target {
+            DeleteTarget::Scans { ids } => {
+                let mut mark = tx.prepare("INSERT OR IGNORE INTO temp.Pruning SELECT Id FROM Scans WHERE Id = ?1")?;
+                for id in ids {
+                    mark.execute([id])?;
+                }
+            }
+            DeleteTarget::Matching { query } => {
+                let (since, threats, kinds, text) = filter_params(query);
+                tx.execute(&format!("INSERT INTO temp.Pruning SELECT Id FROM Scans WHERE {HISTORY_FILTER}"), params![since, threats, kinds, text])?;
+            }
+        }
+        let removed = remove_marked(&tx)?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn recent_detections(&self, limit: u32) -> Result<Vec<DetectionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT Id, ScanId, DetectedAt, Path, Threat, Category, Source, Action
-             FROM Detections ORDER BY Id DESC LIMIT ?1",
+            "SELECT d.Id, d.ScanId, d.DetectedAt, d.Path, d.Threat, d.Category, d.Source, d.Action,
+                    r.Verdict, r.Note, r.At, r.By
+             FROM Detections d LEFT JOIN Reviews r ON r.DetectionId = d.Id ORDER BY d.Id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], detection_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Per-month totals, newest first (the equivalent of a monthly report).
     /// Removes the history `retention` no longer keeps, as of `now`, and
     /// returns how many scans went. What it removes is first added to the
     /// monthly totals. Quarantine records are never removed: restoring a
@@ -518,12 +636,9 @@ impl Store {
              INSERT INTO PrunedTotals (Month, Detections)
                  SELECT substr(DetectedAt, 1, 7), COUNT(DISTINCT ScanId || char(0) || Path) FROM Detections
                  WHERE ScanId IN (SELECT Id FROM temp.Pruning) GROUP BY 1
-             ON CONFLICT(Month) DO UPDATE SET Detections = Detections + excluded.Detections;
-             DELETE FROM Detections WHERE ScanId IN (SELECT Id FROM temp.Pruning);
-             DELETE FROM ScanErrors WHERE ScanId IN (SELECT Id FROM temp.Pruning);",
+             ON CONFLICT(Month) DO UPDATE SET Detections = Detections + excluded.Detections;",
         )?;
-        let removed = tx.execute("DELETE FROM Scans WHERE Id IN (SELECT Id FROM temp.Pruning)", [])?;
-        tx.execute("DELETE FROM temp.Pruning", [])?;
+        let removed = remove_marked(&tx)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -641,6 +756,10 @@ fn detection_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DetectionRow> {
         category: r.get(5)?,
         source: r.get(6)?,
         action: r.get(7)?,
+        review: match r.get::<_, Option<String>>(8)? {
+            Some(verdict) => Some(Review { verdict: Verdict::parse(&verdict), note: r.get(9)?, at: r.get(10)?, by: r.get(11)? }),
+            None => None,
+        },
     })
 }
 
@@ -832,6 +951,66 @@ mod tests {
 
         // 0 keeps for good.
         assert_eq!(store.prune(Retention { history_days: 0, clean_days: 0 }, now + chrono::Duration::days(3650)).unwrap(), 0);
+    }
+
+    #[test]
+    fn findings_are_marked_changed_and_cleared() {
+        let (_tmp, store) = history_store(20);
+        let finding = store.scan_detections(10).unwrap()[0].id;
+        assert_eq!(store.scan_detections(10).unwrap()[0].review, None);
+
+        let marked = store.review(finding, Some((Verdict::FalsePositive, "  our build tool  ")), r"PC\me").unwrap().unwrap();
+        assert_eq!((marked.verdict, marked.note.as_str(), marked.by.as_str()), (Verdict::FalsePositive, "our build tool", r"PC\me"));
+        assert_eq!(store.scan_detections(10).unwrap()[0].review.as_ref(), Some(&marked));
+        assert_eq!(store.recent_detections(5).unwrap().iter().find(|d| d.id == finding).unwrap().review.as_ref(), Some(&marked));
+
+        // A new mark replaces the old one; `None` clears it.
+        store.review(finding, Some((Verdict::Reviewed, "")), r"PC\admin").unwrap();
+        assert_eq!(store.scan_detections(10).unwrap()[0].review.as_ref().map(|r| (r.verdict, r.by.as_str())), Some((Verdict::Reviewed, r"PC\admin")));
+        assert_eq!(store.review(finding, None, r"PC\me").unwrap(), None);
+        assert_eq!(store.scan_detections(10).unwrap()[0].review, None);
+
+        assert!(store.review(999_999, Some((Verdict::Reviewed, "")), "x").is_err(), "an unknown finding is refused");
+    }
+
+    #[test]
+    fn history_is_deleted_by_choice_or_by_filter() {
+        let (_tmp, store) = history_store(60);
+        store.add_quarantine(&QuarantineRow { id: "q1".into(), original_path: r"C:\x.exe".into(), quarantined_at: now(), sha256: String::new(), threat: "T".into(), size: 1, restored_at: None }).unwrap();
+        let reviewed = store.scan_detections(20).unwrap()[0].id;
+        store.review(reviewed, Some((Verdict::FalsePositive, "test")), "me").unwrap();
+        let page = store.history(&HistoryQuery { limit: 5, threats_only: true, ..Default::default() }).unwrap();
+        assert_eq!(page.matching, 6, "every page says how many match in all");
+
+        // Chosen scans, one of them reviewed; an id that is not there is ignored.
+        assert_eq!(store.delete_history(&DeleteTarget::Scans { ids: vec![20, 21, 999] }).unwrap(), 2);
+        assert!(store.scan_detections(20).unwrap().is_empty());
+        let orphans: i64 = store.conn.query_row("SELECT (SELECT COUNT(*) FROM Reviews) + (SELECT COUNT(*) FROM Detections WHERE ScanId NOT IN (SELECT Id FROM Scans))", [], |r| r.get(0)).unwrap();
+        assert_eq!(orphans, 0, "the review and findings went with the scan");
+
+        // Everything a filter matches, on every page.
+        let commands = HistoryQuery { kinds: vec!["command".into()], ..Default::default() };
+        let before = store.history(&HistoryQuery { limit: 1, ..commands.clone() }).unwrap().matching;
+        assert_eq!(store.delete_history(&DeleteTarget::Matching { query: commands.clone() }).unwrap() as i64, before);
+        assert_eq!(store.history(&HistoryQuery { limit: 1, ..commands }).unwrap().matching, 0);
+        let (left, _) = store.extent().unwrap();
+        assert_eq!(left, 60 - 2 - before);
+
+        // Deleted scans leave the monthly totals too; quarantine stays.
+        assert_eq!(store.monthly_summary().unwrap()[0].scans, left);
+        assert_eq!(store.quarantine_items(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pruning_takes_reviews_with_their_findings() {
+        let (_tmp, store) = history_store(20);
+        let finding = store.scan_detections(10).unwrap()[0].id;
+        store.review(finding, Some((Verdict::Reviewed, "")), "me").unwrap();
+        // As of two days from now, a 1-day retention removes everything.
+        let removed = store.prune(Retention { history_days: 1, clean_days: 1 }, chrono::Local::now() + chrono::Duration::days(2)).unwrap();
+        assert_eq!(removed, 20);
+        let reviews: i64 = store.conn.query_row("SELECT COUNT(*) FROM Reviews", [], |r| r.get(0)).unwrap();
+        assert_eq!(reviews, 0);
     }
 
     #[test]

@@ -131,4 +131,42 @@ round-trip test.
     nothing; compacted, **1.0 MB**, against the plan's 50 MB);
     `upkeep_prunes_once_a_day_and_compacts_once_a_month`; the settings test
     covers both shortenings and that lengthening asks nothing.
-- **Next:** milestone 4, review and delete.
+- **Milestone 4: built (2026-10-28); the page's new controls and the app's
+  elevated delete not yet tried by hand.**
+  - Reviews: a `Reviews` table, one row per finding (verdict `reviewed` or
+    `false_positive`, note, when, by whom); `DetectionRow::review` (from
+    `scan_detections` and `recent_detections`). `Store::review` marks,
+    replaces or (with `None`) clears, and refuses an unknown finding.
+    `Request::ReviewFinding` (anyone: a label changes no protection) records
+    `by` as the caller the pipe identified, never a name the client sends.
+  - Delete: `Store::delete_history(DeleteTarget)`, either chosen scans or
+    everything a `HistoryQuery` matches on every page; the scans go with their
+    findings, reviews and errors, and (unlike retention) leave the monthly
+    totals; quarantine stays. `Request::DeleteHistory` is administrators
+    only. `remove_marked` is shared with `prune`, which now also removes
+    reviews with their findings (the foreign key would refuse otherwise).
+  - `HistoryPage::matching` counts every scan the query matches; the
+    filter is one `HISTORY_FILTER` string shared by paging, counting and
+    deleting.
+  - CLI: `service history --findings` lists findings with their numbers and
+    marks; `service review N --false-positive|--reviewed|--clear --note`;
+    `service delete-history --scan N…` or `--all-matching` with history's
+    filters, and a hidden `--json` (hex) the app uses, so search text is
+    never misread on the elevated command line.
+  - App: each finding in Show details has **Mark reviewed**, **Not a
+    threat** (a note, then Save) and **Clear mark**, and shows its mark
+    (NOT A THREAT / REVIEWED, note, who, when). Each entry has **Delete…**;
+    above the list, "N entries" and **Delete these…** for everything the
+    current filter matches. Both ask first (a dialog naming what goes), then
+    Windows' prompt.
+  - Tests: `findings_are_marked_changed_and_cleared`,
+    `history_is_deleted_by_choice_or_by_filter`,
+    `pruning_takes_reviews_with_their_findings`; the contract test marks a
+    finding and checks the reviewer is the caller, and deletes by filter and
+    by choice (now 30 requests); deleting is administrators only and marking
+    is not (`weakening_needs_an_administrator`).
+  - Tried through a console service: findings listed, marked (as
+    `DESKTOP-8Q8S8UH\Sajid`), shown, cleared; a normal user's delete refused
+    for approval. The refusal says "this weakens protection", the generic
+    approval text.
+- **Next:** milestone 5, export.

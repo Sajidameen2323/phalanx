@@ -159,6 +159,45 @@ enum ServiceCommand {
         /// Start below this scan number (shown at the end of a full page).
         #[arg(long)]
         before: Option<i64>,
+        /// Also list each scan's findings, with the numbers `service review` takes.
+        #[arg(long)]
+        findings: bool,
+    },
+    /// Mark a finding as reviewed or a false positive, or clear its mark.
+    /// Its number is in `service history --findings`.
+    Review {
+        finding: i64,
+        #[arg(long, conflicts_with_all = ["reviewed", "clear"])]
+        false_positive: bool,
+        /// The default.
+        #[arg(long, conflicts_with = "clear")]
+        reviewed: bool,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Delete scans from history (administrator): the ones given, or every
+    /// scan the filters match (as `service history` takes them). Quarantine
+    /// is not touched.
+    DeleteHistory {
+        #[arg(long = "scan")]
+        scans: Vec<i64>,
+        /// Every scan the filters below match, on every page.
+        #[arg(long)]
+        all_matching: bool,
+        #[arg(long)]
+        search: Option<String>,
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        #[arg(long)]
+        threats_only: bool,
+        #[arg(long)]
+        days: Option<u32>,
+        /// What to delete as the app passes it (JSON, hex-encoded), so no
+        /// search text is misread on the command line.
+        #[arg(long, hide = true)]
+        json: Option<String>,
     },
     /// The protection settings, as the service keeps them (JSON).
     Settings,
@@ -1098,27 +1137,50 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             println!("    other:      {} file(s) (web lists, DNS backup, signatures)", done.copied);
             println!("The old folder was left as it was.");
         }
-        ServiceCommand::History { limit, search, kinds, threats_only, days, before } => {
+        ServiceCommand::History { limit, search, kinds, threats_only, days, before, findings } => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
-            let since = days.map(|d| (chrono::Local::now() - chrono::Duration::days(d.into())).to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
-            let query = threat_scanner::store::HistoryQuery {
-                before: *before,
-                limit: *limit,
-                kinds: kinds.clone(),
-                threats_only: *threats_only,
-                text: search.clone(),
-                since,
-            };
+            let query = threat_scanner::store::HistoryQuery { before: *before, limit: *limit, ..history_filter(search, kinds, *threats_only, *days) };
             let page: ipc::replies::History = client.call(ipc::Request::History { query })?.into_result()?;
             if page.scans.is_empty() {
                 println!("No scans match.");
             }
             for s in &page.scans {
                 println!("#{:<5} {:<8} {}  {} file(s), {} detection(s)  {}", s.id, s.kind, s.started_at, s.files_scanned, s.detections, s.targets);
+                if *findings && s.detections > 0 {
+                    let details: ipc::replies::ScanDetails = client.call(ipc::Request::ScanDetails { scan: s.id })?.into_result()?;
+                    for d in details.detections {
+                        let mark = d.review.map(|r| format!("  [{}{}]", r.verdict.as_str().replace('_', " "), if r.note.is_empty() { String::new() } else { format!(": {}", r.note) })).unwrap_or_default();
+                        println!("        finding {}  {}  {}{mark}", d.id, d.threat, d.path);
+                    }
+                }
             }
             if let Some(next) = page.next {
-                println!("More: add --before {next}");
+                println!("{} of {} shown. More: add --before {next}", page.scans.len(), page.matching);
             }
+        }
+        ServiceCommand::Review { finding, false_positive, reviewed: _, clear, note } => {
+            use threat_scanner::store::Verdict;
+            let verdict = match (*clear, *false_positive) {
+                (true, _) => None,
+                (false, true) => Some(Verdict::FalsePositive),
+                (false, false) => Some(Verdict::Reviewed),
+            };
+            let mark: ipc::replies::ReviewFinding = connect()?.call(ipc::Request::ReviewFinding { detection: *finding, verdict, note: note.clone() })?.into_result()?;
+            match mark {
+                Some(m) => println!("Finding {finding} is marked {} by {}.", m.verdict.as_str().replace('_', " "), m.by),
+                None => println!("Finding {finding} is no longer marked."),
+            }
+        }
+        ServiceCommand::DeleteHistory { scans, all_matching, search, kinds, threats_only, days, json } => {
+            use threat_scanner::store::DeleteTarget;
+            let target = match (json, scans.is_empty(), *all_matching) {
+                (Some(json), _, _) => serde_json::from_slice(&hex::decode(json.trim())?)?,
+                (None, false, false) => DeleteTarget::Scans { ids: scans.clone() },
+                (None, true, true) => DeleteTarget::Matching { query: history_filter(search, kinds, *threats_only, *days) },
+                _ => anyhow::bail!("give --scan N (one or more), or --all-matching with filters"),
+            };
+            let deleted: ipc::replies::DeleteHistory = approved(connect()?.call(ipc::Request::DeleteHistory { target })?)?;
+            println!("Deleted {deleted} scan(s) from history.");
         }
         ServiceCommand::Scan { paths, kind } => {
             let connect = || ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)));
@@ -1299,6 +1361,12 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
 
 /// The result of a reply, or that it needs an administrator.
 #[cfg(windows)]
+/// The filters `service history` and `service delete-history` share.
+fn history_filter(search: &Option<String>, kinds: &[String], threats_only: bool, days: Option<u32>) -> threat_scanner::store::HistoryQuery {
+    let since = days.map(|d| (chrono::Local::now() - chrono::Duration::days(d.into())).to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+    threat_scanner::store::HistoryQuery { kinds: kinds.to_vec(), threats_only, text: search.clone(), since, ..Default::default() }
+}
+
 fn approved<T: serde::de::DeserializeOwned>(reply: threat_scanner::ipc::Reply) -> Result<T> {
     if reply.needs_approval {
         anyhow::bail!("{}: run this from a terminal opened as administrator", reply.error.unwrap_or_default());

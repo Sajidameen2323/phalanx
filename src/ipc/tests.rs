@@ -33,6 +33,10 @@ fn every_request_reads_back_as_sent() {
             },
         },
         Request::HistoryInfo,
+        Request::ReviewFinding { detection: 7, verdict: Some(crate::store::Verdict::FalsePositive), note: "our tool".into() },
+        Request::ReviewFinding { detection: 7, verdict: None, note: String::new() },
+        Request::DeleteHistory { target: crate::store::DeleteTarget::Scans { ids: vec![1, 2] } },
+        Request::DeleteHistory { target: crate::store::DeleteTarget::Matching { query: crate::store::HistoryQuery { threats_only: true, ..Default::default() } } },
         Request::ScanDetails { scan: 3 },
         Request::RecentDetections { limit: 20 },
         Request::MonthlySummary,
@@ -86,6 +90,10 @@ fn weakening_needs_an_administrator() {
     assert!(user.may(&Request::Status) && user.may(&Request::Ping));
     assert!(!user.may(&Request::Stop));
     assert!(admin.may(&Request::Stop));
+    // Deleting history removes evidence; marking a finding changes nothing.
+    let delete = Request::DeleteHistory { target: crate::store::DeleteTarget::Scans { ids: vec![1] } };
+    assert!(!user.may(&delete) && admin.may(&delete));
+    assert!(user.may(&Request::ReviewFinding { detection: 1, verdict: Some(crate::store::Verdict::FalsePositive), note: String::new() }));
 }
 
 #[cfg(windows)]

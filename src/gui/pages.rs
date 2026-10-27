@@ -70,6 +70,7 @@ impl App {
         // Popups float over whichever page asked for them.
         self.fix_dialog(ctx);
         self.dns_dialog(ctx);
+        self.history_delete_dialog(ctx);
 
         // An appearance change eases over from the old background instead of cutting.
         if let Some((previous, since)) = self.theme_fade {
@@ -898,8 +899,24 @@ impl App {
                 "Nothing matches."
             };
             card(ui, |ui| muted(ui, text));
+        } else {
+            let unfiltered = self.history.filter == HistoryFilter::All && self.history.since == HistorySince::Any && self.history.search.trim().is_empty();
+            let matching = self.history.matching;
+            ui.horizontal_wrapped(|ui| {
+                small(ui, if matching == 1 { "1 entry".to_string() } else { format!("{matching} entries") });
+                if small_button(ui, "Delete these…").clicked() {
+                    let (kinds, threats_only) = self.history.filter.query();
+                    let text = Some(self.history.search.trim().to_string()).filter(|t| !t.is_empty());
+                    let query = HistoryQuery { kinds, threats_only, text, since: self.history.since.start(), ..Default::default() };
+                    let what = if unfiltered { format!("all {matching} entries") } else { format!("the {matching} entries that match this filter") };
+                    self.history_delete = Some(HistoryDelete { target: DeleteTarget::Matching { query }, what, running: false });
+                }
+            });
+            ui.add_space(6.0);
         }
         let mut toggle = None;
+        let mut delete_one = None;
+        let mut review = None;
         for s in &scans {
             let expanded = self.expanded.get(&s.id);
             card(ui, |ui| {
@@ -938,13 +955,17 @@ impl App {
                     );
                 }
                 truncated(ui, s.targets.clone(), theme().muted, 12.5);
-                let has_details = s.detections > 0 || s.errors > 0;
-                if has_details {
-                    let label = if expanded.is_some() { "Hide details" } else { "Show details" };
-                    if small_button(ui, label).clicked() {
-                        toggle = Some(s.id);
+                ui.horizontal(|ui| {
+                    if s.detections > 0 || s.errors > 0 {
+                        let label = if expanded.is_some() { "Hide details" } else { "Show details" };
+                        if small_button(ui, label).clicked() {
+                            toggle = Some(s.id);
+                        }
                     }
-                }
+                    if small_button(ui, "Delete…").clicked() {
+                        delete_one = Some(s.id);
+                    }
+                });
                 if let Some(details) = expanded {
                     ui.add_space(4.0);
                     for d in &details.detections {
@@ -954,6 +975,45 @@ impl App {
                         });
                         path_lines(ui, &d.path);
                         small(ui, format!("Action: {}", d.action));
+                        if let Some(r) = &d.review {
+                            ui.horizontal_wrapped(|ui| {
+                                let (label, color) = match r.verdict {
+                                    Verdict::FalsePositive => ("NOT A THREAT", theme().green),
+                                    Verdict::Reviewed => ("REVIEWED", theme().accent),
+                                };
+                                badge(ui, label, color);
+                                let note = if r.note.is_empty() { String::new() } else { format!("{} · ", r.note) };
+                                small(ui, format!("{note}{} · {}", r.by, short_time(&r.at)));
+                            });
+                        }
+                        match &mut self.review_edit {
+                            Some(edit) if edit.detection == d.id => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut edit.note).hint_text("Note (optional)").desired_width(300.0));
+                                    let save = if edit.verdict == Verdict::FalsePositive { "Save as not a threat" } else { "Save as reviewed" };
+                                    if small_button(ui, save).clicked() {
+                                        review = Some(ReviewStep::Save);
+                                    }
+                                    if small_button(ui, "Cancel").clicked() {
+                                        review = Some(ReviewStep::Cancel);
+                                    }
+                                });
+                            }
+                            _ => {
+                                ui.horizontal_wrapped(|ui| {
+                                    let note = d.review.as_ref().map(|r| r.note.clone()).unwrap_or_default();
+                                    for (verdict, label) in [(Verdict::Reviewed, "Mark reviewed"), (Verdict::FalsePositive, "Not a threat")] {
+                                        if small_button(ui, label).clicked() {
+                                            review = Some(ReviewStep::Start(ReviewEdit { scan: s.id, detection: d.id, verdict, note: note.clone() }));
+                                        }
+                                    }
+                                    if d.review.is_some() && small_button(ui, "Clear mark").clicked() {
+                                        review = Some(ReviewStep::Clear { scan: s.id, detection: d.id });
+                                    }
+                                });
+                            }
+                        }
+                        ui.add_space(4.0);
                     }
                     if !details.errors.is_empty() {
                         ui.add_space(4.0);
@@ -978,6 +1038,23 @@ impl App {
                 small(ui, format!("{} shown", scans.len()));
             });
             ui.add_space(8.0);
+        }
+        if let Some(id) = delete_one {
+            self.history_delete = Some(HistoryDelete { target: DeleteTarget::Scans { ids: vec![id] }, what: format!("entry #{id}"), running: false });
+        }
+        match review {
+            Some(ReviewStep::Start(edit)) => self.review_edit = Some(edit),
+            Some(ReviewStep::Save) => {
+                if let Some(edit) = self.review_edit.take() {
+                    self.save_review(edit.scan, edit.detection, Some(edit.verdict), edit.note);
+                }
+            }
+            Some(ReviewStep::Cancel) => self.review_edit = None,
+            Some(ReviewStep::Clear { scan, detection }) => {
+                self.review_edit = None;
+                self.save_review(scan, detection, None, String::new());
+            }
+            None => {}
         }
         if let Some(id) = toggle && self.expanded.remove(&id).is_none() {
             self.link.run(

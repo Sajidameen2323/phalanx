@@ -144,6 +144,13 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             )
         }
         Request::HistoryInfo => reply::<replies::HistoryInfo>(id, history::info(dir)),
+        Request::ReviewFinding { detection, verdict, note } => reply::<replies::ReviewFinding>(
+            id,
+            session.store(dir).and_then(|s| s.review(detection, verdict.map(|v| (v, note.as_str())), &caller.user)),
+        ),
+        Request::DeleteHistory { target } => {
+            reply::<replies::DeleteHistory>(id, session.store(dir).and_then(|s| s.delete_history(&target)).map(|n| n as u64))
+        }
         Request::History { query } => reply::<replies::History>(id, session.store(dir).and_then(|s| s.history(&query))),
         Request::RecentScans { limit, kind } => reply::<replies::RecentScans>(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
         Request::ScanDetails { scan } => reply::<replies::ScanDetails>(
@@ -469,7 +476,7 @@ mod tests {
 
     /// Every kind of request there is. A new one fails the contract test
     /// until it is sent there (and given a type in [`replies`]).
-    const REQUEST_KINDS: usize = 28;
+    const REQUEST_KINDS: usize = 30;
 
     /// Reads `reply` as its request's type in [`replies`], as clients do.
     /// The match has no catch-all, so a new request does not compile
@@ -487,6 +494,8 @@ mod tests {
             Request::RecentScans { .. } => read::<replies::RecentScans>(reply),
             Request::History { .. } => read::<replies::History>(reply),
             Request::HistoryInfo => read::<replies::HistoryInfo>(reply),
+            Request::ReviewFinding { .. } => read::<replies::ReviewFinding>(reply),
+            Request::DeleteHistory { .. } => read::<replies::DeleteHistory>(reply),
             Request::ScanDetails { .. } => read::<replies::ScanDetails>(reply),
             Request::RecentDetections { .. } => read::<replies::RecentDetections>(reply),
             Request::MonthlySummary => read::<replies::MonthlySummary>(reply),
@@ -648,6 +657,15 @@ events:
         assert_eq!(page.scans.iter().map(|s| s.id).collect::<Vec<_>>(), vec![scan], "{page:?}");
         let details: replies::ScanDetails = read(service.ask(Request::ScanDetails { scan }));
         assert_eq!(details.detections.len(), 1, "{details:?}");
+        let finding = details.detections[0].id;
+        let mark: replies::ReviewFinding = read(service.ask(Request::ReviewFinding {
+            detection: finding,
+            verdict: Some(crate::store::Verdict::FalsePositive),
+            note: "a test file".into(),
+        }));
+        assert_eq!(mark.map(|m| m.by), Some(r"TEST\admin".to_string()), "who marked it is the caller, not the client's say");
+        let again: replies::ScanDetails = read(service.ask(Request::ScanDetails { scan }));
+        assert_eq!(again.detections[0].review.as_ref().map(|r| r.note.as_str()), Some("a test file"));
         service.ask(Request::RecentDetections { limit: 10 });
         let info: replies::HistoryInfo = read(service.ask(Request::HistoryInfo));
         assert!(info.scans >= 1 && info.bytes > 0, "{info:?}");
@@ -664,6 +682,16 @@ events:
         std::fs::write(&other, "flagged by AI Inspect").unwrap();
         let id: replies::QuarantineFile = read(service.ask(Request::QuarantineFile { path: other.clone(), threat: "Test.Contract".into() }));
         service.ask(Request::DeleteQuarantined { item: id });
+
+        // Deleting: nothing matches here, then the cancelled scan, if it left one.
+        let none = crate::store::HistoryQuery { text: Some("nothing has this name".into()), ..Default::default() };
+        let deleted: replies::DeleteHistory = read(service.ask(Request::DeleteHistory { target: crate::store::DeleteTarget::Matching { query: none } }));
+        assert_eq!(deleted, 0);
+        let cancelled = crate::store::HistoryQuery { kinds: vec!["custom".into()], ..Default::default() };
+        let all: replies::History = read(service.ask(Request::History { query: crate::store::HistoryQuery { limit: 10, ..cancelled } }));
+        let others: Vec<i64> = all.scans.iter().map(|s| s.id).filter(|id| *id != scan).collect();
+        let deleted: replies::DeleteHistory = read(service.ask(Request::DeleteHistory { target: crate::store::DeleteTarget::Scans { ids: others.clone() } }));
+        assert_eq!(deleted, others.len() as u64);
 
         // A 0.4 user's folder brought over (protection stays off there too).
         let old = tmp.path().join("old-user");

@@ -19,7 +19,7 @@ use crate::risk::{DownloadOrigin, RiskyFile};
 use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
-use crate::store::{DetectionRow, HistoryQuery, ScanErrorRow};
+use crate::store::{DeleteTarget, DetectionRow, HistoryQuery, ScanErrorRow, Verdict};
 use crate::service::web::WebStatus;
 use crate::web::events::WebEvent;
 use crate::web::{SiteChange, WebConfig};
@@ -70,6 +70,16 @@ pub enum Request {
     /// The history database's size, what it holds, and when it was last
     /// pruned and compacted.
     HistoryInfo,
+    /// Mark a finding as reviewed or a false positive, with a note; `None`
+    /// clears the mark. The service records who asked.
+    ReviewFinding {
+        detection: i64,
+        verdict: Option<Verdict>,
+        #[serde(default)]
+        note: String,
+    },
+    /// Delete scans from history (administrators only: it removes evidence).
+    DeleteHistory { target: DeleteTarget },
     /// A scan's detections and errors. (Fields are not called `id`: that is
     /// the message's own.)
     ScanDetails { scan: i64 },
@@ -227,6 +237,7 @@ impl Request {
             | Request::RecentScans { .. }
             | Request::History { .. }
             | Request::HistoryInfo
+            | Request::ReviewFinding { .. }
             | Request::ScanDetails { .. }
             | Request::RecentDetections { .. }
             | Request::MonthlySummary
@@ -247,7 +258,8 @@ impl Request {
             | Request::Migrate { .. }
             | Request::RunBoxView
             | Request::SetAuthKey { .. }
-            | Request::QuarantineFile { .. } => {
+            | Request::QuarantineFile { .. }
+            | Request::DeleteHistory { .. } => {
                 Allowed::Administrator
             }
         }
@@ -374,6 +386,10 @@ pub mod replies {
     pub type RecentScans = Vec<ScanRow>;
     pub type History = HistoryPage;
     pub type HistoryInfo = crate::service::history::HistoryInfo;
+    /// The finding's mark now.
+    pub type ReviewFinding = Option<crate::store::Review>;
+    /// Scans deleted.
+    pub type DeleteHistory = u64;
     pub type ScanDetails = super::ScanDetails;
     pub type RecentDetections = Vec<DetectionRow>;
     pub type MonthlySummary = Vec<MonthRow>;
