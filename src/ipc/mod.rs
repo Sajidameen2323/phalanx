@@ -67,6 +67,9 @@ pub enum Request {
     /// A page of history, newest first, filtered and searched as `query`
     /// says; the reply says where the next page starts.
     History { query: HistoryQuery },
+    /// The history database's size, what it holds, and when it was last
+    /// pruned and compacted.
+    HistoryInfo,
     /// A scan's detections and errors. (Fields are not called `id`: that is
     /// the message's own.)
     ScanDetails { scan: i64 },
@@ -223,6 +226,7 @@ impl Request {
             | Request::SetSettings { .. }
             | Request::RecentScans { .. }
             | Request::History { .. }
+            | Request::HistoryInfo
             | Request::ScanDetails { .. }
             | Request::RecentDetections { .. }
             | Request::MonthlySummary
@@ -369,6 +373,7 @@ pub mod replies {
     pub type SetSettings = settings::ProtectionSettings;
     pub type RecentScans = Vec<ScanRow>;
     pub type History = HistoryPage;
+    pub type HistoryInfo = crate::service::history::HistoryInfo;
     pub type ScanDetails = super::ScanDetails;
     pub type RecentDetections = Vec<DetectionRow>;
     pub type MonthlySummary = Vec<MonthRow>;

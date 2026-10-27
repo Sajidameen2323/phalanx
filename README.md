@@ -190,7 +190,11 @@ The app has these pages:
   its detections and errors. Search by file, folder or threat name; filter by
   threats found, manual scans, real-time protection, suspicious commands or DLL
   side-loading, and by the last day, week or month. Pages of 50 load as you ask
-  for more.
+  for more. History is kept a year, and real-time checks that found nothing for
+  30 days (Settings > General > History; keeping less needs an administrator).
+  The service removes what is older once a day, adding it to the monthly totals
+  first, and compacts the database monthly; a year of heavy use takes about
+  1 MB. Quarantine records are never removed.
 * **Settings**, in tabs: **General** (startup, tray, notifications, data folder),
   **Scanning** (performance, detection, quarantine), **Exclusions**, **Signatures**
   and **AI inspection**.

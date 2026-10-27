@@ -32,6 +32,7 @@ fn every_request_reads_back_as_sent() {
                 since: Some("2026-10-01T00:00:00+05:30".into()),
             },
         },
+        Request::HistoryInfo,
         Request::ScanDetails { scan: 3 },
         Request::RecentDetections { limit: 20 },
         Request::MonthlySummary,

@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS ScanErrors (
     Message  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ScanErrorsByScan ON ScanErrors(ScanId);
+-- What retention removed, per month, so the monthly totals stay true.
+CREATE TABLE IF NOT EXISTS PrunedTotals (
+    Month         TEXT PRIMARY KEY,
+    Scans         INTEGER NOT NULL DEFAULT 0,
+    FilesScanned  INTEGER NOT NULL DEFAULT 0,
+    Detections    INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// Columns added after the first release; added to existing databases on open.
@@ -175,6 +182,19 @@ fn scan_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRow> {
 /// only themselves.
 fn like_escape(text: &str) -> String {
     text.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_")
+}
+
+/// Real-time protection's routine checks: kept only [`Retention::clean_days`]
+/// when they found nothing.
+pub const CLEAN_KINDS: [&str; 2] = ["watch", "process"];
+
+/// How long history is kept, in days; 0 keeps it for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// Everything: findings, manual scans, commands, side-loading.
+    pub history_days: u32,
+    /// Real-time checks of new files and programs that found nothing.
+    pub clean_days: u32,
 }
 
 /// Most scans one page of history holds.
@@ -476,18 +496,75 @@ impl Store {
     }
 
     /// Per-month totals, newest first (the equivalent of a monthly report).
+    /// Removes the history `retention` no longer keeps, as of `now`, and
+    /// returns how many scans went. What it removes is first added to the
+    /// monthly totals. Quarantine records are never removed: restoring a
+    /// file needs them.
+    pub fn prune(&self, retention: Retention, now: chrono::DateTime<chrono::Local>) -> Result<usize> {
+        let cutoff = |days: u32| (days > 0).then(|| (now - chrono::Duration::days(days.into())).to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS Pruning (Id INTEGER PRIMARY KEY); DELETE FROM temp.Pruning;")?;
+        tx.execute(
+            "INSERT INTO temp.Pruning SELECT Id FROM Scans
+             WHERE (?1 IS NOT NULL AND StartedAt < ?1)
+                OR (?2 IS NOT NULL AND StartedAt < ?2 AND Detections = 0 AND instr(',' || ?3 || ',', ',' || Kind || ',') > 0)",
+            params![cutoff(retention.history_days), cutoff(retention.clean_days), CLEAN_KINDS.join(",")],
+        )?;
+        tx.execute_batch(
+            "INSERT INTO PrunedTotals (Month, Scans, FilesScanned)
+                 SELECT substr(StartedAt, 1, 7), COUNT(*), SUM(FilesScanned) FROM Scans
+                 WHERE Id IN (SELECT Id FROM temp.Pruning) GROUP BY 1
+             ON CONFLICT(Month) DO UPDATE SET Scans = Scans + excluded.Scans, FilesScanned = FilesScanned + excluded.FilesScanned;
+             INSERT INTO PrunedTotals (Month, Detections)
+                 SELECT substr(DetectedAt, 1, 7), COUNT(DISTINCT ScanId || char(0) || Path) FROM Detections
+                 WHERE ScanId IN (SELECT Id FROM temp.Pruning) GROUP BY 1
+             ON CONFLICT(Month) DO UPDATE SET Detections = Detections + excluded.Detections;
+             DELETE FROM Detections WHERE ScanId IN (SELECT Id FROM temp.Pruning);
+             DELETE FROM ScanErrors WHERE ScanId IN (SELECT Id FROM temp.Pruning);",
+        )?;
+        let removed = tx.execute("DELETE FROM Scans WHERE Id IN (SELECT Id FROM temp.Pruning)", [])?;
+        tx.execute("DELETE FROM temp.Pruning", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Gives the space of removed history back to Windows. It rewrites the
+    /// whole file, so it runs rarely; it fails (and can be tried later)
+    /// while another connection is writing.
+    pub fn compact(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    /// Backdates a scan, for tests of what retention removes.
+    #[cfg(test)]
+    pub(crate) fn set_started_at_for_test(&self, scan: i64, started_at: &str) -> Result<()> {
+        self.conn.execute("UPDATE Scans SET StartedAt = ?2 WHERE Id = ?1", params![scan, started_at])?;
+        Ok(())
+    }
+
+    /// How many scans history holds, and when the oldest started.
+    pub fn extent(&self) -> Result<(i64, Option<String>)> {
+        Ok(self.conn.query_row("SELECT COUNT(*), MIN(StartedAt) FROM Scans", [], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+
+    /// Totals per month, newest first, including what retention removed.
     pub fn monthly_summary(&self) -> Result<Vec<MonthRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.Month,
-                    (SELECT COUNT(*) FROM Scans s WHERE substr(s.StartedAt, 1, 7) = m.Month),
+                    (SELECT COUNT(*) FROM Scans s WHERE substr(s.StartedAt, 1, 7) = m.Month)
+                        + COALESCE((SELECT Scans FROM PrunedTotals p WHERE p.Month = m.Month), 0),
                     (SELECT COALESCE(SUM(FilesScanned), 0) FROM Scans s
-                         WHERE substr(s.StartedAt, 1, 7) = m.Month),
+                         WHERE substr(s.StartedAt, 1, 7) = m.Month)
+                        + COALESCE((SELECT FilesScanned FROM PrunedTotals p WHERE p.Month = m.Month), 0),
                     (SELECT COUNT(DISTINCT ScanId || char(0) || Path) FROM Detections d
-                         WHERE substr(d.DetectedAt, 1, 7) = m.Month),
+                         WHERE substr(d.DetectedAt, 1, 7) = m.Month)
+                        + COALESCE((SELECT Detections FROM PrunedTotals p WHERE p.Month = m.Month), 0),
                     (SELECT COUNT(*) FROM Quarantine q
                          WHERE substr(q.QuarantinedAt, 1, 7) = m.Month)
              FROM (SELECT substr(StartedAt, 1, 7) AS Month FROM Scans
-                   UNION SELECT substr(QuarantinedAt, 1, 7) FROM Quarantine) m
+                   UNION SELECT substr(QuarantinedAt, 1, 7) FROM Quarantine
+                   UNION SELECT Month FROM PrunedTotals) m
              ORDER BY m.Month DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -678,6 +755,83 @@ mod tests {
                 assert!(took < std::time::Duration::from_millis(200), "{name} took {took:?}");
             }
         }
+    }
+
+    /// `days` of heavy use ending at `now`: each day, 200 real-time checks
+    /// that found nothing, one that found a threat, a manual scan and a
+    /// suspicious command; one file quarantined, from the first day.
+    fn busy_history(store: &Store, days: i64, now: chrono::DateTime<chrono::Local>) {
+        store.conn.execute_batch("BEGIN").unwrap();
+        let mut insert = store
+            .conn
+            .prepare("INSERT INTO Scans (StartedAt, FinishedAt, Targets, Kind, FilesScanned, Detections) VALUES (?1, ?1, ?2, ?3, ?4, ?5)")
+            .unwrap();
+        let mut finding = store
+            .conn
+            .prepare("INSERT INTO Detections (ScanId, DetectedAt, Path, Sha256, Threat, Category, Source, Details, Action) VALUES (?1, ?2, ?3, '', 'Trojan.Test', 'malware', 'yara', '', 'reported')")
+            .unwrap();
+        for day in 0..days {
+            let at = (now - chrono::Duration::days(day) - chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+            for i in 0..200 {
+                insert.execute(params![at, format!(r"C:\Users\me\Downloads\file-{day}-{i}.pdf"), if i % 2 == 0 { "watch" } else { "process" }, 1, 0]).unwrap();
+            }
+            for (kind, files, found) in [("watch", 1, 1), ("quick", 5000, 0), ("command", 0, 1)] {
+                insert.execute(params![at, format!(r"C:\Users\me\Downloads\day-{day}"), kind, files, found]).unwrap();
+                if found > 0 {
+                    finding.execute(params![store.conn.last_insert_rowid(), at, format!(r"C:\Users\me\Downloads\bad-{day}-{kind}.exe")]).unwrap();
+                }
+            }
+        }
+        drop((insert, finding));
+        let first_day = (now - chrono::Duration::days(days - 1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        store
+            .add_quarantine(&QuarantineRow { id: "q1".into(), original_path: r"C:\x.exe".into(), quarantined_at: first_day, sha256: String::new(), threat: "Trojan.Test".into(), size: 1, restored_at: None })
+            .unwrap();
+        store.conn.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn retention_keeps_what_it_should_and_the_monthly_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.sqlite");
+        let store = Store::open(&path).unwrap();
+        let now = chrono::Local::now();
+        busy_history(&store, 410, now);
+        let months_before = store.monthly_summary().unwrap();
+        let (scans_before, _) = store.extent().unwrap();
+        assert_eq!(scans_before, 410 * 203);
+
+        let removed = store.prune(Retention { history_days: 365, clean_days: 30 }, now).unwrap();
+        let (scans_after, oldest) = store.extent().unwrap();
+        assert_eq!(removed as i64, scans_before - scans_after);
+        // Kept: 30 days of everything, and 365 days of all but the clean
+        // real-time checks.
+        assert_eq!(scans_after, 30 * 203 + (365 - 30) * 3, "{scans_after}");
+        let cutoff = (now - chrono::Duration::days(365)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        assert!(oldest.as_deref().is_some_and(|o| o >= cutoff.as_str()), "{oldest:?}");
+        let clean_old: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM Scans WHERE Detections = 0 AND Kind IN ('watch', 'process') AND StartedAt < ?1", [(now - chrono::Duration::days(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false)], |r| r.get(0))
+            .unwrap();
+        assert_eq!(clean_old, 0);
+        let orphans: i64 = store.conn.query_row("SELECT COUNT(*) FROM Detections WHERE ScanId NOT IN (SELECT Id FROM Scans)", [], |r| r.get(0)).unwrap();
+        assert_eq!(orphans, 0);
+
+        // Every month adds up to what it did, and quarantine is untouched.
+        assert_eq!(format!("{:?}", store.monthly_summary().unwrap()), format!("{months_before:?}"));
+        assert_eq!(store.quarantine_items(true).unwrap().len(), 1);
+        // Pruning again finds nothing more, and the totals hold.
+        assert_eq!(store.prune(Retention { history_days: 365, clean_days: 30 }, now).unwrap(), 0);
+        assert_eq!(format!("{:?}", store.monthly_summary().unwrap()), format!("{months_before:?}"));
+
+        // Compacted, a year of heavy use fits well under the plan's 50 MB.
+        store.compact().unwrap();
+        let bytes: u64 = ["", "-wal", "-shm"].iter().filter_map(|s| std::fs::metadata(format!("{}{s}", path.display())).ok()).map(|m| m.len()).sum();
+        eprintln!("after a year: {scans_after} scans, {:.1} MB", bytes as f64 / 1e6);
+        assert!(bytes < 50_000_000, "{bytes} bytes");
+
+        // 0 keeps for good.
+        assert_eq!(store.prune(Retention { history_days: 0, clean_days: 0 }, now + chrono::Duration::days(3650)).unwrap(), 0);
     }
 
     #[test]

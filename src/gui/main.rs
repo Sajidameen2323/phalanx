@@ -176,6 +176,10 @@ struct Settings {
     /// Check the feeds for new signatures and web rules automatically.
     auto_update: bool,
     auto_update_hours: u32,
+    /// Days history is kept; 0 for good.
+    history_days: u32,
+    /// Days clean real-time checks are kept; 0 for good.
+    clean_history_days: u32,
     /// Unix time of the last automatic or manual check.
     last_update_check: Option<u64>,
 }
@@ -211,6 +215,8 @@ impl Default for Settings {
             ai_max_text_kb: ai::DEFAULT_MAX_TEXT_KB,
             auto_update: true,
             auto_update_hours: 4,
+            history_days: 365,
+            clean_history_days: 30,
             last_update_check: None,
         }
     }
@@ -541,6 +547,8 @@ struct App {
     recent_threats: Vec<ScanRow>,
     /// The last manual scan that finished, for the dashboard.
     last_manual: Option<ScanRow>,
+    /// The history database's size and upkeep, for Settings.
+    history_info: Option<replies::HistoryInfo>,
     months: Vec<MonthRow>,
     pending_delete: Option<String>,
     toast: Option<Toast>,
@@ -727,6 +735,7 @@ impl App {
             quarantine: Vec::new(),
             recent_threats: Vec::new(),
             last_manual: None,
+            history_info: None,
             months: Vec::new(),
             pending_delete: None,
             toast: None,
@@ -820,10 +829,12 @@ impl App {
                 let threats: replies::History = read(Request::History { query: week })?;
                 let manual: replies::History = read(Request::History { query: manual })?;
                 let m: replies::MonthlySummary = read(Request::MonthlySummary)?;
-                Ok((q, threats, manual, m))
+                let info: replies::HistoryInfo = read(Request::HistoryInfo)?;
+                Ok((q, threats, manual, m, info))
             },
             |app, loaded| match loaded {
-                Ok((q, threats, manual, m)) => {
+                Ok((q, threats, manual, m, info)) => {
+                    app.history_info = Some(info);
                     app.quarantine = q;
                     app.recent_threats = threats.scans;
                     app.last_manual = manual.scans.into_iter().find(|s| s.finished_at.is_some() && !s.cancelled);
@@ -1857,6 +1868,8 @@ fn copy_protection(s: &mut Settings, p: &ProtectionSettings) {
     s.quarantine_suspicious = p.quarantine_suspicious;
     s.auto_update = p.auto_update;
     s.auto_update_hours = p.auto_update_hours;
+    s.history_days = p.history_days;
+    s.clean_history_days = p.clean_history_days;
 }
 
 /// The protection settings as the pages have them; what the pages do not
@@ -1880,6 +1893,8 @@ fn protection_from(s: &Settings, service: &ProtectionSettings) -> ProtectionSett
         quarantine_suspicious: s.quarantine_suspicious,
         auto_update: s.auto_update,
         auto_update_hours: s.auto_update_hours,
+        history_days: s.history_days,
+        clean_history_days: s.clean_history_days,
         ..service.clone()
     }
 }

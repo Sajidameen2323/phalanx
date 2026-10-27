@@ -4,6 +4,7 @@
 //! pipe name. See `docs/protection-service.md` for the design.
 
 pub mod data;
+pub mod history;
 pub mod migrate;
 pub mod protect;
 pub mod settings;
@@ -142,6 +143,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                 }),
             )
         }
+        Request::HistoryInfo => reply::<replies::HistoryInfo>(id, history::info(dir)),
         Request::History { query } => reply::<replies::History>(id, session.store(dir).and_then(|s| s.history(&query))),
         Request::RecentScans { limit, kind } => reply::<replies::RecentScans>(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
         Request::ScanDetails { scan } => reply::<replies::ScanDetails>(
@@ -355,6 +357,7 @@ pub fn start(pipe_name: &str, data_dir: &Path) -> io::Result<Running> {
             web_starter.reload();
         })?;
         updater.schedule(Arc::clone(&schedule));
+        history::schedule(data_dir, Arc::clone(&schedule));
         Ok(Running { _server: server, stop_requests: rx, protector, web, schedule, starting: Some(starting) })
     }
     #[cfg(not(windows))]
@@ -466,7 +469,7 @@ mod tests {
 
     /// Every kind of request there is. A new one fails the contract test
     /// until it is sent there (and given a type in [`replies`]).
-    const REQUEST_KINDS: usize = 27;
+    const REQUEST_KINDS: usize = 28;
 
     /// Reads `reply` as its request's type in [`replies`], as clients do.
     /// The match has no catch-all, so a new request does not compile
@@ -483,6 +486,7 @@ mod tests {
             Request::SetSettings { .. } => read::<replies::SetSettings>(reply),
             Request::RecentScans { .. } => read::<replies::RecentScans>(reply),
             Request::History { .. } => read::<replies::History>(reply),
+            Request::HistoryInfo => read::<replies::HistoryInfo>(reply),
             Request::ScanDetails { .. } => read::<replies::ScanDetails>(reply),
             Request::RecentDetections { .. } => read::<replies::RecentDetections>(reply),
             Request::MonthlySummary => read::<replies::MonthlySummary>(reply),
@@ -645,6 +649,8 @@ events:
         let details: replies::ScanDetails = read(service.ask(Request::ScanDetails { scan }));
         assert_eq!(details.detections.len(), 1, "{details:?}");
         service.ask(Request::RecentDetections { limit: 10 });
+        let info: replies::HistoryInfo = read(service.ask(Request::HistoryInfo));
+        assert!(info.scans >= 1 && info.bytes > 0, "{info:?}");
         service.ask(Request::MonthlySummary);
 
         // Quarantine: what the scan found, then put back; a file no scan

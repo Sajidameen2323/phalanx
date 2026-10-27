@@ -1112,6 +1112,43 @@ impl App {
         }
         ui.add_space(14.0);
 
+        card(ui, |ui| {
+            group_title(ui, "History", "Old history is removed once a day; the monthly totals keep counting it. Keeping it for less time needs an administrator's approval.");
+            let days = |days: u32| match days {
+                0 => "Always".to_string(),
+                365 => "1 year".to_string(),
+                730 => "2 years".to_string(),
+                n => format!("{n} days"),
+            };
+            setting_row(ui, "Keep history", "Threats found, manual scans, suspicious commands and side-loading reports.", |ui| {
+                for choice in [90, 365, 730, 0] {
+                    if chip(ui, &days(choice), self.settings.history_days == choice) {
+                        self.settings.history_days = choice;
+                    }
+                }
+            });
+            row_divider(ui);
+            setting_row(ui, "Keep routine checks", "Real-time checks of new files and programs that found nothing.", |ui| {
+                for choice in [7, 30, 90, 0] {
+                    if chip(ui, &days(choice), self.settings.clean_history_days == choice) {
+                        self.settings.clean_history_days = choice;
+                    }
+                }
+            });
+            if let Some(info) = &self.history_info {
+                row_divider(ui);
+                let mut lines = vec![format!("{} on disk, {} entries", fmt_bytes(info.bytes as i64), info.scans)];
+                if let Some(oldest) = &info.oldest {
+                    lines.push(format!("oldest {}", short_time(oldest)));
+                }
+                if let Some(pruned) = &info.pruned_at {
+                    lines.push(format!("last tidied {} ({} removed)", short_time(pruned), info.pruned));
+                }
+                small(ui, lines.join(" · "));
+            }
+        });
+        ui.add_space(14.0);
+
         let mut open = None;
         card(ui, |ui| {
             group_title(ui, "Data", "");

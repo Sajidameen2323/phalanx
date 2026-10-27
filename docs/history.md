@@ -100,4 +100,35 @@ round-trip test.
 - **Page seen in the app (2026-10-28)** against the console service: filter
   and time-range chips, badges and Show details render as intended. The
   search box sits a little shorter than the chips beside it (cosmetic).
-- **Next:** milestone 3, retention.
+- **Milestone 3: built (2026-10-28); the Settings card not yet seen in the
+  app, and the daily upkeep not yet seen running in the installed service.**
+  - Settings: `ProtectionSettings::history_days` (365) and
+    `clean_history_days` (30), 0 for good. Keeping either for less time
+    weakens protection (`weakened_by`: "keeps history for 90 days instead of
+    365 days"), so it needs an administrator; longer or "Always" does not.
+  - `Store::prune(Retention, now)`: in one transaction, everything older
+    than `history_days`, and `watch`/`process` scans that found nothing older
+    than `clean_days` (`CLEAN_KINDS`), are first added per month to the new
+    `PrunedTotals` table, then removed with their detections and errors.
+    `monthly_summary` adds `PrunedTotals` back, so no month's figures change.
+    Quarantine records are never removed. `Store::compact` runs `VACUUM` and
+    truncates the write-ahead log.
+  - `service/history.rs`: `upkeep` prunes when a day has passed and compacts
+    when a month has (stamps in `history-upkeep.json`); `schedule` runs it
+    2 minutes after the service starts, then checks hourly, in background
+    mode. A failed compaction (a writer in the way) is tried at the next
+    check. `Request::HistoryInfo` → `replies::HistoryInfo` (size on disk with
+    the WAL, scans, oldest, last prune and how many it removed, last
+    compaction); in the contract test (now 28 requests).
+  - App: Settings > General has a **History** card above Data: "Keep
+    history" (90 days, 1 year, 2 years, Always), "Keep routine checks" (7,
+    30, 90 days, Always), and the size, entries, oldest and last tidy-up,
+    read with `refresh()`.
+  - Tests: `retention_keeps_what_it_should_and_the_monthly_totals` (410 days
+    of 200 clean checks plus a finding, a manual scan and a command a day:
+    83,230 scans down to exactly 7,095; every month's totals identical; no
+    orphaned detections; quarantine untouched; a second prune removes
+    nothing; compacted, **1.0 MB**, against the plan's 50 MB);
+    `upkeep_prunes_once_a_day_and_compacts_once_a_month`; the settings test
+    covers both shortenings and that lengthening asks nothing.
+- **Next:** milestone 4, review and delete.
