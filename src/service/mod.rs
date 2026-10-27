@@ -142,6 +142,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                 }),
             )
         }
+        Request::History { query } => reply::<replies::History>(id, session.store(dir).and_then(|s| s.history(&query))),
         Request::RecentScans { limit, kind } => reply::<replies::RecentScans>(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
         Request::ScanDetails { scan } => reply::<replies::ScanDetails>(
             id,
@@ -465,7 +466,7 @@ mod tests {
 
     /// Every kind of request there is. A new one fails the contract test
     /// until it is sent there (and given a type in [`replies`]).
-    const REQUEST_KINDS: usize = 26;
+    const REQUEST_KINDS: usize = 27;
 
     /// Reads `reply` as its request's type in [`replies`], as clients do.
     /// The match has no catch-all, so a new request does not compile
@@ -481,6 +482,7 @@ mod tests {
             Request::GetSettings => read::<replies::GetSettings>(reply),
             Request::SetSettings { .. } => read::<replies::SetSettings>(reply),
             Request::RecentScans { .. } => read::<replies::RecentScans>(reply),
+            Request::History { .. } => read::<replies::History>(reply),
             Request::ScanDetails { .. } => read::<replies::ScanDetails>(reply),
             Request::RecentDetections { .. } => read::<replies::RecentDetections>(reply),
             Request::MonthlySummary => read::<replies::MonthlySummary>(reply),
@@ -636,6 +638,10 @@ events:
         // A second scan, cancelled; it may finish first.
         let started: replies::Scan = read(service.ask(Request::Scan { paths: vec![scanned.clone()], kind: "custom".into() }));
         service.ask_or(Request::CancelScan { job: started.job }, "there is no scan");
+        let page: replies::History = read(service.ask(Request::History {
+            query: crate::store::HistoryQuery { limit: 10, threats_only: true, text: Some("setup.TXT".into()), ..Default::default() },
+        }));
+        assert_eq!(page.scans.iter().map(|s| s.id).collect::<Vec<_>>(), vec![scan], "{page:?}");
         let details: replies::ScanDetails = read(service.ask(Request::ScanDetails { scan }));
         assert_eq!(details.detections.len(), 1, "{details:?}");
         service.ask(Request::RecentDetections { limit: 10 });

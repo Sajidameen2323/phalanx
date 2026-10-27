@@ -185,11 +185,11 @@ impl App {
         // days that were not quarantined need attention.
         let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).to_rfc3339();
         let unresolved: Vec<&ScanRow> = self
-            .scans
+            .recent_threats
             .iter()
             .filter(|s| s.started_at >= week_ago && s.detections > s.quarantined)
             .collect();
-        let last_manual = self.scans.iter().find(|s| s.finished_at.is_some() && !s.cancelled && !is_protection_kind(&s.kind));
+        let last_manual = self.last_manual.as_ref();
         let threat_count: i64 = unresolved.iter().map(|s| s.detections - s.quarantined).sum();
         let (color, title, detail) = if let Some(job) = &self.job {
             let found = match self.results.len() {
@@ -832,33 +832,72 @@ impl App {
         );
         ui.add_space(14.0);
 
+        let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             for (filter, label) in [
-                (HistoryFilter::All, "All scans"),
-                (HistoryFilter::Manual, "Manual"),
+                (HistoryFilter::All, "All"),
+                (HistoryFilter::Threats, "Threats found"),
+                (HistoryFilter::Manual, "Manual scans"),
                 (HistoryFilter::Watch, "Real-time protection"),
+                (HistoryFilter::Commands, "Suspicious commands"),
+                (HistoryFilter::SideLoading, "DLL side-loading"),
             ] {
-                if chip(ui, label, self.history_filter == filter) {
-                    self.history_filter = filter;
+                if chip(ui, label, self.history.filter == filter) && self.history.filter != filter {
+                    self.history.filter = filter;
+                    changed = true;
                 }
             }
         });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.history.search)
+                    .hint_text("Search files, folders and threat names")
+                    .desired_width(320.0),
+            );
+            if search.changed() {
+                self.history.search_edited = Some(Instant::now());
+            }
+            if search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && self.history.search_edited.take().is_some() {
+                changed = true;
+            }
+            ui.add_space(8.0);
+            for (since, label) in [
+                (HistorySince::Any, "Any time"),
+                (HistorySince::Day, "24 hours"),
+                (HistorySince::Week, "7 days"),
+                (HistorySince::Month, "30 days"),
+            ] {
+                if chip(ui, label, self.history.since == since) && self.history.since != since {
+                    self.history.since = since;
+                    changed = true;
+                }
+            }
+        });
+        // Search once typing pauses.
+        if let Some(edited) = self.history.search_edited {
+            if edited.elapsed() >= SEARCH_DELAY {
+                self.history.search_edited = None;
+                changed = true;
+            } else {
+                ui.ctx().request_repaint_after(SEARCH_DELAY - edited.elapsed());
+            }
+        }
+        if changed {
+            self.load_history(Load::New);
+        }
         ui.add_space(8.0);
 
-        let filter = self.history_filter;
-        let scans: Vec<ScanRow> = self
-            .scans
-            .iter()
-            .filter(|s| match filter {
-                HistoryFilter::All => true,
-                HistoryFilter::Manual => !is_protection_kind(&s.kind),
-                HistoryFilter::Watch => is_protection_kind(&s.kind),
-            })
-            .take(100)
-            .cloned()
-            .collect();
+        let scans = self.history.rows.clone();
         if scans.is_empty() {
-            card(ui, |ui| muted(ui, "No scans of this kind yet."));
+            let text = if self.history.loading {
+                "Loading…"
+            } else if self.history.filter == HistoryFilter::All && self.history.since == HistorySince::Any && self.history.search.trim().is_empty() {
+                "No scans yet."
+            } else {
+                "Nothing matches."
+            };
+            card(ui, |ui| muted(ui, text));
         }
         let mut toggle = None;
         for s in &scans {
@@ -927,6 +966,16 @@ impl App {
                         }
                     }
                 }
+            });
+            ui.add_space(8.0);
+        }
+        if self.history.next.is_some() {
+            ui.horizontal(|ui| {
+                let label = if self.history.loading { "Loading…" } else { "Load more" };
+                if ui.add_enabled(!self.history.loading, egui::Button::new(label)).clicked() {
+                    self.load_history(Load::More);
+                }
+                small(ui, format!("{} shown", scans.len()));
             });
             ui.add_space(8.0);
         }

@@ -114,7 +114,8 @@ phalanx-cli service stop | start | uninstall
 phalanx-cli service migrate     # as administrator, once: bring a 0.4 user's data over
 phalanx-cli service scan D:\    # scan in the service, with progress
 phalanx-cli service events      # watch what the service reports
-phalanx-cli service settings | history
+phalanx-cli service settings
+phalanx-cli service history --search invoice --threats-only --days 7   # also --kind, --before
 phalanx-cli service protection  # watching? programs through process events?
 phalanx-cli service update      # download signatures in the service, with progress
 phalanx-cli service web         # web settings and whether the DNS filter runs
@@ -186,7 +187,10 @@ The app has these pages:
 * **Quarantine**: restore or permanently delete isolated files.
 * **History**: every scan with its type, duration, files, data, threads, skipped
   and unreadable files, quarantined files and signature date. Expand a scan to see
-  its detections and errors. You can filter by manual scans or real-time protection.
+  its detections and errors. Search by file, folder or threat name; filter by
+  threats found, manual scans, real-time protection, suspicious commands or DLL
+  side-loading, and by the last day, week or month. Pages of 50 load as you ask
+  for more.
 * **Settings**, in tabs: **General** (startup, tray, notifications, data folder),
   **Scanning** (performance, detection, quarantine), **Exclusions**, **Signatures**
   and **AI inspection**.

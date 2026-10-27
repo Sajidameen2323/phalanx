@@ -22,6 +22,16 @@ fn every_request_reads_back_as_sent() {
         Request::SetSettings { settings: ProtectionSettings { exclusions: vec![r"D:\VMs".into()], ..Default::default() } },
         Request::RecentScans { limit: 10, kind: Some("quick".into()) },
         Request::RecentScans { limit: 5, kind: None },
+        Request::History {
+            query: crate::store::HistoryQuery {
+                before: Some(41),
+                limit: 50,
+                kinds: vec!["watch".into(), "process".into()],
+                threats_only: true,
+                text: Some("invoice".into()),
+                since: Some("2026-10-01T00:00:00+05:30".into()),
+            },
+        },
         Request::ScanDetails { scan: 3 },
         Request::RecentDetections { limit: 20 },
         Request::MonthlySummary,

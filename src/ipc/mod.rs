@@ -19,7 +19,7 @@ use crate::risk::{DownloadOrigin, RiskyFile};
 use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
-use crate::store::{DetectionRow, ScanErrorRow};
+use crate::store::{DetectionRow, HistoryQuery, ScanErrorRow};
 use crate::service::web::WebStatus;
 use crate::web::events::WebEvent;
 use crate::web::{SiteChange, WebConfig};
@@ -64,6 +64,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
     },
+    /// A page of history, newest first, filtered and searched as `query`
+    /// says; the reply says where the next page starts.
+    History { query: HistoryQuery },
     /// A scan's detections and errors. (Fields are not called `id`: that is
     /// the message's own.)
     ScanDetails { scan: i64 },
@@ -219,6 +222,7 @@ impl Request {
             | Request::GetSettings
             | Request::SetSettings { .. }
             | Request::RecentScans { .. }
+            | Request::History { .. }
             | Request::ScanDetails { .. }
             | Request::RecentDetections { .. }
             | Request::MonthlySummary
@@ -350,7 +354,7 @@ pub struct ScanDetails {
 pub mod replies {
     use crate::rtp::commands;
     use crate::service::{migrate, settings, web as service_web};
-    use crate::store::{DetectionRow, MonthRow, QuarantineRow, ScanRow};
+    use crate::store::{DetectionRow, HistoryPage, MonthRow, QuarantineRow, ScanRow};
     use crate::web::WebConfig;
     use serde::{Deserialize, Serialize};
     use std::path::PathBuf;
@@ -364,6 +368,7 @@ pub mod replies {
     /// The settings now in force.
     pub type SetSettings = settings::ProtectionSettings;
     pub type RecentScans = Vec<ScanRow>;
+    pub type History = HistoryPage;
     pub type ScanDetails = super::ScanDetails;
     pub type RecentDetections = Vec<DetectionRow>;
     pub type MonthlySummary = Vec<MonthRow>;

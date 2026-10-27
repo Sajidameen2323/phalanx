@@ -139,10 +139,26 @@ enum ServiceCommand {
         #[arg(long)]
         from: Option<PathBuf>,
     },
-    /// Recent scans, as the service keeps them.
+    /// Scans as the service keeps them, newest first, filtered and searched.
     History {
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Text in what was scanned, or in a finding's file or threat name.
+        #[arg(long)]
+        search: Option<String>,
+        /// Only this kind (quick, full, custom, watch, process, command,
+        /// sideload); repeat for several.
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Only scans that found something.
+        #[arg(long)]
+        threats_only: bool,
+        /// Only the last this many days.
+        #[arg(long)]
+        days: Option<u32>,
+        /// Start below this scan number (shown at the end of a full page).
+        #[arg(long)]
+        before: Option<i64>,
     },
     /// The protection settings, as the service keeps them (JSON).
     Settings,
@@ -1082,14 +1098,26 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             println!("    other:      {} file(s) (web lists, DNS backup, signatures)", done.copied);
             println!("The old folder was left as it was.");
         }
-        ServiceCommand::History { limit } => {
+        ServiceCommand::History { limit, search, kinds, threats_only, days, before } => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
-            let scans: ipc::replies::RecentScans = client.call(ipc::Request::RecentScans { limit: *limit, kind: None })?.into_result()?;
-            if scans.is_empty() {
-                println!("No scans yet.");
+            let since = days.map(|d| (chrono::Local::now() - chrono::Duration::days(d.into())).to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+            let query = threat_scanner::store::HistoryQuery {
+                before: *before,
+                limit: *limit,
+                kinds: kinds.clone(),
+                threats_only: *threats_only,
+                text: search.clone(),
+                since,
+            };
+            let page: ipc::replies::History = client.call(ipc::Request::History { query })?.into_result()?;
+            if page.scans.is_empty() {
+                println!("No scans match.");
             }
-            for s in scans {
+            for s in &page.scans {
                 println!("#{:<5} {:<8} {}  {} file(s), {} detection(s)  {}", s.id, s.kind, s.started_at, s.files_scanned, s.detections, s.targets);
+            }
+            if let Some(next) = page.next {
+                println!("More: add --before {next}");
             }
         }
         ServiceCommand::Scan { paths, kind } => {

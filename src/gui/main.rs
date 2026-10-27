@@ -26,7 +26,7 @@ use threat_scanner::posture::{self, Check};
 use threat_scanner::ipc::{self, replies, Event, Request};
 use threat_scanner::scan::{self, FileReport, ScanOptions, ScanReport};
 use threat_scanner::service::settings::ProtectionSettings;
-use threat_scanner::store::{DetectionRow, MonthRow, QuarantineRow, ScanErrorRow, ScanRow};
+use threat_scanner::store::{self, DetectionRow, HistoryQuery, MonthRow, QuarantineRow, ScanErrorRow, ScanRow};
 use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
@@ -445,7 +445,81 @@ enum HistoryFilter {
     All,
     Manual,
     Watch,
+    Threats,
+    Commands,
+    SideLoading,
 }
+
+/// Scan kinds started by someone, rather than by real-time protection.
+const MANUAL_KINDS: [&str; 4] = ["quick", "full", "custom", "manual"];
+/// Scan kinds real-time protection records.
+const PROTECTION_KINDS: [&str; 4] = ["watch", "process", "command", "sideload"];
+
+impl HistoryFilter {
+    /// The kinds it shows (empty for all) and whether only threats.
+    fn query(self) -> (Vec<String>, bool) {
+        let kinds = |list: &[&str]| list.iter().map(|k| k.to_string()).collect();
+        match self {
+            HistoryFilter::All => (Vec::new(), false),
+            HistoryFilter::Manual => (kinds(&MANUAL_KINDS), false),
+            HistoryFilter::Watch => (kinds(&PROTECTION_KINDS), false),
+            HistoryFilter::Threats => (Vec::new(), true),
+            HistoryFilter::Commands => (kinds(&["command"]), false),
+            HistoryFilter::SideLoading => (kinds(&["sideload"]), false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HistorySince {
+    Any,
+    Day,
+    Week,
+    Month,
+}
+
+impl HistorySince {
+    fn start(self) -> Option<String> {
+        let days = match self {
+            HistorySince::Any => return None,
+            HistorySince::Day => 1,
+            HistorySince::Week => 7,
+            HistorySince::Month => 30,
+        };
+        Some((chrono::Local::now() - chrono::Duration::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+    }
+}
+
+/// History scans loaded a page at a time from the service.
+struct HistoryView {
+    filter: HistoryFilter,
+    since: HistorySince,
+    search: String,
+    /// When the search text last changed; it is applied once typing pauses.
+    search_edited: Option<Instant>,
+    rows: Vec<ScanRow>,
+    /// Where the next page starts; `None` when everything is loaded.
+    next: Option<i64>,
+    loading: bool,
+    /// Bumped by every new query, so a reply to an older one is dropped.
+    generation: u64,
+}
+
+/// What [`App::load_history`] loads.
+#[derive(Clone, Copy, PartialEq)]
+enum Load {
+    /// The first page of a new query.
+    New,
+    /// The page after the rows shown.
+    More,
+    /// The rows shown, read again.
+    Again,
+}
+
+/// Rows per page of History.
+const HISTORY_PAGE: u32 = 50;
+/// The pause in typing after which a search runs.
+const SEARCH_DELAY: Duration = Duration::from_millis(400);
 
 struct App {
     page: Page,
@@ -463,7 +537,10 @@ struct App {
     results: Vec<ResultRow>,
     finished: Option<Finished>,
     quarantine: Vec<QuarantineRow>,
-    scans: Vec<ScanRow>,
+    /// The last week's scans that found something, for the dashboard.
+    recent_threats: Vec<ScanRow>,
+    /// The last manual scan that finished, for the dashboard.
+    last_manual: Option<ScanRow>,
     months: Vec<MonthRow>,
     pending_delete: Option<String>,
     toast: Option<Toast>,
@@ -489,7 +566,7 @@ struct App {
     service_rx: Option<Receiver<ServiceView>>,
     service_checked: Option<Instant>,
     // History
-    history_filter: HistoryFilter,
+    history: HistoryView,
     expanded: HashMap<i64, ScanDetails>,
     // Desktop
     tray: Option<desktop::Tray>,
@@ -648,7 +725,8 @@ impl App {
             results: Vec::new(),
             finished: None,
             quarantine: Vec::new(),
-            scans: Vec::new(),
+            recent_threats: Vec::new(),
+            last_manual: None,
             months: Vec::new(),
             pending_delete: None,
             toast: None,
@@ -666,7 +744,16 @@ impl App {
             service: None,
             service_rx: None,
             service_checked: None,
-            history_filter: HistoryFilter::All,
+            history: HistoryView {
+                filter: HistoryFilter::All,
+                since: HistorySince::Any,
+                search: String::new(),
+                search_edited: None,
+                rows: Vec::new(),
+                next: None,
+                loading: false,
+                generation: 0,
+            },
             expanded: HashMap::new(),
             tray,
             quitting,
@@ -718,27 +805,89 @@ impl App {
         });
     }
 
-    /// Reads the quarantine, the scans and the monthly totals from the service.
+    /// Reads the quarantine, the dashboard's scans, the monthly totals and
+    /// the History rows already shown from the service.
     fn refresh(&mut self) {
         if !self.connected {
             return;
         }
+        let week = HistoryQuery { limit: store::MAX_HISTORY_PAGE, threats_only: true, since: HistorySince::Week.start(), ..Default::default() };
+        let manual = HistoryQuery { limit: 20, kinds: MANUAL_KINDS.iter().map(|k| k.to_string()).collect(), ..Default::default() };
         self.link.run(
-            || -> Result<_, String> {
+            move || -> Result<_, String> {
                 use link::read;
                 let q: replies::Quarantine = read(Request::Quarantine { include_restored: false })?;
-                let s: replies::RecentScans = read(Request::RecentScans { limit: 300, kind: None })?;
+                let threats: replies::History = read(Request::History { query: week })?;
+                let manual: replies::History = read(Request::History { query: manual })?;
                 let m: replies::MonthlySummary = read(Request::MonthlySummary)?;
-                Ok((q, s, m))
+                Ok((q, threats, manual, m))
             },
             |app, loaded| match loaded {
-                Ok((q, s, m)) => {
+                Ok((q, threats, manual, m)) => {
                     app.quarantine = q;
-                    app.scans = s;
+                    app.recent_threats = threats.scans;
+                    app.last_manual = manual.scans.into_iter().find(|s| s.finished_at.is_some() && !s.cancelled);
                     app.months = m;
-                    app.expanded.clear();
                 }
                 Err(e) => app.notify(format!("Could not read history: {e}"), false),
+            },
+        );
+        self.load_history(Load::Again);
+    }
+
+    /// The History query for what the page shows now.
+    fn history_query(&self, before: Option<i64>, limit: u32) -> HistoryQuery {
+        let (kinds, threats_only) = self.history.filter.query();
+        let text = Some(self.history.search.trim().to_string()).filter(|t| !t.is_empty());
+        HistoryQuery { before, limit, kinds, threats_only, text, since: self.history.since.start() }
+    }
+
+    /// Loads History rows: a new query's first page, the next page, or the
+    /// rows already shown again (after a scan, so a long list stays long).
+    fn load_history(&mut self, load: Load) {
+        if !self.connected {
+            return;
+        }
+        let shown = (self.history.rows.len() as u32).clamp(HISTORY_PAGE, store::MAX_HISTORY_PAGE);
+        let query = match load {
+            Load::New => {
+                self.history.generation += 1;
+                self.history.rows.clear();
+                self.history.next = None;
+                self.expanded.clear();
+                self.history_query(None, HISTORY_PAGE)
+            }
+            Load::More => match self.history.next {
+                Some(next) => self.history_query(Some(next), HISTORY_PAGE),
+                None => return,
+            },
+            Load::Again => {
+                self.history.generation += 1;
+                self.history_query(None, shown)
+            }
+        };
+        let generation = self.history.generation;
+        self.history.loading = true;
+        self.link.run(
+            move || link::read::<replies::History>(Request::History { query }),
+            move |app, page| {
+                // A newer query has replaced this one.
+                if app.history.generation != generation {
+                    return;
+                }
+                app.history.loading = false;
+                match page {
+                    Ok(page) => {
+                        if load == Load::More {
+                            app.history.rows.extend(page.scans);
+                        } else {
+                            app.expanded.retain(|id, _| page.scans.iter().any(|s| s.id == *id));
+                            app.history.rows = page.scans;
+                        }
+                        app.history.next = page.next;
+                    }
+                    Err(e) => app.notify(format!("Could not read history: {e}"), false),
+                }
             },
         );
     }

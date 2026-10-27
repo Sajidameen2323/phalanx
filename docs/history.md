@@ -69,5 +69,34 @@ round-trip test.
     `store::tests::a_new_database_opens_from_many_threads_at_once`.
   - The contract test scans at normal priority: in background mode a scan can
     wait out a busy parallel test run.
-- **Next:** milestone 2, paging and search (`Store::recent_scans`,
-  `Request::RecentScans`, the History page in `src/gui/pages.rs`).
+- **Milestone 2: built (2026-10-28); the page itself not yet tried by hand.**
+  - `Store::history(&HistoryQuery) -> HistoryPage`: newest first, below a
+    cursor (`before`, a scan id), with kinds, threats only, `since` and text.
+    Text is matched, ignoring case, in what was scanned and in each finding's
+    path and threat name; `%`, `_` and `\` match only themselves. One fixed
+    statement (`prepare_cached`) serves every query: each filter switches
+    itself off when its parameter is empty. `MAX_HISTORY_PAGE` is 500.
+  - `Request::History { query }` → `replies::History`; in the contract test
+    (now 27 requests). `RecentScans` stays for older callers.
+  - `phalanx-cli service history` takes `--search`, `--kind` (repeatable),
+    `--threats-only`, `--days`, `--before` and says how to get the next page.
+  - App: the History page has filter chips (All, Threats found, Manual scans,
+    Real-time protection, Suspicious commands, DLL side-loading), a time range
+    (any, 24 hours, 7 days, 30 days) and a search box that runs 0.4 s after
+    typing stops (or on Enter); 50 rows a page with **Load more**. A reply to
+    an older query is dropped (`HistoryView::generation`). `refresh()` after
+    a scan reloads as many rows as are shown, so a long list stays long, and
+    keeps open details open. The dashboard's two uses of the old 300-scan list
+    have queries of their own: the last week's threats and the last manual
+    scan.
+  - Measured (`a_hundred_thousand_entries_page_and_search_quickly`, release):
+    first page 0.3 ms, a deep page 10 ms, threats only 0.5 ms, one kind
+    0.2 ms, text search 52–58 ms over 100,000 scans. The plan's 200 ms is met.
+    Debug builds only print the times.
+  - Tried end to end with `phalanx-service --console` on a private pipe and
+    300 test scans: paging, search (with `_`), kind, days and "No scans
+    match" all as expected from the CLI. Start the console service from
+    PowerShell: Git Bash rewrites `\\.\pipe\…` to `\.\pipe\…`.
+- **Left in milestone 2:** look at the page in the app (filters, search,
+  Load more, the dashboard's tiles).
+- **Next:** milestone 3, retention.

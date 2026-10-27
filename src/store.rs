@@ -147,6 +147,68 @@ pub fn now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
+/// The columns a [`ScanRow`] is read from, in [`scan_row`]'s order.
+const SCAN_ROW: &str = "Id, Kind, StartedAt, FinishedAt, ElapsedMs, Targets, FilesScanned, BytesScanned, FilesSkipped, Errors, \
+    Detections, Quarantined, Threads, Cancelled, Signatures";
+
+fn scan_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRow> {
+    Ok(ScanRow {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        started_at: r.get(2)?,
+        finished_at: r.get(3)?,
+        elapsed_ms: r.get(4)?,
+        targets: r.get(5)?,
+        files_scanned: r.get(6)?,
+        bytes_scanned: r.get(7)?,
+        files_skipped: r.get(8)?,
+        errors: r.get(9)?,
+        detections: r.get(10)?,
+        quarantined: r.get(11)?,
+        threads: r.get(12)?,
+        cancelled: r.get(13)?,
+        signatures: r.get(14)?,
+    })
+}
+
+/// `text` for a `LIKE … ESCAPE '\'` pattern: its own `%`, `_` and `\` match
+/// only themselves.
+fn like_escape(text: &str) -> String {
+    text.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_")
+}
+
+/// Most scans one page of history holds.
+pub const MAX_HISTORY_PAGE: u32 = 500;
+
+/// Which scans a page of history holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryQuery {
+    /// Start below this scan (the previous page's [`HistoryPage::next`]);
+    /// `None` for the newest.
+    pub before: Option<i64>,
+    /// Scans on the page, at most [`MAX_HISTORY_PAGE`].
+    pub limit: u32,
+    /// Only these kinds (`quick`, `watch`, `command`…); empty for all.
+    pub kinds: Vec<String>,
+    /// Only scans that found something.
+    pub threats_only: bool,
+    /// Text in what was scanned, or in a finding's file or threat name,
+    /// ignoring case.
+    pub text: Option<String>,
+    /// Only scans started at or after this time (RFC 3339, as [`now`] writes it).
+    pub since: Option<String>,
+}
+
+/// A page of history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HistoryPage {
+    pub scans: Vec<ScanRow>,
+    /// Where the next page starts (its [`HistoryQuery::before`]); `None` on
+    /// the last page.
+    pub next: Option<i64>,
+}
+
 /// How long a connection waits for another to finish writing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -368,32 +430,40 @@ impl Store {
 
     /// Newest first; `kind` limits the result to one scan kind.
     pub fn recent_scans(&self, limit: u32, kind: Option<&str>) -> Result<Vec<ScanRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT Id, Kind, StartedAt, FinishedAt, ElapsedMs, Targets, FilesScanned,
-                    BytesScanned, FilesSkipped, Errors, Detections, Quarantined, Threads,
-                    Cancelled, Signatures
-             FROM Scans WHERE ?2 IS NULL OR Kind = ?2 ORDER BY Id DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit, kind], |r| {
-            Ok(ScanRow {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                started_at: r.get(2)?,
-                finished_at: r.get(3)?,
-                elapsed_ms: r.get(4)?,
-                targets: r.get(5)?,
-                files_scanned: r.get(6)?,
-                bytes_scanned: r.get(7)?,
-                files_skipped: r.get(8)?,
-                errors: r.get(9)?,
-                detections: r.get(10)?,
-                quarantined: r.get(11)?,
-                threads: r.get(12)?,
-                cancelled: r.get(13)?,
-                signatures: r.get(14)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!("SELECT {SCAN_ROW} FROM Scans WHERE ?2 IS NULL OR Kind = ?2 ORDER BY Id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map(params![limit, kind], scan_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One page of history, newest first: the scans `query` asks for, and
+    /// where the next page starts.
+    pub fn history(&self, query: &HistoryQuery) -> Result<HistoryPage> {
+        let limit = query.limit.clamp(1, MAX_HISTORY_PAGE);
+        // Every filter is always in the statement and switches itself off
+        // when its parameter is empty, so one statement serves every query.
+        // Kinds go in as one comma-separated list.
+        let sql = format!(
+            r"SELECT {SCAN_ROW} FROM Scans
+              WHERE (?1 IS NULL OR Id < ?1)
+                AND (?2 IS NULL OR StartedAt >= ?2)
+                AND (?3 = 0 OR Detections > 0)
+                AND (?4 = '' OR instr(',' || ?4 || ',', ',' || Kind || ',') > 0)
+                AND (?5 IS NULL OR Targets LIKE ?5 ESCAPE '\' OR EXISTS (
+                      SELECT 1 FROM Detections d WHERE d.ScanId = Scans.Id
+                        AND (d.Path LIKE ?5 ESCAPE '\' OR d.Threat LIKE ?5 ESCAPE '\')))
+              ORDER BY Id DESC LIMIT ?6"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let kinds = query.kinds.join(",");
+        let text = query.text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("%{}%", like_escape(t)));
+        // One more than asked: whether there is a next page.
+        let rows = stmt.query_map(params![query.before, query.since, query.threats_only, kinds, text, limit + 1], scan_row)?;
+        let mut scans: Vec<ScanRow> = rows.collect::<rusqlite::Result<_>>()?;
+        let next = (scans.len() > limit as usize).then(|| {
+            scans.truncate(limit as usize);
+            scans.last().map(|s| s.id)
+        });
+        Ok(HistoryPage { scans, next: next.flatten() })
     }
 
     pub fn recent_detections(&self, limit: u32) -> Result<Vec<DetectionRow>> {
@@ -512,6 +582,103 @@ fn quarantine_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<QuarantineRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store with `count` scans of rotating kinds; every tenth found
+    /// something, in a file named after its scan.
+    fn history_store(count: i64) -> (tempfile::TempDir, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("history.sqlite")).unwrap();
+        let kinds = ["quick", "watch", "process", "command", "sideload", "custom"];
+        store.conn.execute_batch("BEGIN").unwrap();
+        for i in 1..=count {
+            let kind = kinds[(i % kinds.len() as i64) as usize];
+            let targets = format!(r"C:\Users\me\Downloads\batch-{i}");
+            let id = store.begin_scan(&ScanMeta { kind, targets: &targets, threads: 1, signatures: None }).unwrap();
+            let found = i % 10 == 0;
+            if found {
+                let finding = Finding { threat: format!("Trojan.Test{i}"), category: crate::Category::Malware, source: crate::Source::Yara, details: String::new() };
+                store.add_detection(id, &format!(r"C:\Users\me\Downloads\invoice_{i}.exe"), "", &finding, "reported").unwrap();
+            }
+            let stats = ScanStats { files_scanned: 1, detections: found as i64, ..Default::default() };
+            store.finish_scan(id, &stats, 5, false).unwrap();
+        }
+        store.conn.execute_batch("COMMIT").unwrap();
+        (tmp, store)
+    }
+
+    fn ids(page: &HistoryPage) -> Vec<i64> {
+        page.scans.iter().map(|s| s.id).collect()
+    }
+
+    #[test]
+    fn history_pages_newest_first_and_filters() {
+        let (_tmp, store) = history_store(60);
+        let query = |q: HistoryQuery| store.history(&q).unwrap();
+
+        // Pages follow each other with no gap or repeat.
+        let first = query(HistoryQuery { limit: 25, ..Default::default() });
+        assert_eq!(ids(&first), (36..=60).rev().collect::<Vec<_>>());
+        let second = query(HistoryQuery { limit: 25, before: first.next, ..Default::default() });
+        assert_eq!(ids(&second), (11..=35).rev().collect::<Vec<_>>());
+        let last = query(HistoryQuery { limit: 25, before: second.next, ..Default::default() });
+        assert_eq!(ids(&last), (1..=10).rev().collect::<Vec<_>>());
+        assert_eq!(last.next, None, "the last page says so");
+        // A page exactly as long as what is left is the last one too.
+        assert_eq!(query(HistoryQuery { limit: 10, before: second.next, ..Default::default() }).next, None);
+
+        let threats = query(HistoryQuery { limit: 100, threats_only: true, ..Default::default() });
+        assert_eq!(ids(&threats), vec![60, 50, 40, 30, 20, 10]);
+        let commands = query(HistoryQuery { limit: 100, kinds: vec!["command".into(), "sideload".into()], ..Default::default() });
+        assert!(commands.scans.iter().all(|s| s.kind == "command" || s.kind == "sideload") && commands.scans.len() == 20, "{commands:?}");
+
+        // Text in what was scanned, in a finding's file, or its threat name,
+        // ignoring case.
+        assert_eq!(ids(&query(HistoryQuery { limit: 100, text: Some("BATCH-42".into()), ..Default::default() })), vec![42]);
+        assert_eq!(ids(&query(HistoryQuery { limit: 100, text: Some("invoice_30.exe".into()), ..Default::default() })), vec![30]);
+        assert_eq!(ids(&query(HistoryQuery { limit: 100, text: Some("trojan.test5".into()), ..Default::default() })), vec![50]);
+        // `_` and `%` are themselves, not wildcards: "invoice_3" is not
+        // "invoice?3", and "%" matches nothing here.
+        assert_eq!(ids(&query(HistoryQuery { limit: 100, text: Some("e_3".into()), ..Default::default() })), vec![30]);
+        assert!(query(HistoryQuery { limit: 100, text: Some("%".into()), ..Default::default() }).scans.is_empty());
+        // Blank text is no filter.
+        assert_eq!(query(HistoryQuery { limit: 100, text: Some("  ".into()), ..Default::default() }).scans.len(), 60);
+
+        // Filters combine, and page.
+        let combined = query(HistoryQuery { limit: 2, threats_only: true, kinds: vec!["quick".into(), "sideload".into()], ..Default::default() });
+        assert_eq!(ids(&combined), vec![60, 40]);
+        assert_eq!(ids(&query(HistoryQuery { limit: 2, before: combined.next, threats_only: true, kinds: vec!["quick".into(), "sideload".into()], ..Default::default() })), vec![30, 10]);
+
+        // Everything started before `since` is left out.
+        assert!(query(HistoryQuery { limit: 100, since: Some("2999-01-01".into()), ..Default::default() }).scans.is_empty());
+        assert_eq!(query(HistoryQuery { limit: 100, since: Some("2000-01-01".into()), ..Default::default() }).scans.len(), 60);
+    }
+
+    /// The plan's target: a year of heavy use pages and searches in under
+    /// 200 ms. Release builds only: a debug build's SQLite is unoptimized.
+    #[test]
+    fn a_hundred_thousand_entries_page_and_search_quickly() {
+        let (_tmp, store) = history_store(100_000);
+        let timed = |q: HistoryQuery| {
+            let started = std::time::Instant::now();
+            let page = store.history(&q).unwrap();
+            (page, started.elapsed())
+        };
+        let checks = [
+            ("first page", HistoryQuery { limit: 50, ..Default::default() }),
+            ("deep page", HistoryQuery { limit: 50, before: Some(1_000), ..Default::default() }),
+            ("threats only", HistoryQuery { limit: 50, threats_only: true, ..Default::default() }),
+            ("one kind", HistoryQuery { limit: 50, kinds: vec!["sideload".into()], ..Default::default() }),
+            ("text found deep down", HistoryQuery { limit: 50, text: Some("invoice_20.exe".into()), ..Default::default() }),
+            ("text found nowhere", HistoryQuery { limit: 50, text: Some("no such file".into()), ..Default::default() }),
+        ];
+        for (name, query) in checks {
+            let (page, took) = timed(query);
+            eprintln!("{name}: {} scans in {took:?}", page.scans.len());
+            if !cfg!(debug_assertions) {
+                assert!(took < std::time::Duration::from_millis(200), "{name} took {took:?}");
+            }
+        }
+    }
 
     #[test]
     fn a_new_database_opens_from_many_threads_at_once() {
