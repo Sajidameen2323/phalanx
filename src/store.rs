@@ -147,17 +147,47 @@ pub fn now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
+/// How long a connection waits for another to finish writing.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether setting up a connection failed only because another connection
+/// was setting up the same database at that moment.
+fn set_up_clash(e: &anyhow::Error) -> bool {
+    match e.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(f, message)) => {
+            matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                || message.as_deref().is_some_and(|m| m.contains("duplicate column name"))
+        }
+        _ => false,
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // The GUI, a scan and the folder watcher may each hold a connection.
-        conn.busy_timeout(std::time::Duration::from_secs(15))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
-        conn.execute_batch(SCHEMA)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         let store = Self { conn };
-        store.migrate()?;
-        Ok(store)
+        // Switching a new database to WAL takes it over for a moment, and
+        // SQLite refuses (rather than waits for) another connection setting
+        // it up at the same time, as real-time protection's threads do when
+        // the service first starts; two may also add the same new column.
+        // Either way the setup is tried again, as the busy timeout would.
+        let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+        loop {
+            match store.set_up() {
+                Ok(()) => return Ok(store),
+                Err(e) if std::time::Instant::now() < deadline && set_up_clash(&e) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn set_up(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+        self.conn.execute_batch(SCHEMA)?;
+        self.migrate()
     }
 
     /// Copies every scan, detection, scan error and quarantine record from
@@ -482,6 +512,27 @@ fn quarantine_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<QuarantineRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_database_opens_from_many_threads_at_once() {
+        for _ in 0..20 {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("history.sqlite");
+            let start = std::sync::Barrier::new(8);
+            let failures: Vec<String> = std::thread::scope(|s| {
+                let opened: Vec<_> = (0..8)
+                    .map(|_| {
+                        s.spawn(|| {
+                            start.wait();
+                            Store::open(&path).and_then(|store| store.recent_scans(10, None).map(drop)).err().map(|e| format!("{e:#}"))
+                        })
+                    })
+                    .collect();
+                opened.into_iter().filter_map(|t| t.join().unwrap()).collect()
+            });
+            assert!(failures.is_empty(), "{failures:?}");
+        }
+    }
 
     #[test]
     fn upgrades_a_first_release_database() {

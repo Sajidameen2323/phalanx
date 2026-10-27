@@ -120,6 +120,8 @@ Driven by the detection report from step 0:
 
 ## Step 7: History people can manage (about 1 week)
 
+*In progress:* see [history.md](history.md) for the milestones and progress.
+
 History is the record of what Phalanx saw and did. Today the app loads the latest
 300 entries, nothing can be found, removed or exported, and every real-time batch
 adds a row, so the database only grows.

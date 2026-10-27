@@ -12,7 +12,7 @@ pub mod web;
 #[cfg(windows)]
 pub mod manage;
 
-use crate::ipc::{Caller, ClientMessage, Reply, Request, ScanDetails, Status};
+use crate::ipc::{replies, Caller, ClientMessage, Reply, Request, ScanDetails, Status};
 use crate::web::WebConfig;
 use protect::{Hub, Protector};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +23,6 @@ use crate::quarantine::Quarantine;
 use crate::scan;
 use crate::store::Store;
 use serde::Serialize;
-use serde_json::json;
 use settings::ProtectionSettings;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -49,6 +48,21 @@ struct Context {
 }
 
 impl Context {
+    /// The service's parts, none of them started yet.
+    fn new(data_dir: &Path, stop_requested: std::sync::mpsc::Sender<()>) -> Self {
+        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let hub = Arc::new(Hub::default());
+        let protector = Protector::new(data_dir, Arc::clone(&hub));
+        let web = WebGuard::new(data_dir, Arc::clone(&hub));
+        // New signatures or web rules: reload the engine and the web rules.
+        let (reload_engine, reload_web, settings_dir) = (Arc::clone(&protector), Arc::clone(&web), data_dir.to_path_buf());
+        let updater = Updater::new(data_dir, Arc::clone(&hub), move || {
+            reload_engine.reload_signatures(&ProtectionSettings::load(&settings_dir).unwrap_or_default());
+            reload_web.reload();
+        });
+        Context { started, data_dir: data_dir.to_path_buf(), settings: Mutex::new(()), stop_requested, hub, protector, web, updater }
+    }
+
     /// Applies web settings off the pipe's threads (the DNS filter may restart).
     fn reapply_web(&self, config: WebConfig) {
         let web = Arc::clone(&self.web);
@@ -93,8 +107,8 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
     }
     let dir = ctx.data_dir.as_path();
     match message.request {
-        Request::Ping => Reply::ok(id, json!("pong")),
-        Request::Status => reply(
+        Request::Ping => reply::<replies::Ping>(id, Ok("pong".into())),
+        Request::Status => reply::<replies::Status>(
             id,
             Ok(Status {
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -106,9 +120,9 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
         ),
         Request::Stop => {
             let _ = ctx.stop_requested.send(());
-            Reply::ok(id, json!("stopping"))
+            reply::<replies::Stop>(id, Ok("stopping".into()))
         }
-        Request::GetSettings => reply(id, ProtectionSettings::load(dir)),
+        Request::GetSettings => reply::<replies::GetSettings>(id, ProtectionSettings::load(dir)),
         Request::SetSettings { settings } => {
             let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
             let current = match ProtectionSettings::load(dir) {
@@ -119,7 +133,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             if !weaker.is_empty() && !caller.admin {
                 return Reply::needs_approval_because(id, &weaker);
             }
-            reply(
+            reply::<replies::SetSettings>(
                 id,
                 settings.save(dir).map(|()| {
                     ctx.reapply(settings.clone());
@@ -128,20 +142,20 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                 }),
             )
         }
-        Request::RecentScans { limit, kind } => reply(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
-        Request::ScanDetails { scan } => reply(
+        Request::RecentScans { limit, kind } => reply::<replies::RecentScans>(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
+        Request::ScanDetails { scan } => reply::<replies::ScanDetails>(
             id,
             session.store(dir).and_then(|s| Ok(ScanDetails { detections: s.scan_detections(scan)?, errors: s.scan_errors(scan)? })),
         ),
-        Request::RecentDetections { limit } => reply(id, session.store(dir).and_then(|s| s.recent_detections(limit))),
-        Request::MonthlySummary => reply(id, session.store(dir).and_then(|s| s.monthly_summary())),
-        Request::Quarantine { include_restored } => reply(id, session.store(dir).and_then(|s| s.quarantine_items(include_restored))),
-        Request::Restore { item, force } => reply(
+        Request::RecentDetections { limit } => reply::<replies::RecentDetections>(id, session.store(dir).and_then(|s| s.recent_detections(limit))),
+        Request::MonthlySummary => reply::<replies::MonthlySummary>(id, session.store(dir).and_then(|s| s.monthly_summary())),
+        Request::Quarantine { include_restored } => reply::<replies::Quarantine>(id, session.store(dir).and_then(|s| s.quarantine_items(include_restored))),
+        Request::Restore { item, force } => reply::<replies::Restore>(
             id,
             session.store(dir).and_then(|s| Quarantine::new(scan::quarantine_dir(dir), s)?.restore(&item, force)),
         ),
         Request::DeleteQuarantined { item } => {
-            reply(id, session.store(dir).and_then(|s| Quarantine::new(scan::quarantine_dir(dir), s)?.delete(&item)))
+            reply::<replies::DeleteQuarantined>(id, session.store(dir).and_then(|s| Quarantine::new(scan::quarantine_dir(dir), s)?.delete(&item)))
         }
         Request::Migrate { from, auth_key } => {
             let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
@@ -161,11 +175,11 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
                 ctx.reapply(settings);
                 ctx.reapply_web(web);
             }
-            reply(id, done)
+            reply::<replies::Migrate>(id, done)
         }
-        Request::UpdateSignatures { force } => reply(id, ctx.updater.start(force).map(|()| json!("started"))),
-        Request::SetAuthKey { key } => reply(id, updates::save_auth_key(dir, key.as_deref())),
-        Request::GetWebSettings => reply(id, WebConfig::load(dir)),
+        Request::UpdateSignatures { force } => reply::<replies::UpdateSignatures>(id, ctx.updater.start(force).map(|()| "started".into())),
+        Request::SetAuthKey { key } => reply::<replies::SetAuthKey>(id, updates::save_auth_key(dir, key.as_deref())),
+        Request::GetWebSettings => reply::<replies::GetWebSettings>(id, WebConfig::load(dir)),
         Request::SetWebSettings { settings } => {
             let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
             let current = match WebConfig::load(dir) {
@@ -176,7 +190,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             if !weaker.is_empty() && !caller.admin {
                 return Reply::needs_approval_because(id, &weaker);
             }
-            reply(
+            reply::<replies::SetWebSettings>(
                 id,
                 settings.save(dir).map(|()| {
                     ctx.reapply_web(settings.clone());
@@ -197,31 +211,31 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             };
             match config.change_site(change, &site) {
                 Err(e) => Reply::error(id, e.to_string()),
-                Ok(host) => reply(
+                Ok(host) => reply::<replies::ChangeSite>(
                     id,
                     config.save(dir).map(|()| {
                         ctx.reapply_web(config.clone());
                         ctx.hub.send(&crate::ipc::Event::WebSettingsChanged { settings: config.clone() });
-                        json!({ "site": host, "settings": config })
+                        replies::SiteChanged { site: host, settings: config }
                     }),
                 ),
             }
         }
-        Request::WebStatus => reply(id, Ok(ctx.web.status())),
-        Request::QuarantineFile { path, threat } => reply(id, session.store(dir).and_then(|s| quarantine_any(s, dir, &plain(&path), &threat))),
+        Request::WebStatus => reply::<replies::WebStatus>(id, Ok(ctx.web.status())),
+        Request::QuarantineFile { path, threat } => reply::<replies::QuarantineFile>(id, session.store(dir).and_then(|s| quarantine_any(s, dir, &plain(&path), &threat))),
         // Handled by the connection itself (see `imp::serve`).
-        Request::Subscribe => Reply::ok(id, json!("subscribed")),
-        Request::ProtectionStatus => reply(id, Ok(ctx.protector.status())),
-        Request::RunBoxView => reply(id, Ok(crate::rtp::commands::run_box_view())),
+        Request::Subscribe => reply::<replies::Subscribe>(id, Ok("subscribed".into())),
+        Request::ProtectionStatus => reply::<replies::ProtectionStatus>(id, Ok(ctx.protector.status())),
+        Request::RunBoxView => reply::<replies::RunBoxView>(id, Ok(crate::rtp::commands::run_box_view())),
         Request::Scan { paths, kind } => {
             let paths = paths.iter().map(|p| plain(p)).collect();
-            reply(id, ProtectionSettings::load(dir).and_then(|settings| ctx.protector.scan(paths, &kind, &settings)).map(|job| json!({ "job": job })))
+            reply::<replies::Scan>(id, ProtectionSettings::load(dir).and_then(|settings| ctx.protector.scan(paths, &kind, &settings)).map(|job| replies::ScanStarted { job }))
         }
         Request::CancelScan { job } => match ctx.protector.cancel(job) {
-            true => Reply::ok(id, json!("cancelling")),
+            true => reply::<replies::CancelScan>(id, Ok("cancelling".into())),
             false => Reply::error(id, format!("there is no scan {job} running")),
         },
-        Request::QuarantineDetection { scan, path } => reply(id, session.store(dir).and_then(|s| quarantine_detection(s, dir, scan, &path))),
+        Request::QuarantineDetection { scan, path } => reply::<replies::QuarantineDetection>(id, session.store(dir).and_then(|s| quarantine_detection(s, dir, scan, &path))),
     }
 }
 
@@ -328,26 +342,8 @@ impl Running {
 pub fn start(pipe_name: &str, data_dir: &Path) -> io::Result<Running> {
     std::fs::create_dir_all(data_dir)?;
     let (tx, rx) = std::sync::mpsc::channel();
-    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let hub = Arc::new(Hub::default());
-    let protector = Protector::new(data_dir, Arc::clone(&hub));
-    let web = WebGuard::new(data_dir, Arc::clone(&hub));
-    // New signatures or web rules: reload the engine and the web rules.
-    let (reload_engine, reload_web, settings_dir) = (Arc::clone(&protector), Arc::clone(&web), data_dir.to_path_buf());
-    let updater = Updater::new(data_dir, Arc::clone(&hub), move || {
-        reload_engine.reload_signatures(&ProtectionSettings::load(&settings_dir).unwrap_or_default());
-        reload_web.reload();
-    });
-    let ctx = Context {
-        started,
-        data_dir: data_dir.to_path_buf(),
-        settings: Mutex::new(()),
-        stop_requested: tx,
-        hub,
-        protector: Arc::clone(&protector),
-        web: Arc::clone(&web),
-        updater: Arc::clone(&updater),
-    };
+    let ctx = Context::new(data_dir, tx);
+    let (protector, web, updater) = (Arc::clone(&ctx.protector), Arc::clone(&ctx.web), Arc::clone(&ctx.updater));
     let schedule = Arc::new(AtomicBool::new(false));
     #[cfg(windows)]
     {
@@ -458,8 +454,219 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::plain;
+    use super::{handle, plain, Context, Session};
+    use crate::ipc::{replies, Caller, ClientMessage, Reply, Request};
+    use crate::service::settings::ProtectionSettings;
+    use crate::web::{SiteChange, WebConfig};
+    use serde::de::DeserializeOwned;
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// Every kind of request there is. A new one fails the contract test
+    /// until it is sent there (and given a type in [`replies`]).
+    const REQUEST_KINDS: usize = 26;
+
+    /// Reads `reply` as its request's type in [`replies`], as clients do.
+    /// The match has no catch-all, so a new request does not compile
+    /// without one.
+    fn contract(request: &Request, reply: Reply) -> Result<(), String> {
+        fn read<T: DeserializeOwned>(reply: Reply) -> Result<(), String> {
+            reply.into_result::<T>().map(drop).map_err(|e| e.to_string())
+        }
+        match request {
+            Request::Ping => read::<replies::Ping>(reply),
+            Request::Status => read::<replies::Status>(reply),
+            Request::Stop => read::<replies::Stop>(reply),
+            Request::GetSettings => read::<replies::GetSettings>(reply),
+            Request::SetSettings { .. } => read::<replies::SetSettings>(reply),
+            Request::RecentScans { .. } => read::<replies::RecentScans>(reply),
+            Request::ScanDetails { .. } => read::<replies::ScanDetails>(reply),
+            Request::RecentDetections { .. } => read::<replies::RecentDetections>(reply),
+            Request::MonthlySummary => read::<replies::MonthlySummary>(reply),
+            Request::Quarantine { .. } => read::<replies::Quarantine>(reply),
+            Request::Restore { .. } => read::<replies::Restore>(reply),
+            Request::DeleteQuarantined { .. } => read::<replies::DeleteQuarantined>(reply),
+            Request::Migrate { .. } => read::<replies::Migrate>(reply),
+            Request::Subscribe => read::<replies::Subscribe>(reply),
+            Request::ProtectionStatus => read::<replies::ProtectionStatus>(reply),
+            Request::RunBoxView => read::<replies::RunBoxView>(reply),
+            Request::Scan { .. } => read::<replies::Scan>(reply),
+            Request::CancelScan { .. } => read::<replies::CancelScan>(reply),
+            Request::QuarantineDetection { .. } => read::<replies::QuarantineDetection>(reply),
+            Request::UpdateSignatures { .. } => read::<replies::UpdateSignatures>(reply),
+            Request::SetAuthKey { .. } => read::<replies::SetAuthKey>(reply),
+            Request::GetWebSettings => read::<replies::GetWebSettings>(reply),
+            Request::SetWebSettings { .. } => read::<replies::SetWebSettings>(reply),
+            Request::ChangeSite { .. } => read::<replies::ChangeSite>(reply),
+            Request::WebStatus => read::<replies::WebStatus>(reply),
+            Request::QuarantineFile { .. } => read::<replies::QuarantineFile>(reply),
+        }
+    }
+
+    /// Sends requests the way the pipe delivers them, as an administrator
+    /// (so the requests only administrators may make are checked too), and
+    /// checks each reply against its contract.
+    struct Service {
+        ctx: Context,
+        session: Session,
+        admin: Caller,
+        next_id: u64,
+        checked: BTreeSet<String>,
+    }
+
+    impl Service {
+        fn ask(&mut self, request: Request) -> Reply {
+            let reply = self.send(request.clone());
+            assert!(reply.ok, "{request:?} failed: {:?}", reply.error);
+            self.check(&request, &reply);
+            reply
+        }
+
+        /// Like `ask`, for a request that may fairly fail (`allowed` is part
+        /// of its error); its type is checked when it succeeds.
+        fn ask_or(&mut self, request: Request, allowed: &str) {
+            let reply = self.send(request.clone());
+            if reply.ok {
+                self.check(&request, &reply);
+            } else {
+                assert!(reply.error.as_deref().is_some_and(|e| e.contains(allowed)), "{request:?} failed: {:?}", reply.error);
+                self.checked.insert(kind(&request));
+            }
+        }
+
+        fn send(&mut self, request: Request) -> Reply {
+            self.next_id += 1;
+            // Through JSON both ways, as on the pipe.
+            let message: ClientMessage = serde_json::from_str(&serde_json::to_string(&ClientMessage { id: self.next_id, request }).unwrap()).unwrap();
+            let reply = handle(&self.ctx, &mut self.session, &self.admin, message);
+            serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap()
+        }
+
+        fn check(&mut self, request: &Request, reply: &Reply) {
+            if let Err(e) = contract(request, reply.clone()) {
+                panic!("the reply to {request:?} does not read as its type in `replies`: {e}\n{:?}", reply.result);
+            }
+            self.checked.insert(kind(request));
+        }
+    }
+
+    /// The request's name on the wire.
+    fn kind(request: &Request) -> String {
+        serde_json::to_value(request).unwrap()["op"].as_str().unwrap().to_string()
+    }
+
+    fn read<T: DeserializeOwned>(reply: Reply) -> T {
+        reply.into_result().unwrap()
+    }
+
+    /// The service's events as they are written to a subscriber.
+    #[derive(Clone, Default)]
+    struct Events(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Events {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Events {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[test]
+    fn every_reply_reads_back_as_its_named_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Protection, the DNS filter and web rules stay off: this checks
+        // replies, not protection. Scans run at normal priority: in
+        // background mode they can wait out a busy test run.
+        let quiet = ProtectionSettings { watch_enabled: false, performance: crate::system::Performance::Fast, ..Default::default() };
+        quiet.save(&dir).unwrap();
+        let web_off = WebConfig { enabled: false, dns_filter: false, ..Default::default() };
+        web_off.save(&dir).unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let ctx = Context::new(&dir, stop_tx);
+        let events = Events::default();
+        ctx.hub.subscribe(Box::new(events.clone()));
+        // Loads the signatures, for the scans below.
+        ctx.protector.apply(&quiet);
+        let admin = Caller { user: r"TEST\admin".into(), sid: "S-1-5-21-0-0-0-500".into(), admin: true };
+        let mut service = Service { ctx, session: Session::default(), admin, next_id: 0, checked: BTreeSet::new() };
+
+        service.ask(Request::Ping);
+        service.ask(Request::Status);
+        service.ask(Request::GetSettings);
+        service.ask(Request::SetSettings { settings: quiet.clone() });
+        service.ask(Request::ProtectionStatus);
+        service.ask(Request::RunBoxView);
+        service.ask(Request::Subscribe);
+        service.ask(Request::SetAuthKey { key: None });
+        service.ask(Request::GetWebSettings);
+        service.ask(Request::SetWebSettings { settings: web_off.clone() });
+        let changed: replies::ChangeSite = read(service.ask(Request::ChangeSite { change: SiteChange::Block, site: "https://example.test/x".into() }));
+        assert_eq!(changed.site, "example.test");
+        service.ask(Request::WebStatus);
+
+        // A scan that finds the test marker, for History and quarantine.
+        let scanned = tmp.path().join("scanned");
+        std::fs::create_dir_all(&scanned).unwrap();
+        let bad = scanned.join("setup.txt");
+        std::fs::write(&bad, format!("x {} y", "threat-scanner-test-marker-7f3a".to_ascii_uppercase())).unwrap();
+        service.ask(Request::Scan { paths: vec![scanned.clone()], kind: "custom".into() });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let scan = loop {
+            let scans: replies::RecentScans = read(service.ask(Request::RecentScans { limit: 10, kind: Some("custom".into()) }));
+            if let Some(row) = scans.iter().find(|s| s.detections > 0 && s.finished_at.is_some()) {
+                break row.id;
+            }
+            assert!(Instant::now() < deadline, "the scan did not finish: {scans:?}
+events:
+{}", events.text());
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        // A second scan, cancelled; it may finish first.
+        let started: replies::Scan = read(service.ask(Request::Scan { paths: vec![scanned.clone()], kind: "custom".into() }));
+        service.ask_or(Request::CancelScan { job: started.job }, "there is no scan");
+        let details: replies::ScanDetails = read(service.ask(Request::ScanDetails { scan }));
+        assert_eq!(details.detections.len(), 1, "{details:?}");
+        service.ask(Request::RecentDetections { limit: 10 });
+        service.ask(Request::MonthlySummary);
+
+        // Quarantine: what the scan found, then put back; a file no scan
+        // found, then deleted.
+        let id: replies::QuarantineDetection = read(service.ask(Request::QuarantineDetection { scan, path: bad.clone() }));
+        let listed: replies::Quarantine = read(service.ask(Request::Quarantine { include_restored: false }));
+        assert!(listed.iter().any(|q| q.id == id), "{listed:?}");
+        let back: replies::Restore = read(service.ask(Request::Restore { item: id, force: false }));
+        assert!(back.ends_with("setup.txt") && bad.exists(), "{back:?}");
+        let other = tmp.path().join("other.txt");
+        std::fs::write(&other, "flagged by AI Inspect").unwrap();
+        let id: replies::QuarantineFile = read(service.ask(Request::QuarantineFile { path: other.clone(), threat: "Test.Contract".into() }));
+        service.ask(Request::DeleteQuarantined { item: id });
+
+        // A 0.4 user's folder brought over (protection stays off there too).
+        let old = tmp.path().join("old-user");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("gui-settings.json"), r#"{"watch_enabled": false}"#).unwrap();
+        service.ask(Request::Migrate { from: old, auth_key: None });
+
+        // Not sent: it would download every feed. Its reply is built with
+        // `replies::UpdateSignatures`, which the compiler checks.
+        service.checked.insert(kind(&Request::UpdateSignatures { force: false }));
+
+        service.ask(Request::Stop);
+        assert!(stop_rx.try_recv().is_ok(), "the service was told to stop");
+        assert_eq!(service.checked.len(), REQUEST_KINDS, "not every request was checked: {:?}", service.checked);
+    }
 
     #[test]
     fn paths_have_one_spelling() {

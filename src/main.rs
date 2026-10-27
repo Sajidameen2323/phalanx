@@ -1074,7 +1074,7 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             if reply.needs_approval {
                 anyhow::bail!("migrating needs administrator rights: run this from a terminal opened as administrator");
             }
-            let done: threat_scanner::service::migrate::Migrated = reply.into_result()?;
+            let done: ipc::replies::Migrate = reply.into_result()?;
             println!("Brought over from {}:", done.from.display());
             println!("    settings:   {}", if done.settings { "yes" } else { "none found" });
             println!("    history:    {} scan(s)", done.scans);
@@ -1084,7 +1084,7 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
         }
         ServiceCommand::History { limit } => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
-            let scans: Vec<threat_scanner::store::ScanRow> = client.call(ipc::Request::RecentScans { limit: *limit, kind: None })?.into_result()?;
+            let scans: ipc::replies::RecentScans = client.call(ipc::Request::RecentScans { limit: *limit, kind: None })?.into_result()?;
             if scans.is_empty() {
                 println!("No scans yet.");
             }
@@ -1100,8 +1100,8 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             // Absolute, as the service does not share this working folder;
             // not canonical, which on Windows means `\\?\C:\…` paths.
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            let started: serde_json::Value = connect()?.call(ipc::Request::Scan { paths, kind: kind.clone() })?.into_result()?;
-            let job = started["job"].as_u64().unwrap_or_default();
+            let started: ipc::replies::Scan = connect()?.call(ipc::Request::Scan { paths, kind: kind.clone() })?.into_result()?;
+            let job = started.job;
             println!("Scanning in the service (job {job})…");
             loop {
                 let ipc::ServerMessage::Event { event } = events.next_message()? else { continue };
@@ -1130,7 +1130,7 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             if reply.needs_approval {
                 anyhow::bail!("this shows every user's Run-box history, so it needs administrator rights");
             }
-            let view: threat_scanner::rtp::commands::RunBoxView = reply.into_result()?;
+            let view: ipc::replies::RunBoxView = reply.into_result()?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         ServiceCommand::Site { change, site } => {
@@ -1145,12 +1145,12 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             if reply.needs_approval {
                 anyhow::bail!("{}: run this from a terminal opened as administrator", reply.error.unwrap_or_default());
             }
-            let done: serde_json::Value = reply.into_result()?;
-            println!("Done: {}", done["site"].as_str().unwrap_or(site));
+            let done: ipc::replies::ChangeSite = reply.into_result()?;
+            println!("Done: {}", done.site);
         }
         ServiceCommand::Ads { state } => {
             let mut client = connect()?;
-            let mut settings: threat_scanner::web::WebConfig = client.call(ipc::Request::GetWebSettings)?.into_result()?;
+            let mut settings: ipc::replies::GetWebSettings = client.call(ipc::Request::GetWebSettings)?.into_result()?;
             settings.block_ads = matches!(state, OnOff::On);
             let reply = client.call(ipc::Request::SetWebSettings { settings })?;
             if reply.needs_approval {
@@ -1208,7 +1208,7 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             println!("The web settings are saved.");
         }
         ServiceCommand::Restore { id, force } => {
-            let path: PathBuf = approved(connect()?.call(ipc::Request::Restore { item: id.clone(), force: *force })?)?;
+            let path: ipc::replies::Restore = approved(connect()?.call(ipc::Request::Restore { item: id.clone(), force: *force })?)?;
             println!("Restored to {}.", path.display());
         }
         ServiceCommand::DeleteQuarantined { id } => {
@@ -1217,7 +1217,7 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
         }
         ServiceCommand::Quarantine { path, threat } => {
             let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
-            let id: String = approved(connect()?.call(ipc::Request::QuarantineFile { path, threat: threat.clone() })?)?;
+            let id: ipc::replies::QuarantineFile = approved(connect()?.call(ipc::Request::QuarantineFile { path, threat: threat.clone() })?)?;
             println!("Quarantined ({id}).");
         }
         ServiceCommand::Web => {
@@ -1238,12 +1238,12 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
         }
         ServiceCommand::Protection => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
-            let status: ipc::ProtectionStatus = client.call(ipc::Request::ProtectionStatus)?.into_result()?;
+            let status: ipc::replies::ProtectionStatus = client.call(ipc::Request::ProtectionStatus)?.into_result()?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         ServiceCommand::Settings => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
-            let settings: threat_scanner::service::settings::ProtectionSettings = client.call(ipc::Request::GetSettings)?.into_result()?;
+            let settings: ipc::replies::GetSettings = client.call(ipc::Request::GetSettings)?.into_result()?;
             println!("{}", serde_json::to_string_pretty(&settings)?);
         }
         ServiceCommand::Status => {

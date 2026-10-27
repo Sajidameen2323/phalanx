@@ -342,6 +342,71 @@ pub struct ScanDetails {
     pub errors: Vec<ScanErrorRow>,
 }
 
+/// What each request's reply holds, named after the request. The service
+/// builds every reply with these types and clients read them with the same
+/// ones, so the two cannot drift apart unnoticed (History's "Show details"
+/// once broke that way); the service's contract test checks each one through
+/// the reply's wire form.
+pub mod replies {
+    use crate::rtp::commands;
+    use crate::service::{migrate, settings, web as service_web};
+    use crate::store::{DetectionRow, MonthRow, QuarantineRow, ScanRow};
+    use crate::web::WebConfig;
+    use serde::{Deserialize, Serialize};
+    use std::path::PathBuf;
+
+    /// `"pong"`.
+    pub type Ping = String;
+    pub type Status = super::Status;
+    /// `"stopping"`.
+    pub type Stop = String;
+    pub type GetSettings = settings::ProtectionSettings;
+    /// The settings now in force.
+    pub type SetSettings = settings::ProtectionSettings;
+    pub type RecentScans = Vec<ScanRow>;
+    pub type ScanDetails = super::ScanDetails;
+    pub type RecentDetections = Vec<DetectionRow>;
+    pub type MonthlySummary = Vec<MonthRow>;
+    pub type Quarantine = Vec<QuarantineRow>;
+    /// Where the file was put back.
+    pub type Restore = PathBuf;
+    pub type DeleteQuarantined = ();
+    pub type Migrate = migrate::Migrated;
+    /// `"subscribed"`; events follow on the same connection.
+    pub type Subscribe = String;
+    pub type ProtectionStatus = super::ProtectionStatus;
+    pub type RunBoxView = commands::RunBoxView;
+    pub type Scan = ScanStarted;
+    /// `"cancelling"`.
+    pub type CancelScan = String;
+    /// The quarantine id.
+    pub type QuarantineDetection = String;
+    /// `"started"`; progress arrives as events.
+    pub type UpdateSignatures = String;
+    pub type SetAuthKey = ();
+    pub type GetWebSettings = WebConfig;
+    /// The web settings now in force.
+    pub type SetWebSettings = WebConfig;
+    pub type ChangeSite = SiteChanged;
+    pub type WebStatus = service_web::WebStatus;
+    /// The quarantine id.
+    pub type QuarantineFile = String;
+
+    /// The reply to `Scan`: the job its progress events carry.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ScanStarted {
+        pub job: u64,
+    }
+
+    /// The reply to `ChangeSite`: the host as it was saved, and the web
+    /// settings with the change.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SiteChanged {
+        pub site: String,
+        pub settings: WebConfig,
+    }
+}
+
 /// The reply to `ProtectionStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectionStatus {

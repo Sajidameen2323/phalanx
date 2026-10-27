@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use threat_scanner::ai::{self, AiReport, Evidence};
 use threat_scanner::engine::{Engine, EngineConfig};
 use threat_scanner::posture::{self, Check};
-use threat_scanner::ipc::{self, Event, Request};
+use threat_scanner::ipc::{self, replies, Event, Request};
 use threat_scanner::scan::{self, FileReport, ScanOptions, ScanReport};
 use threat_scanner::service::settings::ProtectionSettings;
 use threat_scanner::store::{DetectionRow, MonthRow, QuarantineRow, ScanErrorRow, ScanRow};
@@ -726,9 +726,9 @@ impl App {
         self.link.run(
             || -> Result<_, String> {
                 use link::read;
-                let q: Vec<QuarantineRow> = read(Request::Quarantine { include_restored: false })?;
-                let s: Vec<ScanRow> = read(Request::RecentScans { limit: 300, kind: None })?;
-                let m: Vec<MonthRow> = read(Request::MonthlySummary)?;
+                let q: replies::Quarantine = read(Request::Quarantine { include_restored: false })?;
+                let s: replies::RecentScans = read(Request::RecentScans { limit: 300, kind: None })?;
+                let m: replies::MonthlySummary = read(Request::MonthlySummary)?;
                 Ok((q, s, m))
             },
             |app, loaded| match loaded {
@@ -851,10 +851,10 @@ impl App {
         let threads = options.threads;
         let (paths, kind_name) = (options.paths.clone(), kind.to_string());
         self.link.run(
-            move || link::call(Request::Scan { paths, kind: kind_name }).and_then(|r| r.into_result::<serde_json::Value>().map_err(|e| e.to_string())),
+            move || link::call(Request::Scan { paths, kind: kind_name }).and_then(|r| r.into_result::<replies::Scan>().map_err(|e| e.to_string())),
             |app, started| match started {
                 Ok(reply) => {
-                    let id = reply["job"].as_u64();
+                    let id = Some(reply.job);
                     if let Some(job) = &mut app.job {
                         job.job = id;
                         // Events that came before the reply.
@@ -952,7 +952,7 @@ impl App {
                     .into_iter()
                     .map(|path| {
                         let result = link::call(Request::QuarantineDetection { scan, path: PathBuf::from(&path) })
-                            .and_then(|r| r.into_result::<String>().map_err(|e| e.to_string()));
+                            .and_then(|r| r.into_result::<replies::QuarantineDetection>().map_err(|e| e.to_string()));
                         (path, result)
                     })
                     .collect::<Vec<_>>()
@@ -1351,10 +1351,10 @@ impl App {
             || -> Result<_, String> {
                 let mut client = ipc::Client::connect().map_err(|e| ipc::describe(&e))?;
                 let status = client.status().map_err(|e| e.to_string())?;
-                let settings: ProtectionSettings = client.call(Request::GetSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
-                let web: threat_scanner::web::WebConfig = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
-                let protection: ipc::ProtectionStatus = client.call(Request::ProtectionStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
-                let web_status: threat_scanner::service::web::WebStatus = client.call(Request::WebStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let settings: replies::GetSettings = client.call(Request::GetSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let web: replies::GetWebSettings = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let protection: replies::ProtectionStatus = client.call(Request::ProtectionStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let web_status: replies::WebStatus = client.call(Request::WebStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
                 Ok((status, settings, web, protection, web_status))
             },
             move |app, read| match read {
@@ -1407,8 +1407,8 @@ impl App {
         let args = format!("service set-settings --json {}", link::hex_json(&wanted));
         self.link.run(
             move || {
-                let read = || link::call(Request::GetSettings).and_then(|r| r.into_result::<ProtectionSettings>().map_err(|e| e.to_string()));
-                match link::with_approval::<ProtectionSettings>(Request::SetSettings { settings: wanted }, &args, read) {
+                let read = || link::call(Request::GetSettings).and_then(|r| r.into_result::<replies::GetSettings>().map_err(|e| e.to_string()));
+                match link::with_approval::<replies::SetSettings>(Request::SetSettings { settings: wanted }, &args, read) {
                     link::Approval::Done(settings) => (Ok(settings), None),
                     link::Approval::Declined => (read(), Some("Not changed: Windows' administrator prompt was declined".to_string())),
                     link::Approval::Failed(e) => (read(), Some(format!("Could not change the settings: {e}"))),

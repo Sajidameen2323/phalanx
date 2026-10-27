@@ -932,7 +932,7 @@ impl App {
         }
         if let Some(id) = toggle && self.expanded.remove(&id).is_none() {
             self.link.run(
-                move || link::read::<ipc::ScanDetails>(Request::ScanDetails { scan: id }),
+                move || link::read::<ipc::replies::ScanDetails>(Request::ScanDetails { scan: id }),
                 move |app, details| match details {
                     Ok(ipc::ScanDetails { detections, errors }) => {
                         app.expanded.insert(id, ScanDetails { detections, errors });

@@ -519,7 +519,7 @@ fn change_site_via_service(change: SiteChange, site: &str) -> std::result::Resul
 fn set_ads_via_service(on: bool) -> std::result::Result<(), String> {
     use crate::ipc::{Client, Request};
     let mut client = Client::connect().map_err(|e| crate::ipc::describe(&e))?;
-    let mut settings: WebConfig = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+    let mut settings: crate::ipc::replies::GetWebSettings = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
     settings.block_ads = on;
     let reply = client.call(Request::SetWebSettings { settings }).map_err(|e| e.to_string())?;
     match (reply.ok, reply.needs_approval) {
