@@ -128,7 +128,7 @@ impl App {
                 ui,
                 &mut self.settings.browser_guard,
                 "Watch who opens browser passwords and cookies",
-                "Catches programs other than your browser opening its saved passwords, sign-in cookies or the key that unlocks them, and browsers started in secret for remote control. Stolen sign-in cookies let a thief read your email, password-reset codes included, without your password or second factor. It watches every file opened on the PC, so it uses some processor time and a few MB of memory.",
+                "Catches programs other than your browser opening its saved passwords, sign-in cookies or the key that unlocks them (and Discord's, Telegram's and crypto wallets' sign-in data), reading a browser's memory, or loading unsigned code into it, and browsers started in secret for remote control or with a planted extension. Stolen sign-in cookies let a thief read your email, password-reset codes included, without your password or second factor. It watches every file opened on the PC, so it uses some processor time and a few MB of memory.",
             );
             row_divider(ui);
             ui.add_enabled_ui(self.settings.browser_guard, |ui| {
@@ -171,7 +171,7 @@ impl App {
 
         for (i, hit) in self.audit.browser_hits.iter().enumerate() {
             ui.add_space(8.0);
-            let allowed = self.settings.browser_guard_allowed.iter().any(|a| a.as_os_str().eq_ignore_ascii_case(hit.image.as_os_str()));
+            let allowed = self.settings.browser_guard_allowed.iter().any(|a| a.as_os_str().eq_ignore_ascii_case(subject(hit).as_os_str()));
             browser_hit_card(ui, i, hit, allowed, &mut action);
         }
         if !self.audit.browser_hits.is_empty() {
@@ -357,9 +357,10 @@ fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, allowed: bool, 
             if !stopped && hit.process().is_some() && small_button(ui, "Stop it").clicked() {
                 *action = Some(WatchAction::Stop(index));
             }
-            let file = hit.image.is_file().then(|| hit.image.clone());
+            let file = subject(hit).is_file().then(|| subject(hit).to_path_buf());
             if let Some(path) = &file {
-                if hit.kind == BrowserGuardKind::DataRead && !allowed && small_button(ui, "Allow this program").clicked() {
+                let label = if hit.kind == BrowserGuardKind::Injected { "Allow this DLL" } else { "Allow this program" };
+                if hit.kind != BrowserGuardKind::RemoteControl && !allowed && small_button(ui, label).clicked() {
                     *action = Some(WatchAction::Allow(path.clone()));
                 }
                 if small_button(ui, "Open folder").clicked() {
@@ -371,6 +372,15 @@ fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, allowed: bool, 
             }
         });
     });
+}
+
+/// The file an alert is about: the DLL loaded into a browser, otherwise
+/// the program.
+fn subject(hit: &BrowserHit) -> &Path {
+    match (hit.kind, hit.files.first()) {
+        (BrowserGuardKind::Injected, Some(dll)) => dll,
+        _ => &hit.image,
+    }
 }
 
 enum ItemAction {

@@ -68,6 +68,12 @@ pub struct ScanOptions {
     pub keep_clean_history: bool,
     /// Look inside ZIP and 7z archives (see [`crate::contents`]).
     pub archives: bool,
+    /// Skip developers' dependency, build and cache folders (`node_modules`,
+    /// `.git`, `.next`, Python environments, Cargo's `target`…) and source
+    /// maps: on for quick scans, where a project folder on the desktop can
+    /// hold hundreds of thousands of library files that are not run as they
+    /// are. Full and custom scans still look everywhere.
+    pub skip_build_folders: bool,
 }
 
 impl ScanOptions {
@@ -84,8 +90,28 @@ impl ScanOptions {
             trust_signed: true,
             keep_clean_history: true,
             archives: true,
+            skip_build_folders: kind == "quick",
         }
     }
+}
+
+/// Folders a quick scan skips: package managers' dependencies, version
+/// control, build output and caches. Python environments (`pyvenv.cfg`) and
+/// cache folders that mark themselves (`CACHEDIR.TAG`, as Cargo's `target`
+/// does) are recognised whatever their name.
+pub fn is_build_folder(dir: &Path) -> bool {
+    const NAMES: &[&str] = &[
+        "node_modules", "bower_components", "jspm_packages", ".pnpm-store", ".yarn", ".git", ".svn", ".hg", "__pycache__",
+        ".venv", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".gradle", ".terraform", ".turbo", ".parcel-cache",
+        ".svelte-kit", ".nuxt", ".angular", ".expo",
+    ];
+    let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()) else { return false };
+    NAMES.contains(&name.as_str()) || name.starts_with(".next") || dir.join("pyvenv.cfg").is_file() || dir.join("CACHEDIR.TAG").is_file()
+}
+
+/// Files a quick scan skips: source maps (JSON describing other code).
+fn is_build_file(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x.eq_ignore_ascii_case("map"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,7 +222,18 @@ pub fn run(
                 system::enter_background_mode();
             }
             'roots: for root in &options.paths {
-                for entry in walkdir::WalkDir::new(root).follow_links(false) {
+                // Exclusions are canonical paths. Each entry's is the root's
+                // plus the rest of its path, so no file is opened just to
+                // compare it; excluded folders are not entered at all.
+                let real_root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                let real = |path: &Path| path.strip_prefix(root).map_or_else(|_| path.to_path_buf(), |rest| real_root.join(rest));
+                let is_excluded = |path: &Path| !excluded.is_empty() && excluded.iter().any(|x| real(path).starts_with(x));
+                let walk = walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+                    !(e.depth() > 0
+                        && e.file_type().is_dir()
+                        && ((options.skip_build_folders && is_build_folder(e.path())) || is_excluded(e.path())))
+                });
+                for entry in walk {
                     if stopping() {
                         break 'roots;
                     }
@@ -211,7 +248,7 @@ pub fn run(
                     if !entry.file_type().is_file() {
                         continue;
                     }
-                    if let Ok(real) = fs::canonicalize(entry.path()) && excluded.iter().any(|x| real.starts_with(x)) {
+                    if (options.skip_build_folders && is_build_file(entry.path())) || is_excluded(entry.path()) {
                         continue;
                     }
                     // A large program may be a small one padded past the
@@ -449,6 +486,38 @@ mod tests {
         quarantine_reported(&store, &data_dir, &report.infected[0]).unwrap();
         assert!(!bad.exists());
         assert_eq!(store.quarantine_items(false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quick_scans_skip_code_libraries_and_custom_scans_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let desktop = tmp.path().join("Desktop");
+        let project = desktop.join("app");
+        let bad = format!("x {} y", marker());
+        for dir in ["node_modules/lib/dist", ".git/objects", ".next-build/static", "venv/Lib", "target/debug", "src"] {
+            fs::create_dir_all(project.join(dir)).unwrap();
+        }
+        fs::write(project.join("venv/pyvenv.cfg"), "home = C:\\Python312").unwrap();
+        fs::write(project.join("target/CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55").unwrap();
+        for file in ["node_modules/lib/dist/x.js", ".git/objects/ab", ".next-build/static/c.js", "venv/Lib/m.py", "target/debug/app.exe", "src/app.js.map"] {
+            fs::write(project.join(file), &bad).unwrap();
+        }
+        fs::write(project.join("src/payload.js"), &bad).unwrap();
+        // A folder that only sounds like one is still scanned.
+        fs::create_dir_all(desktop.join("target practice")).unwrap();
+        fs::write(desktop.join("target practice/notes.txt"), &bad).unwrap();
+
+        let data_dir = tmp.path().join("data");
+        let store = open_store(&data_dir).unwrap();
+        let found = |kind: &str| {
+            let options = ScanOptions::new(vec![desktop.clone()], kind);
+            let report = run(&engine(), &store, &data_dir, &options, &AtomicBool::new(false), &mut |_| {}).unwrap();
+            let mut names: Vec<String> = report.infected.iter().map(|r| Path::new(&r.path).file_name().unwrap().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(found("quick"), ["notes.txt", "payload.js"]);
+        assert_eq!(found("custom").len(), 8, "a custom scan looks everywhere");
     }
 
     #[test]

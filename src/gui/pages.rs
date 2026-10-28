@@ -415,7 +415,7 @@ impl App {
                     card(col, |ui| {
                         ui.set_min_height(112.0);
                         let (title, text) = match mode {
-                            Mode::Quick => ("Quick scan", "Downloads, Desktop, Documents, Temp".to_string()),
+                            Mode::Quick => ("Quick scan", "Downloads, Desktop, Documents, Temp; skips code libraries such as node_modules".to_string()),
                             Mode::Full => ("Full scan", format!("All internal drives · {drive_list}")),
                             Mode::Custom => ("Custom scan", "Folders or files you choose".to_string()),
                         };

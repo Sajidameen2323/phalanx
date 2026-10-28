@@ -43,7 +43,7 @@ fn describe(event: RtpEvent) -> String {
         RtpEvent::BrowserGuard { active, .. } => format!("browser-guard {active}"),
         RtpEvent::BrowserData(hit) => {
             let stopped = matches!(hit.stopped, Some(Ok(())));
-            format!("browser-data {:?} {:?} {} stopped={stopped}", hit.kind, hit.level, hit.program.to_ascii_lowercase())
+            format!("browser-data {:?} {:?} {} stopped={stopped} ({})", hit.kind, hit.level, hit.program.to_ascii_lowercase(), hit.action())
         }
         RtpEvent::DriveAdded { root, files } => format!("drive {} {files}", root.display()),
         RtpEvent::Restarting { error, .. } => format!("restarting {error}"),
@@ -576,11 +576,31 @@ fn a_signed_program_loading_a_planted_windows_dll_is_reported() {
     assert_eq!(store.scan_detections(row.id).unwrap()[0].threat, "SideLoad.iphlpapi.dll");
 }
 
-/// Needs administrator rights (file opens come from an event session);
-/// skipped, and says so, without them.
+/// Waits up to `secs` for `child` to exit; kills it if it does not.
+#[cfg(windows)]
+fn exits_within(child: &mut std::process::Child, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return true,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                return false;
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// The browser data watch against real Windows events, one case after
+/// another (they share one event session): PowerShell and `curl` reading
+/// saved passwords, PowerShell opening a browser's memory, and an unsigned
+/// DLL from the temporary folder loaded into a browser. Stand-in browsers
+/// are copies of Windows' `ping` and `rundll32` named `chrome.exe`. Needs
+/// administrator rights; skipped, and says so, without them.
 #[cfg(windows)]
 #[test]
-fn a_script_host_opening_saved_passwords_is_caught_and_stopped() {
+fn the_browser_data_watch_catches_and_stops_stealers() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     // A profile where browsers keep one (the temporary folder is in AppData).
@@ -588,6 +608,8 @@ fn a_script_host_opening_saved_passwords_is_caught_and_stopped() {
     fs::create_dir_all(&profile).unwrap();
     let passwords = profile.join("Login Data");
     fs::write(&passwords, "not really a database").unwrap();
+    let system32 = Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join("System32");
+    let powershell = system32.join(r"WindowsPowerShell\v1.0\powershell.exe");
 
     let mut cfg = RtpConfig::new(Vec::new());
     cfg.scan_new_drives = false;
@@ -603,30 +625,68 @@ fn a_script_host_opening_saved_passwords_is_caught_and_stopped() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Like a PowerShell stealer: read the file, then stay to send it.
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let powershell = Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
     let script = format!("Get-Content -LiteralPath '{}' | Out-Null; Start-Sleep 60", passwords.display());
-    let mut child = std::process::Command::new(powershell).args(["-NoProfile", "-Command", &script]).spawn().unwrap();
-    let found = run.until(|m| m.starts_with("browser-data"));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let exited = loop {
-        match child.try_wait().unwrap() {
-            Some(_) => break true,
-            None if Instant::now() > deadline => break false,
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
-    if !exited {
-        let _ = child.kill();
-    }
+    let mut child = std::process::Command::new(&powershell).args(["-NoProfile", "-Command", &script]).spawn().unwrap();
+    let read = run.until(|m| m.starts_with("browser-data DataRead"));
+    let stopped = exits_within(&mut child, 10);
+    assert!(read && stopped, "{:?}", run.seen);
+    assert!(run.seen.iter().any(|m| m.starts_with("browser-data DataRead High powershell.exe stopped=true")), "{:?}", run.seen);
+
+    // Windows' own curl, sending the file somewhere (here, nowhere).
+    let url = format!("file:///{}", passwords.display().to_string().replace('\\', "/").replace(' ', "%20"));
+    let mut child = std::process::Command::new(system32.join("curl.exe")).args(["-s", "-o", "NUL", &url]).spawn().unwrap();
+    assert!(run.until(|m| m.starts_with("browser-data DataRead High curl.exe")), "{:?}", run.seen);
+    exits_within(&mut child, 10);
+
+    // A program opening a browser to read its memory.
+    let fake = tmp.path().join("browser");
+    fs::create_dir_all(&fake).unwrap();
+    fs::copy(system32.join("PING.EXE"), fake.join("chrome.exe")).unwrap();
+    let mut browser = std::process::Command::new(fake.join("chrome.exe"))
+        .args(["-n", "60", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let script = format!("$p = [Diagnostics.Process]::GetProcessById({}); $null = $p.Handle; Start-Sleep 60", browser.id());
+    let mut child = std::process::Command::new(&powershell).args(["-NoProfile", "-Command", &script]).spawn().unwrap();
+    let opened = run.until(|m| m.starts_with("browser-data MemoryRead"));
+    let stopped = exits_within(&mut child, 10);
+    let _ = browser.kill();
+    let _ = browser.wait();
+    assert!(opened && stopped, "{:?}", run.seen);
+    assert!(run.seen.iter().any(|m| m.starts_with("browser-data MemoryRead High powershell.exe stopped=true")), "{:?}", run.seen);
+
+    // Unsigned code loaded into a browser: ping, named chrome.exe, next to
+    // a changed (so unsigned) copy of a Windows DLL it imports, in the
+    // temporary folder; Windows loads the copy beside the program first.
+    let injector = tmp.path().join("injected");
+    fs::create_dir_all(&injector).unwrap();
+    fs::copy(system32.join("PING.EXE"), injector.join("chrome.exe")).unwrap();
+    let mut dll = fs::read(system32.join("IPHLPAPI.DLL")).unwrap();
+    dll.extend_from_slice(b"phalanx injection test");
+    fs::write(injector.join("IPHLPAPI.DLL"), dll).unwrap();
+    let mut child = std::process::Command::new(injector.join("chrome.exe"))
+        .args(["-n", "60", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let injected = run.until(|m| m.starts_with("browser-data Injected"));
+    let stopped = exits_within(&mut child, 10);
     run.handle.stop();
-    assert!(found, "{:?}", run.seen);
-    assert!(run.seen.contains(&"browser-data DataRead High powershell.exe stopped=true".to_string()), "{:?}", run.seen);
-    assert!(exited, "PowerShell was stopped");
+    assert!(injected && stopped, "{:?}", run.seen);
+    assert!(run.seen.iter().any(|m| m.starts_with("browser-data Injected High chrome.exe stopped=true")), "{:?}", run.seen);
+
     let store = scan::open_store(&data_dir).unwrap();
-    let row = &store.recent_scans(5, Some("browser")).unwrap()[0];
-    let finding = &store.scan_detections(row.id).unwrap()[0];
-    assert_eq!(finding.threat, "BrowserData.Read");
+    let threats: Vec<String> = store
+        .recent_scans(20, Some("browser"))
+        .unwrap()
+        .iter()
+        .map(|row| store.scan_detections(row.id).unwrap()[0].threat.clone())
+        .collect();
+    for threat in ["BrowserData.Read", "BrowserData.MemoryRead", "BrowserData.InjectedCode"] {
+        assert!(threats.iter().any(|t| t == threat), "{threat} not in {threats:?}");
+    }
 }
 
 #[test]

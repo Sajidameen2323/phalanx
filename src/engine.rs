@@ -190,6 +190,13 @@ impl FileScanner<'_> {
                             _ => {}
                         }
                     }
+                    // HTML smuggling is an HTML page building a file and
+                    // offering it as a download. JavaScript libraries that
+                    // make PDFs or images in the browser (jsPDF, html2pdf)
+                    // do the same in their own code: only pages count.
+                    if is_html_only(rule.identifier()) && !looks_like_markup(data) {
+                        continue;
+                    }
                     let category = if is_auto_generated(rule.identifier()) {
                         Category::Suspicious
                     } else {
@@ -226,6 +233,23 @@ impl FileScanner<'_> {
 /// only ever suspicious, whatever the rule's score.
 pub fn is_auto_generated(identifier: &str) -> bool {
     identifier.starts_with("MALPEDIA_") && identifier.ends_with("_Auto")
+}
+
+/// Rules about HTML pages (HTML smuggling), which only mean something on a
+/// file that is markup.
+pub fn is_html_only(identifier: &str) -> bool {
+    let lower = identifier.to_ascii_lowercase();
+    lower.contains("html_smuggling") || lower.contains("htmlsmuggling")
+}
+
+/// Whether `data` is markup: an HTML, SVG or HTA page starts with `<`
+/// (after a byte-order mark and white space). Scripts, bundles and source
+/// maps do not.
+pub fn looks_like_markup(data: &[u8]) -> bool {
+    let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(data);
+    // UTF-16 pages: the first character's low byte comes first.
+    let data = data.strip_prefix(&[0xFF, 0xFE][..]).unwrap_or(data);
+    data.iter().find(|b| !b.is_ascii_whitespace() && **b != 0) == Some(&b'<')
 }
 
 /// Category for a rule without `category` meta, as in most public rule sets.
@@ -452,6 +476,33 @@ mod tests {
         assert_eq!(infer_category("ELASTIC_Windows_Trojan_Agent", Some(75)), Category::Malware);
         assert_eq!(infer_category("ELASTIC_Windows_Trojan_Agent", Some(60)), Category::Suspicious);
         assert_eq!(infer_category("SomeRule", None), Category::Suspicious);
+    }
+
+    #[test]
+    fn html_smuggling_rules_only_count_on_pages() {
+        assert!(is_html_only("ELCEEF_HTML_Smuggling_A"));
+        assert!(is_html_only("SUSP_HtmlSmuggling_Blob"));
+        assert!(!is_html_only("SUSP_HTML_Phish"));
+        assert!(looks_like_markup(b"\xEF\xBB\xBF  <!DOCTYPE html><html>"));
+        assert!(looks_like_markup(b"\r\n<svg xmlns='x'>"));
+        assert!(looks_like_markup(b"\xFF\xFE<\0h\0t\0m\0l\0"));
+        assert!(!looks_like_markup(b"/*! jsPDF 4.2.1 */ var Blob"));
+        assert!(!looks_like_markup(br#"{"version":3,"sources":["html2pdf.js"]}"#));
+
+        // The same smuggling code: a page is flagged, a library is not.
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("smuggling.yar");
+        std::fs::write(
+            &rules,
+            "rule ELCEEF_HTML_Smuggling_A { meta: score = 80 strings: $a = \"msSaveOrOpenBlob\" condition: $a }",
+        )
+        .unwrap();
+        let engine = Engine::new(&EngineConfig { rule_paths: vec![rules], ..Default::default() }).unwrap();
+        let mut scanner = engine.scanner();
+        let page = scanner.scan(b"<html><script>navigator.msSaveOrOpenBlob(b, 'invoice.iso')</script></html>");
+        assert_eq!(page.findings.iter().map(|f| f.threat.as_str()).collect::<Vec<_>>(), ["ELCEEF_HTML_Smuggling_A"]);
+        let library = scanner.scan(b"!function(t){window.navigator.msSaveOrOpenBlob(t,'doc.pdf')}");
+        assert!(library.findings.is_empty(), "{:?}", library.findings);
     }
 
     #[test]

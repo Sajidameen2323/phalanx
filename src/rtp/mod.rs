@@ -569,7 +569,7 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>, side: Op
                 live.remove(&pid);
                 known.retain(|id| id.pid != pid);
             }
-            Ok(etw::Event::FileOpened { .. }) => {}
+            Ok(etw::Event::FileOpened { .. } | etw::Event::ProcessOpened { .. }) => {}
             Ok(etw::Event::ImageLoaded { pid, image: dll }) => {
                 if let Some(side) = &side && filter.candidate(&dll) {
                     let image = live.get(&pid).map(|p| p.image.clone()).or_else(|| process::identify(pid).map(|(_, image)| image));
