@@ -45,7 +45,9 @@ WHAT IT DOES
 - Stealer check: looks for what password-stealing malware leaves behind.
   Its browser data watch (off until you turn it on) catches programs
   opening your browser's saved passwords and sign-in cookies, which let a
-  thief read your email without your password, and stops them.
+  thief read your email without your password, or reading the browser's
+  memory, and stops them. It also guards Discord's and Telegram's sign-in
+  data and desktop crypto wallets.
 - AI Inspect: a second opinion on a file from Google Gemini, and what
   MalwareBazaar and VirusTotal know about it (only its fingerprint, the
   SHA-256, is sent; never the file).
