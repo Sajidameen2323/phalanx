@@ -199,8 +199,8 @@ impl App {
                 self.approval = Some("Changes that weaken web protection need an administrator's approval".into());
                 self.link.run(
                     move || {
-                        let read = || link::read::<WebConfig>(Request::GetWebSettings);
-                        match link::with_approval::<WebConfig>(Request::SetWebSettings { settings: wanted }, &args, read) {
+                        let read = || link::read::<threat_scanner::ipc::replies::GetWebSettings>(Request::GetWebSettings);
+                        match link::with_approval::<threat_scanner::ipc::replies::SetWebSettings>(Request::SetWebSettings { settings: wanted }, &args, read) {
                             link::Approval::Done(config) => (Ok(config), None),
                             link::Approval::Declined => (read(), Some("Not changed: Windows' administrator prompt was declined".to_string())),
                             link::Approval::Failed(e) => (read(), Some(format!("Could not change web protection: {e}"))),

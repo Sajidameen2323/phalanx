@@ -48,6 +48,11 @@ pub struct ProtectionSettings {
     // Signatures
     pub auto_update: bool,
     pub auto_update_hours: u32,
+    // History
+    /// Days history is kept (findings, manual scans, commands); 0 for good.
+    pub history_days: u32,
+    /// Days real-time checks that found nothing are kept; 0 for good.
+    pub clean_history_days: u32,
 }
 
 impl Default for ProtectionSettings {
@@ -71,6 +76,8 @@ impl Default for ProtectionSettings {
             quarantine_suspicious: false,
             auto_update: true,
             auto_update_hours: 4,
+            history_days: 365,
+            clean_history_days: 30,
         }
     }
 }
@@ -126,6 +133,14 @@ impl ProtectionSettings {
         if new.auto_update && self.auto_update && new.auto_update_hours > self.auto_update_hours {
             out.push(format!("checks for signatures every {} hours instead of {}", new.auto_update_hours, self.auto_update_hours));
         }
+        for (what, was, now) in [
+            ("history", self.history_days, new.history_days),
+            ("clean real-time checks", self.clean_history_days, new.clean_history_days),
+        ] {
+            if kept(now) < kept(was) {
+                out.push(format!("keeps {what} for {} instead of {}", days_text(now), days_text(was)));
+            }
+        }
         for folder in self.watch_folders.iter().filter(|f| !contains(&new.watch_folders, f)) {
             out.push(format!("stops watching {}", folder.display()));
         }
@@ -133,6 +148,26 @@ impl ProtectionSettings {
             out.push(format!("never scans {}", path.display()));
         }
         out
+    }
+}
+
+impl ProtectionSettings {
+    /// How long history is kept.
+    pub fn retention(&self) -> crate::store::Retention {
+        crate::store::Retention { history_days: self.history_days, clean_days: self.clean_history_days }
+    }
+}
+
+/// Days kept, with 0 (for good) the longest.
+fn kept(days: u32) -> u32 {
+    if days == 0 { u32::MAX } else { days }
+}
+
+fn days_text(days: u32) -> String {
+    match days {
+        0 => "good".into(),
+        1 => "1 day".into(),
+        n => format!("{n} days"),
     }
 }
 
@@ -161,6 +196,8 @@ mod tests {
             (ProtectionSettings { auto_update_hours: 48, ..base.clone() }, "checks for signatures every 48 hours instead of 4"),
             (ProtectionSettings { watch_folders: vec![], ..base.clone() }, r"stops watching C:\Users\me\Downloads"),
             (ProtectionSettings { exclusions: vec![r"C:\Temp".into()], ..base.clone() }, r"never scans C:\Temp"),
+            (ProtectionSettings { history_days: 90, ..base.clone() }, "keeps history for 90 days instead of 365 days"),
+            (ProtectionSettings { clean_history_days: 7, ..base.clone() }, "keeps clean real-time checks for 7 days instead of 30 days"),
         ];
         for (new, why) in cases {
             assert_eq!(base.weakened_by(&new), [why]);
@@ -174,6 +211,8 @@ mod tests {
             max_size_mb: 500,
             watch_folders: vec![r"c:\users\me\downloads\".into(), r"D:\Shared".into()],
             auto_update_hours: 1,
+            history_days: 0,
+            clean_history_days: 90,
             ..base.clone()
         };
         assert!(base.weakened_by(&stronger).is_empty(), "{:?}", base.weakened_by(&stronger));

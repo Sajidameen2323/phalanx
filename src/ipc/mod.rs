@@ -19,7 +19,7 @@ use crate::risk::{DownloadOrigin, RiskyFile};
 use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
-use crate::store::{DetectionRow, ScanErrorRow};
+use crate::store::{DeleteTarget, DetectionRow, HistoryQuery, ScanErrorRow, Verdict};
 use crate::service::web::WebStatus;
 use crate::web::events::WebEvent;
 use crate::web::{SiteChange, WebConfig};
@@ -64,6 +64,25 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
     },
+    /// A page of history, newest first, filtered and searched as `query`
+    /// says; the reply says where the next page starts.
+    History { query: HistoryQuery },
+    /// The history database's size, what it holds, and when it was last
+    /// pruned and compacted.
+    HistoryInfo,
+    /// Mark a finding as reviewed or a false positive, with a note; `None`
+    /// clears the mark. The service records who asked.
+    ReviewFinding {
+        detection: i64,
+        verdict: Option<Verdict>,
+        #[serde(default)]
+        note: String,
+    },
+    /// Delete scans from history (administrators only: it removes evidence).
+    DeleteHistory { target: DeleteTarget },
+    /// Every scan `query` matches, one row per finding, for the client to
+    /// save as a file (the service writes none: it runs as SYSTEM).
+    ExportHistory { query: HistoryQuery },
     /// A scan's detections and errors. (Fields are not called `id`: that is
     /// the message's own.)
     ScanDetails { scan: i64 },
@@ -219,6 +238,10 @@ impl Request {
             | Request::GetSettings
             | Request::SetSettings { .. }
             | Request::RecentScans { .. }
+            | Request::History { .. }
+            | Request::HistoryInfo
+            | Request::ReviewFinding { .. }
+            | Request::ExportHistory { .. }
             | Request::ScanDetails { .. }
             | Request::RecentDetections { .. }
             | Request::MonthlySummary
@@ -239,7 +262,8 @@ impl Request {
             | Request::Migrate { .. }
             | Request::RunBoxView
             | Request::SetAuthKey { .. }
-            | Request::QuarantineFile { .. } => {
+            | Request::QuarantineFile { .. }
+            | Request::DeleteHistory { .. } => {
                 Allowed::Administrator
             }
         }
@@ -340,6 +364,78 @@ pub struct Status {
 pub struct ScanDetails {
     pub detections: Vec<DetectionRow>,
     pub errors: Vec<ScanErrorRow>,
+}
+
+/// What each request's reply holds, named after the request. The service
+/// builds every reply with these types and clients read them with the same
+/// ones, so the two cannot drift apart unnoticed (History's "Show details"
+/// once broke that way); the service's contract test checks each one through
+/// the reply's wire form.
+pub mod replies {
+    use crate::rtp::commands;
+    use crate::service::{migrate, settings, web as service_web};
+    use crate::store::{DetectionRow, HistoryPage, MonthRow, QuarantineRow, ScanRow};
+    use crate::web::WebConfig;
+    use serde::{Deserialize, Serialize};
+    use std::path::PathBuf;
+
+    /// `"pong"`.
+    pub type Ping = String;
+    pub type Status = super::Status;
+    /// `"stopping"`.
+    pub type Stop = String;
+    pub type GetSettings = settings::ProtectionSettings;
+    /// The settings now in force.
+    pub type SetSettings = settings::ProtectionSettings;
+    pub type RecentScans = Vec<ScanRow>;
+    pub type History = HistoryPage;
+    pub type HistoryInfo = crate::service::history::HistoryInfo;
+    /// The finding's mark now.
+    pub type ReviewFinding = Option<crate::store::Review>;
+    /// Scans deleted.
+    pub type DeleteHistory = u64;
+    pub type ExportHistory = Vec<crate::store::ExportRow>;
+    pub type ScanDetails = super::ScanDetails;
+    pub type RecentDetections = Vec<DetectionRow>;
+    pub type MonthlySummary = Vec<MonthRow>;
+    pub type Quarantine = Vec<QuarantineRow>;
+    /// Where the file was put back.
+    pub type Restore = PathBuf;
+    pub type DeleteQuarantined = ();
+    pub type Migrate = migrate::Migrated;
+    /// `"subscribed"`; events follow on the same connection.
+    pub type Subscribe = String;
+    pub type ProtectionStatus = super::ProtectionStatus;
+    pub type RunBoxView = commands::RunBoxView;
+    pub type Scan = ScanStarted;
+    /// `"cancelling"`.
+    pub type CancelScan = String;
+    /// The quarantine id.
+    pub type QuarantineDetection = String;
+    /// `"started"`; progress arrives as events.
+    pub type UpdateSignatures = String;
+    pub type SetAuthKey = ();
+    pub type GetWebSettings = WebConfig;
+    /// The web settings now in force.
+    pub type SetWebSettings = WebConfig;
+    pub type ChangeSite = SiteChanged;
+    pub type WebStatus = service_web::WebStatus;
+    /// The quarantine id.
+    pub type QuarantineFile = String;
+
+    /// The reply to `Scan`: the job its progress events carry.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ScanStarted {
+        pub job: u64,
+    }
+
+    /// The reply to `ChangeSite`: the host as it was saved, and the web
+    /// settings with the change.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SiteChanged {
+        pub site: String,
+        pub settings: WebConfig,
+    }
 }
 
 /// The reply to `ProtectionStatus`.

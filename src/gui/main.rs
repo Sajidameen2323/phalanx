@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 use threat_scanner::ai::{self, AiReport, Evidence};
 use threat_scanner::engine::{Engine, EngineConfig};
 use threat_scanner::posture::{self, Check};
-use threat_scanner::ipc::{self, Event, Request};
+use threat_scanner::ipc::{self, replies, Event, Request};
 use threat_scanner::scan::{self, FileReport, ScanOptions, ScanReport};
 use threat_scanner::service::settings::ProtectionSettings;
-use threat_scanner::store::{DetectionRow, MonthRow, QuarantineRow, ScanErrorRow, ScanRow};
+use threat_scanner::store::{self, DeleteTarget, DetectionRow, HistoryQuery, MonthRow, QuarantineRow, ScanErrorRow, ScanRow, Verdict};
 use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
@@ -176,6 +176,10 @@ struct Settings {
     /// Check the feeds for new signatures and web rules automatically.
     auto_update: bool,
     auto_update_hours: u32,
+    /// Days history is kept; 0 for good.
+    history_days: u32,
+    /// Days clean real-time checks are kept; 0 for good.
+    clean_history_days: u32,
     /// Unix time of the last automatic or manual check.
     last_update_check: Option<u64>,
 }
@@ -211,6 +215,8 @@ impl Default for Settings {
             ai_max_text_kb: ai::DEFAULT_MAX_TEXT_KB,
             auto_update: true,
             auto_update_hours: 4,
+            history_days: 365,
+            clean_history_days: 30,
             last_update_check: None,
         }
     }
@@ -445,7 +451,107 @@ enum HistoryFilter {
     All,
     Manual,
     Watch,
+    Threats,
+    Commands,
+    SideLoading,
 }
+
+/// Scan kinds started by someone, rather than by real-time protection.
+const MANUAL_KINDS: [&str; 4] = ["quick", "full", "custom", "manual"];
+/// Scan kinds real-time protection records.
+const PROTECTION_KINDS: [&str; 4] = ["watch", "process", "command", "sideload"];
+
+impl HistoryFilter {
+    /// The kinds it shows (empty for all) and whether only threats.
+    fn query(self) -> (Vec<String>, bool) {
+        let kinds = |list: &[&str]| list.iter().map(|k| k.to_string()).collect();
+        match self {
+            HistoryFilter::All => (Vec::new(), false),
+            HistoryFilter::Manual => (kinds(&MANUAL_KINDS), false),
+            HistoryFilter::Watch => (kinds(&PROTECTION_KINDS), false),
+            HistoryFilter::Threats => (Vec::new(), true),
+            HistoryFilter::Commands => (kinds(&["command"]), false),
+            HistoryFilter::SideLoading => (kinds(&["sideload"]), false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HistorySince {
+    Any,
+    Day,
+    Week,
+    Month,
+}
+
+impl HistorySince {
+    fn start(self) -> Option<String> {
+        let days = match self {
+            HistorySince::Any => return None,
+            HistorySince::Day => 1,
+            HistorySince::Week => 7,
+            HistorySince::Month => 30,
+        };
+        Some((chrono::Local::now() - chrono::Duration::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+    }
+}
+
+/// History scans loaded a page at a time from the service.
+struct HistoryView {
+    filter: HistoryFilter,
+    since: HistorySince,
+    search: String,
+    /// When the search text last changed; it is applied once typing pauses.
+    search_edited: Option<Instant>,
+    rows: Vec<ScanRow>,
+    /// Where the next page starts; `None` when everything is loaded.
+    next: Option<i64>,
+    /// Scans the query matches on all pages.
+    matching: i64,
+    loading: bool,
+    /// Bumped by every new query, so a reply to an older one is dropped.
+    generation: u64,
+}
+
+/// A finding's review mark being written.
+struct ReviewEdit {
+    scan: i64,
+    detection: i64,
+    verdict: Verdict,
+    note: String,
+}
+
+/// What was clicked in a finding's review controls.
+enum ReviewStep {
+    Start(ReviewEdit),
+    Save,
+    Cancel,
+    Clear { scan: i64, detection: i64 },
+}
+
+/// History about to be deleted, waiting for the user's yes.
+struct HistoryDelete {
+    target: DeleteTarget,
+    /// What it is, for the question ("entry #42", "the 37 entries shown").
+    what: String,
+    running: bool,
+}
+
+/// What [`App::load_history`] loads.
+#[derive(Clone, Copy, PartialEq)]
+enum Load {
+    /// The first page of a new query.
+    New,
+    /// The page after the rows shown.
+    More,
+    /// The rows shown, read again.
+    Again,
+}
+
+/// Rows per page of History.
+const HISTORY_PAGE: u32 = 50;
+/// The pause in typing after which a search runs.
+const SEARCH_DELAY: Duration = Duration::from_millis(400);
 
 struct App {
     page: Page,
@@ -463,7 +569,14 @@ struct App {
     results: Vec<ResultRow>,
     finished: Option<Finished>,
     quarantine: Vec<QuarantineRow>,
-    scans: Vec<ScanRow>,
+    /// The last week's scans that found something, for the dashboard.
+    recent_threats: Vec<ScanRow>,
+    /// The last manual scan that finished, for the dashboard.
+    last_manual: Option<ScanRow>,
+    /// The history database's size and upkeep, for Settings.
+    history_info: Option<replies::HistoryInfo>,
+    /// A history recovery already put in the activity log (its time).
+    recovery_logged: Option<u64>,
     months: Vec<MonthRow>,
     pending_delete: Option<String>,
     toast: Option<Toast>,
@@ -489,8 +602,10 @@ struct App {
     service_rx: Option<Receiver<ServiceView>>,
     service_checked: Option<Instant>,
     // History
-    history_filter: HistoryFilter,
+    history: HistoryView,
     expanded: HashMap<i64, ScanDetails>,
+    review_edit: Option<ReviewEdit>,
+    history_delete: Option<HistoryDelete>,
     // Desktop
     tray: Option<desktop::Tray>,
     quitting: Arc<AtomicBool>,
@@ -648,7 +763,10 @@ impl App {
             results: Vec::new(),
             finished: None,
             quarantine: Vec::new(),
-            scans: Vec::new(),
+            recent_threats: Vec::new(),
+            last_manual: None,
+            history_info: None,
+            recovery_logged: None,
             months: Vec::new(),
             pending_delete: None,
             toast: None,
@@ -666,7 +784,19 @@ impl App {
             service: None,
             service_rx: None,
             service_checked: None,
-            history_filter: HistoryFilter::All,
+            history: HistoryView {
+                filter: HistoryFilter::All,
+                since: HistorySince::Any,
+                search: String::new(),
+                search_edited: None,
+                rows: Vec::new(),
+                next: None,
+                matching: 0,
+                loading: false,
+                generation: 0,
+            },
+            review_edit: None,
+            history_delete: None,
             expanded: HashMap::new(),
             tray,
             quitting,
@@ -718,27 +848,190 @@ impl App {
         });
     }
 
-    /// Reads the quarantine, the scans and the monthly totals from the service.
+    /// Reads the quarantine, the dashboard's scans, the monthly totals and
+    /// the History rows already shown from the service.
     fn refresh(&mut self) {
         if !self.connected {
             return;
         }
+        let week = HistoryQuery { limit: store::MAX_HISTORY_PAGE, threats_only: true, since: HistorySince::Week.start(), ..Default::default() };
+        let manual = HistoryQuery { limit: 20, kinds: MANUAL_KINDS.iter().map(|k| k.to_string()).collect(), ..Default::default() };
         self.link.run(
-            || -> Result<_, String> {
+            move || -> Result<_, String> {
                 use link::read;
-                let q: Vec<QuarantineRow> = read(Request::Quarantine { include_restored: false })?;
-                let s: Vec<ScanRow> = read(Request::RecentScans { limit: 300, kind: None })?;
-                let m: Vec<MonthRow> = read(Request::MonthlySummary)?;
-                Ok((q, s, m))
+                let q: replies::Quarantine = read(Request::Quarantine { include_restored: false })?;
+                let threats: replies::History = read(Request::History { query: week })?;
+                let manual: replies::History = read(Request::History { query: manual })?;
+                let m: replies::MonthlySummary = read(Request::MonthlySummary)?;
+                let info: replies::HistoryInfo = read(Request::HistoryInfo)?;
+                Ok((q, threats, manual, m, info))
             },
             |app, loaded| match loaded {
-                Ok((q, s, m)) => {
+                Ok((q, threats, manual, m, info)) => {
+                    // A recovery in the last week goes to the activity log,
+                    // once, so it is seen without opening Settings.
+                    if let Some(recovered) = &info.recovered {
+                        let recent = chrono::Utc::now().timestamp() - (recovered.at as i64) < 7 * 24 * 3600;
+                        if recent && app.recovery_logged != Some(recovered.at) {
+                            app.recovery_logged = Some(recovered.at);
+                            app.log_activity(ActivityKind::Problem, "History was damaged and restored", pages::recovery_text(recovered));
+                        }
+                    }
+                    app.history_info = Some(info);
                     app.quarantine = q;
-                    app.scans = s;
+                    app.recent_threats = threats.scans;
+                    app.last_manual = manual.scans.into_iter().find(|s| s.finished_at.is_some() && !s.cancelled);
                     app.months = m;
-                    app.expanded.clear();
                 }
                 Err(e) => app.notify(format!("Could not read history: {e}"), false),
+            },
+        );
+        self.load_history(Load::Again);
+    }
+
+    /// Saves a finding's review mark (`None` clears it) and shows it.
+    fn save_review(&mut self, scan: i64, detection: i64, verdict: Option<Verdict>, note: String) {
+        self.link.run(
+            move || link::read::<replies::ReviewFinding>(Request::ReviewFinding { detection, verdict, note }),
+            move |app, mark| match mark {
+                Ok(mark) => {
+                    if let Some(found) = app.expanded.get_mut(&scan).and_then(|d| d.detections.iter_mut().find(|d| d.id == detection)) {
+                        found.review = mark;
+                    }
+                }
+                Err(e) => app.notify(format!("Could not save the mark: {e}"), false),
+            },
+        );
+    }
+
+    /// Asks before deleting history; it needs an administrator, so Windows'
+    /// prompt follows a yes.
+    fn history_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.history_delete else { return };
+        let busy = pending.running;
+        let text = format!(
+            "Deletes {} from history, with the findings, marks and errors recorded there, for good. The monthly totals drop by as much. Quarantined files are not touched.",
+            pending.what
+        );
+        let run = widgets::danger_button("Delete");
+        match widgets::dialog(ctx, "history-delete", "Delete from history?", busy, |ui| widgets::admin_command_body(ui, &text, None, run, busy)) {
+            Some(widgets::DialogChoice::Confirm) => self.delete_history(),
+            Some(widgets::DialogChoice::Cancel) => self.history_delete = None,
+            None => {}
+        }
+    }
+
+    fn delete_history(&mut self) {
+        let Some(pending) = &mut self.history_delete else { return };
+        pending.running = true;
+        let target = pending.target.clone();
+        // The target travels hex-encoded, so no search text is misread on
+        // the elevated command line.
+        let args = format!("service delete-history --json {}", link::hex_json(&target));
+        self.link.run(
+            // After the elevated copy, the count is not known here.
+            move || link::with_approval::<replies::DeleteHistory>(Request::DeleteHistory { target }, &args, || Ok(0)),
+            |app, outcome| {
+                app.history_delete = None;
+                match outcome {
+                    link::Approval::Done(0) => app.notify("History updated", true),
+                    link::Approval::Done(n) => app.notify(format!("Deleted {n} entries from history"), true),
+                    link::Approval::Declined => app.notify("Not deleted: Windows' administrator prompt was declined", false),
+                    link::Approval::Failed(e) => app.notify(format!("Could not delete: {e}"), false),
+                }
+                app.refresh();
+            },
+        );
+    }
+
+    /// Everything the History page's filter and search match, on any page.
+    fn history_filter(&self) -> HistoryQuery {
+        HistoryQuery { before: None, limit: 0, ..self.history_query(None, 0) }
+    }
+
+    /// Saves what History's filter matches as a CSV or JSON file the user
+    /// picks. The service sends the rows; the app writes the file, as the
+    /// user, where they chose.
+    fn export_history(&mut self) {
+        let name = format!("phalanx-history-{}.csv", chrono::Local::now().format("%Y-%m-%d"));
+        let Some(file) = rfd::FileDialog::new()
+            .set_file_name(&name)
+            .add_filter("CSV (spreadsheets)", &["csv"])
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let query = self.history_filter();
+        self.link.run(
+            move || -> Result<(usize, PathBuf), String> {
+                let rows = link::read::<replies::ExportHistory>(Request::ExportHistory { query })?;
+                let json = file.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+                let text = if json { store::export_json(&rows) } else { store::export_csv(&rows) };
+                std::fs::write(&file, text).map_err(|e| format!("writing {}: {e}", file.display()))?;
+                Ok((rows.len(), file))
+            },
+            |app, saved| match saved {
+                Ok((rows, file)) => app.notify(format!("Saved {rows} rows to {}", file.display()), true),
+                Err(e) => app.notify(format!("Could not export: {e}"), false),
+            },
+        );
+    }
+
+    /// The History query for what the page shows now.
+    fn history_query(&self, before: Option<i64>, limit: u32) -> HistoryQuery {
+        let (kinds, threats_only) = self.history.filter.query();
+        let text = Some(self.history.search.trim().to_string()).filter(|t| !t.is_empty());
+        HistoryQuery { before, limit, kinds, threats_only, text, since: self.history.since.start() }
+    }
+
+    /// Loads History rows: a new query's first page, the next page, or the
+    /// rows already shown again (after a scan, so a long list stays long).
+    fn load_history(&mut self, load: Load) {
+        if !self.connected {
+            return;
+        }
+        let shown = (self.history.rows.len() as u32).clamp(HISTORY_PAGE, store::MAX_HISTORY_PAGE);
+        let query = match load {
+            Load::New => {
+                self.history.generation += 1;
+                self.history.rows.clear();
+                self.history.next = None;
+                self.expanded.clear();
+                self.history_query(None, HISTORY_PAGE)
+            }
+            Load::More => match self.history.next {
+                Some(next) => self.history_query(Some(next), HISTORY_PAGE),
+                None => return,
+            },
+            Load::Again => {
+                self.history.generation += 1;
+                self.history_query(None, shown)
+            }
+        };
+        let generation = self.history.generation;
+        self.history.loading = true;
+        self.link.run(
+            move || link::read::<replies::History>(Request::History { query }),
+            move |app, page| {
+                // A newer query has replaced this one.
+                if app.history.generation != generation {
+                    return;
+                }
+                app.history.loading = false;
+                match page {
+                    Ok(page) => {
+                        if load == Load::More {
+                            app.history.rows.extend(page.scans);
+                        } else {
+                            app.expanded.retain(|id, _| page.scans.iter().any(|s| s.id == *id));
+                            app.history.rows = page.scans;
+                        }
+                        app.history.next = page.next;
+                        app.history.matching = page.matching;
+                    }
+                    Err(e) => app.notify(format!("Could not read history: {e}"), false),
+                }
             },
         );
     }
@@ -851,10 +1144,10 @@ impl App {
         let threads = options.threads;
         let (paths, kind_name) = (options.paths.clone(), kind.to_string());
         self.link.run(
-            move || link::call(Request::Scan { paths, kind: kind_name }).and_then(|r| r.into_result::<serde_json::Value>().map_err(|e| e.to_string())),
+            move || link::call(Request::Scan { paths, kind: kind_name }).and_then(|r| r.into_result::<replies::Scan>().map_err(|e| e.to_string())),
             |app, started| match started {
                 Ok(reply) => {
-                    let id = reply["job"].as_u64();
+                    let id = Some(reply.job);
                     if let Some(job) = &mut app.job {
                         job.job = id;
                         // Events that came before the reply.
@@ -952,7 +1245,7 @@ impl App {
                     .into_iter()
                     .map(|path| {
                         let result = link::call(Request::QuarantineDetection { scan, path: PathBuf::from(&path) })
-                            .and_then(|r| r.into_result::<String>().map_err(|e| e.to_string()));
+                            .and_then(|r| r.into_result::<replies::QuarantineDetection>().map_err(|e| e.to_string()));
                         (path, result)
                     })
                     .collect::<Vec<_>>()
@@ -1351,10 +1644,10 @@ impl App {
             || -> Result<_, String> {
                 let mut client = ipc::Client::connect().map_err(|e| ipc::describe(&e))?;
                 let status = client.status().map_err(|e| e.to_string())?;
-                let settings: ProtectionSettings = client.call(Request::GetSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
-                let web: threat_scanner::web::WebConfig = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
-                let protection: ipc::ProtectionStatus = client.call(Request::ProtectionStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
-                let web_status: threat_scanner::service::web::WebStatus = client.call(Request::WebStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let settings: replies::GetSettings = client.call(Request::GetSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let web: replies::GetWebSettings = client.call(Request::GetWebSettings).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let protection: replies::ProtectionStatus = client.call(Request::ProtectionStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
+                let web_status: replies::WebStatus = client.call(Request::WebStatus).and_then(|r| r.into_result()).map_err(|e| e.to_string())?;
                 Ok((status, settings, web, protection, web_status))
             },
             move |app, read| match read {
@@ -1407,8 +1700,8 @@ impl App {
         let args = format!("service set-settings --json {}", link::hex_json(&wanted));
         self.link.run(
             move || {
-                let read = || link::call(Request::GetSettings).and_then(|r| r.into_result::<ProtectionSettings>().map_err(|e| e.to_string()));
-                match link::with_approval::<ProtectionSettings>(Request::SetSettings { settings: wanted }, &args, read) {
+                let read = || link::call(Request::GetSettings).and_then(|r| r.into_result::<replies::GetSettings>().map_err(|e| e.to_string()));
+                match link::with_approval::<replies::SetSettings>(Request::SetSettings { settings: wanted }, &args, read) {
                     link::Approval::Done(settings) => (Ok(settings), None),
                     link::Approval::Declined => (read(), Some("Not changed: Windows' administrator prompt was declined".to_string())),
                     link::Approval::Failed(e) => (read(), Some(format!("Could not change the settings: {e}"))),
@@ -1708,6 +2001,8 @@ fn copy_protection(s: &mut Settings, p: &ProtectionSettings) {
     s.quarantine_suspicious = p.quarantine_suspicious;
     s.auto_update = p.auto_update;
     s.auto_update_hours = p.auto_update_hours;
+    s.history_days = p.history_days;
+    s.clean_history_days = p.clean_history_days;
 }
 
 /// The protection settings as the pages have them; what the pages do not
@@ -1731,6 +2026,8 @@ fn protection_from(s: &Settings, service: &ProtectionSettings) -> ProtectionSett
         quarantine_suspicious: s.quarantine_suspicious,
         auto_update: s.auto_update,
         auto_update_hours: s.auto_update_hours,
+        history_days: s.history_days,
+        clean_history_days: s.clean_history_days,
         ..service.clone()
     }
 }

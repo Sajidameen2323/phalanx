@@ -114,7 +114,11 @@ phalanx-cli service stop | start | uninstall
 phalanx-cli service migrate     # as administrator, once: bring a 0.4 user's data over
 phalanx-cli service scan D:\    # scan in the service, with progress
 phalanx-cli service events      # watch what the service reports
-phalanx-cli service settings | history
+phalanx-cli service settings
+phalanx-cli service history --search invoice --threats-only --days 7   # also --kind, --before, --findings
+phalanx-cli service history --threats-only --export threats.csv        # or .json; every matching scan
+phalanx-cli service review 42 --false-positive --note "our build tool"  # or --reviewed, --clear
+phalanx-cli service delete-history --scan 300   # or --all-matching with history's filters (administrator)
 phalanx-cli service protection  # watching? programs through process events?
 phalanx-cli service update      # download signatures in the service, with progress
 phalanx-cli service web         # web settings and whether the DNS filter runs
@@ -186,7 +190,25 @@ The app has these pages:
 * **Quarantine**: restore or permanently delete isolated files.
 * **History**: every scan with its type, duration, files, data, threads, skipped
   and unreadable files, quarantined files and signature date. Expand a scan to see
-  its detections and errors. You can filter by manual scans or real-time protection.
+  its detections and errors. Search by file, folder or threat name; filter by
+  threats found, manual scans, real-time protection, suspicious commands or DLL
+  side-loading, and by the last day, week or month. Pages of 50 load as you ask
+  for more. History is kept a year, and real-time checks that found nothing for
+  30 days (Settings > General > History; keeping less needs an administrator).
+  The service removes what is older once a day, adding it to the monthly totals
+  first, and compacts the database monthly; a year of heavy use takes about
+  1 MB. Quarantine records are never removed.
+  Each finding can be marked **Reviewed** or **Not a threat**, with a note; the
+  service records who marked it. Entries can be deleted one at a time or all
+  that match the current filter (an administrator's approval is needed: it
+  removes evidence); deleted entries leave the monthly totals too, and
+  quarantined files are not touched. **Export…** saves everything the current
+  filter matches, one row per finding with its mark, as CSV (for spreadsheets;
+  a cell that starts like a formula is kept as text) or JSON.
+  The service checks the history database each time it starts and backs it up
+  daily (only if it passes a check). A damaged database is moved aside, never
+  deleted, and the last backup takes its place; the app says so in its
+  activity log and in Settings. Quarantined files are never affected.
 * **Settings**, in tabs: **General** (startup, tray, notifications, data folder),
   **Scanning** (performance, detection, quarantine), **Exclusions**, **Signatures**
   and **AI inspection**.

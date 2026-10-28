@@ -70,6 +70,7 @@ impl App {
         // Popups float over whichever page asked for them.
         self.fix_dialog(ctx);
         self.dns_dialog(ctx);
+        self.history_delete_dialog(ctx);
 
         // An appearance change eases over from the old background instead of cutting.
         if let Some((previous, since)) = self.theme_fade {
@@ -185,11 +186,11 @@ impl App {
         // days that were not quarantined need attention.
         let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).to_rfc3339();
         let unresolved: Vec<&ScanRow> = self
-            .scans
+            .recent_threats
             .iter()
             .filter(|s| s.started_at >= week_ago && s.detections > s.quarantined)
             .collect();
-        let last_manual = self.scans.iter().find(|s| s.finished_at.is_some() && !s.cancelled && !is_protection_kind(&s.kind));
+        let last_manual = self.last_manual.as_ref();
         let threat_count: i64 = unresolved.iter().map(|s| s.detections - s.quarantined).sum();
         let (color, title, detail) = if let Some(job) = &self.job {
             let found = match self.results.len() {
@@ -832,35 +833,94 @@ impl App {
         );
         ui.add_space(14.0);
 
+        let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             for (filter, label) in [
-                (HistoryFilter::All, "All scans"),
-                (HistoryFilter::Manual, "Manual"),
+                (HistoryFilter::All, "All"),
+                (HistoryFilter::Threats, "Threats found"),
+                (HistoryFilter::Manual, "Manual scans"),
                 (HistoryFilter::Watch, "Real-time protection"),
+                (HistoryFilter::Commands, "Suspicious commands"),
+                (HistoryFilter::SideLoading, "DLL side-loading"),
             ] {
-                if chip(ui, label, self.history_filter == filter) {
-                    self.history_filter = filter;
+                if chip(ui, label, self.history.filter == filter) && self.history.filter != filter {
+                    self.history.filter = filter;
+                    changed = true;
                 }
             }
         });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.history.search)
+                    .hint_text("Search files, folders and threat names")
+                    .desired_width(320.0),
+            );
+            if search.changed() {
+                self.history.search_edited = Some(Instant::now());
+            }
+            if search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && self.history.search_edited.take().is_some() {
+                changed = true;
+            }
+            ui.add_space(8.0);
+            for (since, label) in [
+                (HistorySince::Any, "Any time"),
+                (HistorySince::Day, "24 hours"),
+                (HistorySince::Week, "7 days"),
+                (HistorySince::Month, "30 days"),
+            ] {
+                if chip(ui, label, self.history.since == since) && self.history.since != since {
+                    self.history.since = since;
+                    changed = true;
+                }
+            }
+        });
+        // Search once typing pauses.
+        if let Some(edited) = self.history.search_edited {
+            if edited.elapsed() >= SEARCH_DELAY {
+                self.history.search_edited = None;
+                changed = true;
+            } else {
+                ui.ctx().request_repaint_after(SEARCH_DELAY - edited.elapsed());
+            }
+        }
+        if changed {
+            self.load_history(Load::New);
+        }
         ui.add_space(8.0);
 
-        let filter = self.history_filter;
-        let scans: Vec<ScanRow> = self
-            .scans
-            .iter()
-            .filter(|s| match filter {
-                HistoryFilter::All => true,
-                HistoryFilter::Manual => !is_protection_kind(&s.kind),
-                HistoryFilter::Watch => is_protection_kind(&s.kind),
-            })
-            .take(100)
-            .cloned()
-            .collect();
+        let scans = self.history.rows.clone();
         if scans.is_empty() {
-            card(ui, |ui| muted(ui, "No scans of this kind yet."));
+            let text = if self.history.loading {
+                "Loading…"
+            } else if self.history.filter == HistoryFilter::All && self.history.since == HistorySince::Any && self.history.search.trim().is_empty() {
+                "No scans yet."
+            } else {
+                "Nothing matches."
+            };
+            card(ui, |ui| muted(ui, text));
+        } else {
+            let unfiltered = self.history.filter == HistoryFilter::All && self.history.since == HistorySince::Any && self.history.search.trim().is_empty();
+            let matching = self.history.matching;
+            let mut export = false;
+            ui.horizontal_wrapped(|ui| {
+                small(ui, if matching == 1 { "1 entry".to_string() } else { format!("{matching} entries") });
+                if small_button(ui, "Export…").clicked() {
+                    export = true;
+                }
+                if small_button(ui, "Delete these…").clicked() {
+                    let what = if unfiltered { format!("all {matching} entries") } else { format!("the {matching} entries that match this filter") };
+                    self.history_delete = Some(HistoryDelete { target: DeleteTarget::Matching { query: self.history_filter() }, what, running: false });
+                }
+            });
+            if export {
+                self.export_history();
+            }
+            ui.add_space(6.0);
         }
         let mut toggle = None;
+        let mut delete_one = None;
+        let mut review = None;
         for s in &scans {
             let expanded = self.expanded.get(&s.id);
             card(ui, |ui| {
@@ -899,13 +959,17 @@ impl App {
                     );
                 }
                 truncated(ui, s.targets.clone(), theme().muted, 12.5);
-                let has_details = s.detections > 0 || s.errors > 0;
-                if has_details {
-                    let label = if expanded.is_some() { "Hide details" } else { "Show details" };
-                    if small_button(ui, label).clicked() {
-                        toggle = Some(s.id);
+                ui.horizontal(|ui| {
+                    if s.detections > 0 || s.errors > 0 {
+                        let label = if expanded.is_some() { "Hide details" } else { "Show details" };
+                        if small_button(ui, label).clicked() {
+                            toggle = Some(s.id);
+                        }
                     }
-                }
+                    if small_button(ui, "Delete…").clicked() {
+                        delete_one = Some(s.id);
+                    }
+                });
                 if let Some(details) = expanded {
                     ui.add_space(4.0);
                     for d in &details.detections {
@@ -915,6 +979,45 @@ impl App {
                         });
                         path_lines(ui, &d.path);
                         small(ui, format!("Action: {}", d.action));
+                        if let Some(r) = &d.review {
+                            ui.horizontal_wrapped(|ui| {
+                                let (label, color) = match r.verdict {
+                                    Verdict::FalsePositive => ("NOT A THREAT", theme().green),
+                                    Verdict::Reviewed => ("REVIEWED", theme().accent),
+                                };
+                                badge(ui, label, color);
+                                let note = if r.note.is_empty() { String::new() } else { format!("{} · ", r.note) };
+                                small(ui, format!("{note}{} · {}", r.by, short_time(&r.at)));
+                            });
+                        }
+                        match &mut self.review_edit {
+                            Some(edit) if edit.detection == d.id => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut edit.note).hint_text("Note (optional)").desired_width(300.0));
+                                    let save = if edit.verdict == Verdict::FalsePositive { "Save as not a threat" } else { "Save as reviewed" };
+                                    if small_button(ui, save).clicked() {
+                                        review = Some(ReviewStep::Save);
+                                    }
+                                    if small_button(ui, "Cancel").clicked() {
+                                        review = Some(ReviewStep::Cancel);
+                                    }
+                                });
+                            }
+                            _ => {
+                                ui.horizontal_wrapped(|ui| {
+                                    let note = d.review.as_ref().map(|r| r.note.clone()).unwrap_or_default();
+                                    for (verdict, label) in [(Verdict::Reviewed, "Mark reviewed"), (Verdict::FalsePositive, "Not a threat")] {
+                                        if small_button(ui, label).clicked() {
+                                            review = Some(ReviewStep::Start(ReviewEdit { scan: s.id, detection: d.id, verdict, note: note.clone() }));
+                                        }
+                                    }
+                                    if d.review.is_some() && small_button(ui, "Clear mark").clicked() {
+                                        review = Some(ReviewStep::Clear { scan: s.id, detection: d.id });
+                                    }
+                                });
+                            }
+                        }
+                        ui.add_space(4.0);
                     }
                     if !details.errors.is_empty() {
                         ui.add_space(4.0);
@@ -930,9 +1033,36 @@ impl App {
             });
             ui.add_space(8.0);
         }
+        if self.history.next.is_some() {
+            ui.horizontal(|ui| {
+                let label = if self.history.loading { "Loading…" } else { "Load more" };
+                if ui.add_enabled(!self.history.loading, egui::Button::new(label)).clicked() {
+                    self.load_history(Load::More);
+                }
+                small(ui, format!("{} shown", scans.len()));
+            });
+            ui.add_space(8.0);
+        }
+        if let Some(id) = delete_one {
+            self.history_delete = Some(HistoryDelete { target: DeleteTarget::Scans { ids: vec![id] }, what: format!("entry #{id}"), running: false });
+        }
+        match review {
+            Some(ReviewStep::Start(edit)) => self.review_edit = Some(edit),
+            Some(ReviewStep::Save) => {
+                if let Some(edit) = self.review_edit.take() {
+                    self.save_review(edit.scan, edit.detection, Some(edit.verdict), edit.note);
+                }
+            }
+            Some(ReviewStep::Cancel) => self.review_edit = None,
+            Some(ReviewStep::Clear { scan, detection }) => {
+                self.review_edit = None;
+                self.save_review(scan, detection, None, String::new());
+            }
+            None => {}
+        }
         if let Some(id) = toggle && self.expanded.remove(&id).is_none() {
             self.link.run(
-                move || link::read::<ipc::ScanDetails>(Request::ScanDetails { scan: id }),
+                move || link::read::<ipc::replies::ScanDetails>(Request::ScanDetails { scan: id }),
                 move |app, details| match details {
                     Ok(ipc::ScanDetails { detections, errors }) => {
                         app.expanded.insert(id, ScanDetails { detections, errors });
@@ -1061,6 +1191,56 @@ impl App {
         if test {
             system::notify("Test notification", &format!("This is how {APP_TITLE} notifications look."));
         }
+        ui.add_space(14.0);
+
+        card(ui, |ui| {
+            group_title(ui, "History", "Old history is removed once a day; the monthly totals keep counting it. Keeping it for less time needs an administrator's approval.");
+            let days = |days: u32| match days {
+                0 => "Always".to_string(),
+                365 => "1 year".to_string(),
+                730 => "2 years".to_string(),
+                n => format!("{n} days"),
+            };
+            setting_row(ui, "Keep history", "Threats found, manual scans, suspicious commands and side-loading reports.", |ui| {
+                for choice in [90, 365, 730, 0] {
+                    if chip(ui, &days(choice), self.settings.history_days == choice) {
+                        self.settings.history_days = choice;
+                    }
+                }
+            });
+            row_divider(ui);
+            setting_row(ui, "Keep routine checks", "Real-time checks of new files and programs that found nothing.", |ui| {
+                for choice in [7, 30, 90, 0] {
+                    if chip(ui, &days(choice), self.settings.clean_history_days == choice) {
+                        self.settings.clean_history_days = choice;
+                    }
+                }
+            });
+            if let Some(info) = &self.history_info {
+                row_divider(ui);
+                let mut lines = vec![format!("{} on disk, {} entries", fmt_bytes(info.bytes as i64), info.scans)];
+                if let Some(oldest) = &info.oldest {
+                    lines.push(format!("oldest {}", short_time(oldest)));
+                }
+                if let Some(pruned) = &info.pruned_at {
+                    lines.push(format!("last tidied {} ({} removed)", short_time(pruned), info.pruned));
+                }
+                small(ui, lines.join(" · "));
+                let mut health = Vec::new();
+                if let Some(checked) = &info.checked_at {
+                    health.push(format!("checked {}", short_time(checked)));
+                }
+                health.push(match &info.backed_up_at {
+                    Some(at) => format!("backed up {}", short_time(at)),
+                    None => "not backed up yet (daily)".to_string(),
+                });
+                small(ui, health.join(" · "));
+                if let Some(recovered) = &info.recovered {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(recovery_text(recovered)).color(theme().amber)).wrap());
+                }
+            }
+        });
         ui.add_space(14.0);
 
         let mut open = None;
@@ -2008,6 +2188,22 @@ fn detection_card(ui: &mut Ui, row: &mut ResultRow, ai_enabled: bool) -> bool {
 }
 
 /// Scans recorded by real-time protection rather than started by the user.
+/// What happened when the service found the history database damaged.
+pub(super) fn recovery_text(recovered: &threat_scanner::service::history::Recovered) -> String {
+    let when = chrono::DateTime::from_timestamp(recovered.at as i64, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    let what = if recovered.from_backup {
+        "the last daily backup took its place, so history from after that backup is missing"
+    } else {
+        "there was no good backup, so history started again empty"
+    };
+    format!(
+        "On {when} the history database was found damaged ({}): {what}. The damaged file was kept as {} in the protection data folder. Quarantined files are not affected.",
+        recovered.problem, recovered.kept_as
+    )
+}
+
 fn is_protection_kind(kind: &str) -> bool {
     kind == "watch" || kind == "process" || kind == "command" || kind == "sideload"
 }

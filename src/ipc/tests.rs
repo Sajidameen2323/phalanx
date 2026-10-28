@@ -22,6 +22,22 @@ fn every_request_reads_back_as_sent() {
         Request::SetSettings { settings: ProtectionSettings { exclusions: vec![r"D:\VMs".into()], ..Default::default() } },
         Request::RecentScans { limit: 10, kind: Some("quick".into()) },
         Request::RecentScans { limit: 5, kind: None },
+        Request::History {
+            query: crate::store::HistoryQuery {
+                before: Some(41),
+                limit: 50,
+                kinds: vec!["watch".into(), "process".into()],
+                threats_only: true,
+                text: Some("invoice".into()),
+                since: Some("2026-10-01T00:00:00+05:30".into()),
+            },
+        },
+        Request::HistoryInfo,
+        Request::ExportHistory { query: crate::store::HistoryQuery { kinds: vec!["command".into()], ..Default::default() } },
+        Request::ReviewFinding { detection: 7, verdict: Some(crate::store::Verdict::FalsePositive), note: "our tool".into() },
+        Request::ReviewFinding { detection: 7, verdict: None, note: String::new() },
+        Request::DeleteHistory { target: crate::store::DeleteTarget::Scans { ids: vec![1, 2] } },
+        Request::DeleteHistory { target: crate::store::DeleteTarget::Matching { query: crate::store::HistoryQuery { threats_only: true, ..Default::default() } } },
         Request::ScanDetails { scan: 3 },
         Request::RecentDetections { limit: 20 },
         Request::MonthlySummary,
@@ -75,6 +91,10 @@ fn weakening_needs_an_administrator() {
     assert!(user.may(&Request::Status) && user.may(&Request::Ping));
     assert!(!user.may(&Request::Stop));
     assert!(admin.may(&Request::Stop));
+    // Deleting history removes evidence; marking a finding changes nothing.
+    let delete = Request::DeleteHistory { target: crate::store::DeleteTarget::Scans { ids: vec![1] } };
+    assert!(!user.may(&delete) && admin.may(&delete));
+    assert!(user.may(&Request::ReviewFinding { detection: 1, verdict: Some(crate::store::Verdict::FalsePositive), note: String::new() }));
 }
 
 #[cfg(windows)]
