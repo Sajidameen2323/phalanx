@@ -14,7 +14,7 @@ mod widgets;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -27,7 +27,7 @@ use threat_scanner::reputation::{self, Reputation};
 use threat_scanner::ipc::{self, replies, Event, Request};
 use threat_scanner::scan::{self, FileReport, ScanOptions, ScanReport};
 use threat_scanner::service::settings::ProtectionSettings;
-use threat_scanner::store::{self, DeleteTarget, DetectionRow, HistoryQuery, MonthRow, QuarantineRow, ScanErrorRow, ScanRow, Verdict};
+use threat_scanner::store::{self, DeleteTarget, DetectionRow, FileFinding, HistoryQuery, MonthRow, QuarantineRow, ScanErrorRow, ScanRow, Verdict};
 use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
@@ -454,6 +454,10 @@ struct ScanDetails {
     errors: Vec<ScanErrorRow>,
 }
 
+/// What an inspection sends back: the hash lookup made just before it (if
+/// one was) and the AI's answer.
+type InspectResult = (Option<Result<Reputation, String>>, Result<AiReport, String>);
+
 /// The AI inspection page: one file at a time.
 #[derive(Default)]
 struct InspectState {
@@ -461,7 +465,7 @@ struct InspectState {
     preparing: Option<Receiver<Result<Evidence, String>>>,
     evidence: Option<Result<Evidence, String>>,
     /// Gemini's answer, and the hash lookup made just before it (if one was).
-    running: Option<(Receiver<(Option<Result<Reputation, String>>, Result<AiReport, String>)>, Instant)>,
+    running: Option<(Receiver<InspectResult>, Instant)>,
     report: Option<Result<AiReport, String>>,
     /// A hash lookup is under way.
     looking_up: bool,
@@ -481,8 +485,6 @@ enum HistoryFilter {
 
 /// Scan kinds started by someone, rather than by real-time protection.
 const MANUAL_KINDS: [&str; 4] = ["quick", "full", "custom", "manual"];
-/// Scan kinds real-time protection records.
-const PROTECTION_KINDS: [&str; 5] = ["watch", "process", "command", "sideload", "browser"];
 
 impl HistoryFilter {
     /// The kinds it shows (empty for all) and whether only threats.
@@ -491,7 +493,7 @@ impl HistoryFilter {
         match self {
             HistoryFilter::All => (Vec::new(), false),
             HistoryFilter::Manual => (kinds(&MANUAL_KINDS), false),
-            HistoryFilter::Watch => (kinds(&PROTECTION_KINDS), false),
+            HistoryFilter::Watch => (kinds(&store::PROTECTION_KINDS), false),
             HistoryFilter::Threats => (Vec::new(), true),
             HistoryFilter::Commands => (kinds(&["command"]), false),
             HistoryFilter::SideLoading => (kinds(&["sideload"]), false),
@@ -535,6 +537,12 @@ struct HistoryView {
     loading: bool,
     /// Bumped by every new query, so a reply to an older one is dropped.
     generation: u64,
+    /// Groups of repeated real-time records opened to show each one.
+    open_groups: HashSet<String>,
+    /// Showing findings once per file rather than entry by entry.
+    by_file: bool,
+    /// The "By file" list for the current filter, once loaded.
+    files: Option<Vec<FileFinding>>,
 }
 
 /// A finding's review mark being written.
@@ -822,6 +830,9 @@ impl App {
                 matching: 0,
                 loading: false,
                 generation: 0,
+                open_groups: HashSet::new(),
+                by_file: false,
+                files: None,
             },
             review_edit: None,
             history_delete: None,
@@ -1060,6 +1071,30 @@ impl App {
                         app.history.next = page.next;
                         app.history.matching = page.matching;
                     }
+                    Err(e) => app.notify(format!("Could not read history: {e}"), false),
+                }
+            },
+        );
+        if self.history.by_file && load != Load::More {
+            self.load_history_files();
+        }
+    }
+
+    /// The "By file" list for the current filter.
+    fn load_history_files(&mut self) {
+        if !self.connected {
+            return;
+        }
+        let query = self.history_filter();
+        let generation = self.history.generation;
+        self.link.run(
+            move || link::read::<replies::HistoryFiles>(Request::HistoryFiles { query, limit: store::MAX_FILE_FINDINGS }),
+            move |app, files| {
+                if app.history.generation != generation {
+                    return;
+                }
+                match files {
+                    Ok(files) => app.history.files = Some(files),
                     Err(e) => app.notify(format!("Could not read history: {e}"), false),
                 }
             },

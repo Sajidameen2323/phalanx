@@ -67,6 +67,9 @@ pub enum Request {
     /// A page of history, newest first, filtered and searched as `query`
     /// says; the reply says where the next page starts.
     History { query: HistoryQuery },
+    /// What the scans `query` matches found, once per file and threat (at
+    /// most `limit`): History's "By file" view.
+    HistoryFiles { query: HistoryQuery, limit: u32 },
     /// The history database's size, what it holds, and when it was last
     /// pruned and compacted.
     HistoryInfo,
@@ -251,6 +254,7 @@ impl Request {
             | Request::SetSettings { .. }
             | Request::RecentScans { .. }
             | Request::History { .. }
+            | Request::HistoryFiles { .. }
             | Request::HistoryInfo
             | Request::ReviewFinding { .. }
             | Request::ExportHistory { .. }
@@ -403,6 +407,7 @@ pub mod replies {
     pub type SetSettings = settings::ProtectionSettings;
     pub type RecentScans = Vec<ScanRow>;
     pub type History = HistoryPage;
+    pub type HistoryFiles = Vec<crate::store::FileFinding>;
     pub type HistoryInfo = crate::service::history::HistoryInfo;
     /// The finding's mark now.
     pub type ReviewFinding = Option<crate::store::Review>;

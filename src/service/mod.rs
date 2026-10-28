@@ -156,6 +156,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             reply::<replies::DeleteHistory>(id, session.store(dir).and_then(|s| s.delete_history(&target)).map(|n| n as u64))
         }
         Request::History { query } => reply::<replies::History>(id, session.store(dir).and_then(|s| s.history(&query))),
+        Request::HistoryFiles { query, limit } => reply::<replies::HistoryFiles>(id, session.store(dir).and_then(|s| s.findings_by_file(&query, limit))),
         Request::RecentScans { limit, kind } => reply::<replies::RecentScans>(id, session.store(dir).and_then(|s| s.recent_scans(limit, kind.as_deref()))),
         Request::ScanDetails { scan } => reply::<replies::ScanDetails>(
             id,
@@ -484,7 +485,7 @@ mod tests {
 
     /// Every kind of request there is. A new one fails the contract test
     /// until it is sent there (and given a type in [`replies`]).
-    const REQUEST_KINDS: usize = 33;
+    const REQUEST_KINDS: usize = 34;
 
     /// Reads `reply` as its request's type in [`replies`], as clients do.
     /// The match has no catch-all, so a new request does not compile
@@ -501,6 +502,7 @@ mod tests {
             Request::SetSettings { .. } => read::<replies::SetSettings>(reply),
             Request::RecentScans { .. } => read::<replies::RecentScans>(reply),
             Request::History { .. } => read::<replies::History>(reply),
+            Request::HistoryFiles { .. } => read::<replies::HistoryFiles>(reply),
             Request::HistoryInfo => read::<replies::HistoryInfo>(reply),
             Request::ReviewFinding { .. } => read::<replies::ReviewFinding>(reply),
             Request::DeleteHistory { .. } => read::<replies::DeleteHistory>(reply),
@@ -671,6 +673,11 @@ events:
             query: crate::store::HistoryQuery { limit: 10, threats_only: true, text: Some("setup.TXT".into()), ..Default::default() },
         }));
         assert_eq!(page.scans.iter().map(|s| s.id).collect::<Vec<_>>(), vec![scan], "{page:?}");
+        let files: replies::HistoryFiles = read(service.ask(Request::HistoryFiles {
+            query: crate::store::HistoryQuery { text: Some("setup.TXT".into()), ..Default::default() },
+            limit: 10,
+        }));
+        assert_eq!(files.iter().map(|f| f.last_scan).collect::<Vec<_>>(), vec![scan], "{files:?}");
         let details: replies::ScanDetails = read(service.ask(Request::ScanDetails { scan }));
         assert_eq!(details.detections.len(), 1, "{details:?}");
         let finding = details.detections[0].id;

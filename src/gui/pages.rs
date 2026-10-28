@@ -207,7 +207,7 @@ impl App {
             // Neutral while it works; the result colour arrives when the scan ends.
             (theme().muted, "Scanning".to_string(), format!("{} files · {}{found}", job.files, fmt_duration(job.started.elapsed())))
         } else if let Some(latest) = unresolved.first() {
-            let found_by = if is_protection_kind(&latest.kind) { "real-time protection" } else { "a scan" };
+            let found_by = if store::is_protection_kind(&latest.kind) { "real-time protection" } else { "a scan" };
             (
                 theme().red,
                 "Threats need review".to_string(),
@@ -883,6 +883,18 @@ impl App {
                 }
             }
         });
+        let mut view_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            for (by_file, label) in [(false, "Each entry"), (true, "By file")] {
+                if chip(ui, label, self.history.by_file == by_file) && self.history.by_file != by_file {
+                    self.history.by_file = by_file;
+                    view_changed = true;
+                }
+            }
+        });
+        if view_changed && self.history.by_file {
+            self.load_history_files();
+        }
         // Search once typing pauses.
         if let Some(edited) = self.history.search_edited {
             if edited.elapsed() >= SEARCH_DELAY {
@@ -926,14 +938,34 @@ impl App {
             }
             ui.add_space(6.0);
         }
+        if self.history.by_file {
+            self.history_files(ui);
+            return;
+        }
+        // Real-time records that repeat one another show as one entry, the
+        // newest, with the earlier ones under it when opened.
+        let mut visible: Vec<Shown> = Vec::new();
+        for entry in store::group_history(&scans) {
+            let open = self.history.open_groups.contains(&entry.key);
+            let count = entry.rows.len();
+            let first = entry.rows.last().map(|r| r.started_at.clone()).unwrap_or_default();
+            let mut rows = entry.rows.into_iter();
+            if let Some(newest) = rows.next() {
+                visible.push(Shown { row: newest, group: (count > 1).then(|| Repeats { count, first, key: entry.key.clone() }), earlier: false });
+            }
+            if open {
+                visible.extend(rows.map(|row| Shown { row, group: None, earlier: true }));
+            }
+        }
+        let mut toggle_group = None;
         let mut toggle = None;
         let mut delete_one = None;
         let mut review = None;
-        for s in &scans {
+        for Shown { row: s, group, earlier } in &visible {
             let expanded = self.expanded.get(&s.id);
             card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    let kind_color = if is_protection_kind(&s.kind) { theme().green } else { theme().accent };
+                    let kind_color = if store::is_protection_kind(&s.kind) { theme().green } else { theme().accent };
                     badge(ui, &s.kind.to_uppercase(), kind_color);
                     ui.label(RichText::new(format!("#{} · {}", s.id, short_time(&s.started_at))).strong().color(theme().text));
                     let (status, color) = match (&s.finished_at, s.cancelled, s.detections) {
@@ -947,6 +979,9 @@ impl App {
                     };
                     badge(ui, &status, color);
                 });
+                if *earlier {
+                    small(ui, "An earlier record of the entry above");
+                }
                 if s.kind == "command" {
                     facts(ui, &[("Action", "Reported only: command-line rules do not stop programs yet".to_string())]);
                 } else if s.kind == "sideload" {
@@ -967,6 +1002,15 @@ impl App {
                     );
                 }
                 truncated(ui, s.targets.clone(), theme().muted, 12.5);
+                if let Some(Repeats { count, first, key }) = group {
+                    ui.horizontal_wrapped(|ui| {
+                        small(ui, format!("Seen {count} times since {}", short_time(first)));
+                        let label = if self.history.open_groups.contains(key) { "Hide earlier".to_string() } else { format!("Show earlier ({})", count - 1) };
+                        if small_button(ui, &label).clicked() {
+                            toggle_group = Some(key.clone());
+                        }
+                    });
+                }
                 ui.horizontal(|ui| {
                     if s.detections > 0 || s.errors > 0 {
                         let label = if expanded.is_some() { "Hide details" } else { "Show details" };
@@ -1051,6 +1095,9 @@ impl App {
             });
             ui.add_space(8.0);
         }
+        if let Some(key) = toggle_group && !self.history.open_groups.remove(&key) {
+            self.history.open_groups.insert(key);
+        }
         if let Some(id) = delete_one {
             self.history_delete = Some(HistoryDelete { target: DeleteTarget::Scans { ids: vec![id] }, what: format!("entry #{id}"), running: false });
         }
@@ -1078,6 +1125,40 @@ impl App {
                     Err(e) => app.notify(format!("Could not load scan details: {e}"), false),
                 },
             );
+        }
+    }
+
+    /// History's "By file" view: what the filtered entries found, once per
+    /// file and threat, however many scans found it again.
+    fn history_files(&mut self, ui: &mut Ui) {
+        let Some(files) = self.history.files.clone() else {
+            card(ui, |ui| muted(ui, "Loading…"));
+            return;
+        };
+        if files.is_empty() {
+            card(ui, |ui| muted(ui, "These entries found nothing."));
+            return;
+        }
+        let most = if files.len() as u32 >= store::MAX_FILE_FINDINGS { " (the most recent)" } else { "" };
+        small(ui, format!("{} file(s), each shown once{most}", files.len()));
+        ui.add_space(6.0);
+        for f in &files {
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    badge(ui, &f.category.to_uppercase(), category_color_str(&f.category));
+                    truncated(ui, f.threat.clone(), theme().text, 13.0);
+                });
+                path_lines(ui, &f.path);
+                let times = match (f.times, f.scans) {
+                    (1, _) => "Found once".to_string(),
+                    (times, scans) if times == scans => format!("Found {times} times"),
+                    (times, scans) => format!("Found {times} times in {scans} entries"),
+                };
+                let when = if f.times == 1 { short_time(&f.last_seen) } else { format!("{} to {}", short_time(&f.first_seen), short_time(&f.last_seen)) };
+                small(ui, format!("{times} · {when} · last in #{}", f.last_scan));
+                small(ui, format!("Last action: {}", f.action));
+            });
+            ui.add_space(8.0);
         }
     }
 
@@ -2369,8 +2450,20 @@ pub(super) fn recovery_text(recovered: &threat_scanner::service::history::Recove
     )
 }
 
-fn is_protection_kind(kind: &str) -> bool {
-    kind == "watch" || kind == "process" || kind == "command" || kind == "sideload"
+/// A History card: a record, with the group it heads, if any.
+struct Shown {
+    row: ScanRow,
+    group: Option<Repeats>,
+    /// An earlier record of an opened group, under its newest.
+    earlier: bool,
+}
+
+/// Real-time records that repeat one another.
+struct Repeats {
+    count: usize,
+    /// When the oldest was.
+    first: String,
+    key: String,
 }
 
 fn capitalize(text: &str) -> String {

@@ -501,7 +501,7 @@ fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> String {
 
 /// Watches for programs starting. Programs already running when protection
 /// starts go to the sweep lane, so they never hold up new files; new ones go
-/// to the urgent lane. Command lines are checked here, before the scan.
+/// to the urgent lane, those that start while the first list is read too. Command lines are checked here, before the scan.
 ///
 /// Process-start events (ETW) report a program within milliseconds; the
 /// process list is then still read every few seconds for anything the event
@@ -512,6 +512,9 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>, side: Op
     let images = side.is_some();
     let mut filter = sideload::Filter::new();
     let store = if ctx.commands_enabled() { Some(scan::open_store(ctx.data_dir)?) } else { None };
+    // Programs started after this are new, even when the first list (slow on
+    // a busy PC) is what finds them.
+    let began = process::now_ticks();
     // Started before the first list, so nothing starts unseen in between.
     let mut events = start_events(ctx, images, false);
     let mut retry_events = Instant::now() + EVENTS_RETRY;
@@ -526,12 +529,12 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>, side: Op
             match listing {
                 Ok(list) => {
                     failures = 0;
-                    let lane = if first { sweep } else { urgent };
                     live = list.into_iter().map(|p| (p.id.pid, p)).collect();
                     let mut current = HashSet::with_capacity(live.len());
                     for info in live.values() {
                         current.insert(info.id.clone());
                         if !known.contains(&info.id) {
+                            let lane = if first && info.id.created < began { sweep } else { urgent };
                             consider_program(ctx, store.as_ref(), info, &live, lane)?;
                         }
                     }

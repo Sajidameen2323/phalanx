@@ -22,6 +22,7 @@ fn every_request_reads_back_as_sent() {
         Request::SetSettings { settings: ProtectionSettings { exclusions: vec![r"D:\VMs".into()], ..Default::default() } },
         Request::RecentScans { limit: 10, kind: Some("quick".into()) },
         Request::RecentScans { limit: 5, kind: None },
+        Request::HistoryFiles { query: crate::store::HistoryQuery { kinds: vec!["full".into()], ..Default::default() }, limit: 100 },
         Request::History {
             query: crate::store::HistoryQuery {
                 before: Some(41),
@@ -101,6 +102,11 @@ fn weakening_needs_an_administrator() {
 mod live {
     use super::super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// How long a test waits on the service. Long: right after a build,
+    /// Windows scanning the new test binary can slow everything for a
+    /// minute. A test that passes stops waiting when the answer comes.
+    const SERVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
     /// A data folder whose settings keep real-time protection off: tests must
     /// not watch this PC's Downloads folders and programs.
@@ -255,9 +261,9 @@ mod live {
         rx
     }
 
-    /// Waits up to 30 s for an event that `wanted` accepts.
+    /// Waits up to [`SERVICE_WAIT`] for an event that `wanted` accepts.
     fn wait_for(events: &std::sync::mpsc::Receiver<serde_json::Value>, wanted: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + SERVICE_WAIT;
         let mut seen = Vec::new();
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
             match events.recv_timeout(left) {
@@ -266,7 +272,7 @@ mod live {
                 Err(_) => break,
             }
         }
-        panic!("no such event within 30 s; saw {seen:?}");
+        panic!("no such event within {SERVICE_WAIT:?}; saw {seen:?}");
     }
 
     #[test]
@@ -291,7 +297,7 @@ mod live {
 
         // Protection may have started before this client subscribed: ask.
         let mut client = Client::connect_to(&name, false).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + SERVICE_WAIT;
         loop {
             let status: ProtectionStatus = client.call(Request::ProtectionStatus).unwrap().into_result().unwrap();
             if status.watching {
