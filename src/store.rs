@@ -225,6 +225,75 @@ fn remove_marked(tx: &rusqlite::Transaction<'_>) -> Result<usize> {
     Ok(removed)
 }
 
+/// Most scans one export holds.
+pub const MAX_EXPORT: u32 = 100_000;
+
+/// One row of exported history: a scan and one of its findings, or a scan
+/// that found nothing (no finding).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRow {
+    pub scan: i64,
+    pub kind: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub targets: String,
+    pub files_scanned: i64,
+    pub detections: i64,
+    pub quarantined: i64,
+    pub finding: Option<i64>,
+    pub threat: Option<String>,
+    pub category: Option<String>,
+    pub source: Option<String>,
+    pub path: Option<String>,
+    pub action: Option<String>,
+    pub review: Option<Verdict>,
+    pub review_note: Option<String>,
+    pub reviewed_by: Option<String>,
+}
+
+/// `rows` as CSV with a header line, for a spreadsheet. A cell that starts
+/// like a formula (`=`, `+`, `-`, `@`, or a tab or carriage return) gets a
+/// leading `'`, so a file or threat name cannot run as one when opened.
+pub fn export_csv(rows: &[ExportRow]) -> String {
+    fn cell(text: &str) -> String {
+        let text = if text.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{text}") } else { text.to_string() };
+        if text.contains([',', '"', '\n', '\r']) { format!("\"{}\"", text.replace('"', "\"\"")) } else { text }
+    }
+    let mut out = String::from(
+        "scan,kind,started_at,finished_at,targets,files_scanned,detections,quarantined,finding,threat,category,source,path,action,review,review_note,reviewed_by\r\n",
+    );
+    for r in rows {
+        let opt = |v: &Option<String>| cell(v.as_deref().unwrap_or(""));
+        let fields = [
+            r.scan.to_string(),
+            cell(&r.kind),
+            cell(&r.started_at),
+            opt(&r.finished_at),
+            cell(&r.targets),
+            r.files_scanned.to_string(),
+            r.detections.to_string(),
+            r.quarantined.to_string(),
+            r.finding.map(|f| f.to_string()).unwrap_or_default(),
+            opt(&r.threat),
+            opt(&r.category),
+            opt(&r.source),
+            opt(&r.path),
+            opt(&r.action),
+            r.review.map(|v| v.as_str().to_string()).unwrap_or_default(),
+            opt(&r.review_note),
+            opt(&r.reviewed_by),
+        ];
+        out.push_str(&fields.join(","));
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// `rows` as a JSON array, for other tools.
+pub fn export_json(rows: &[ExportRow]) -> String {
+    serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".into())
+}
+
 /// What someone made of a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -560,6 +629,43 @@ impl Store {
         let mut count = self.conn.prepare_cached(&format!("SELECT COUNT(*) FROM Scans WHERE {HISTORY_FILTER}"))?;
         let matching = count.query_row(params![since, threats, kinds, text], |r| r.get(0))?;
         Ok(HistoryPage { scans, next: next.flatten(), matching })
+    }
+
+    /// Every scan `query` matches, on all pages, newest first, one row per
+    /// finding (a scan that found nothing is one row with no finding), for
+    /// export. At most [`MAX_EXPORT`] scans.
+    pub fn export(&self, query: &HistoryQuery) -> Result<Vec<ExportRow>> {
+        let (since, threats, kinds, text) = filter_params(query);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.Id, s.Kind, s.StartedAt, s.FinishedAt, s.Targets, s.FilesScanned, s.Detections, s.Quarantined,
+                    d.Id, d.Threat, d.Category, d.Source, d.Path, d.Action, r.Verdict, r.Note, r.By
+             FROM (SELECT * FROM Scans WHERE {HISTORY_FILTER} ORDER BY Id DESC LIMIT ?5) s
+             LEFT JOIN Detections d ON d.ScanId = s.Id
+             LEFT JOIN Reviews r ON r.DetectionId = d.Id
+             ORDER BY s.Id DESC, d.Id"
+        ))?;
+        let rows = stmt.query_map(params![since, threats, kinds, text, MAX_EXPORT], |r| {
+            Ok(ExportRow {
+                scan: r.get(0)?,
+                kind: r.get(1)?,
+                started_at: r.get(2)?,
+                finished_at: r.get(3)?,
+                targets: r.get(4)?,
+                files_scanned: r.get(5)?,
+                detections: r.get(6)?,
+                quarantined: r.get(7)?,
+                finding: r.get(8)?,
+                threat: r.get(9)?,
+                category: r.get(10)?,
+                source: r.get(11)?,
+                path: r.get(12)?,
+                action: r.get(13)?,
+                review: r.get::<_, Option<String>>(14)?.map(|v| Verdict::parse(&v)),
+                review_note: r.get(15)?,
+                reviewed_by: r.get(16)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Marks a finding as reviewed or a false positive, with a note, or
@@ -999,6 +1105,38 @@ mod tests {
         // Deleted scans leave the monthly totals too; quarantine stays.
         assert_eq!(store.monthly_summary().unwrap()[0].scans, left);
         assert_eq!(store.quarantine_items(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn export_has_a_row_per_finding_with_its_mark() {
+        let (_tmp, store) = history_store(20);
+        // Scan 20 found two things, one marked.
+        let finding = Finding { threat: "=HYPERLINK(\"http://x\")".into(), category: crate::Category::Malware, source: crate::Source::Yara, details: String::new() };
+        store.add_detection(20, r"C:\Users\me\Downloads\a, b.exe", "", &finding, "reported").unwrap();
+        let first = store.scan_detections(20).unwrap()[0].id;
+        store.review(first, Some((Verdict::FalsePositive, "line one\nline \"two\"")), r"PC\me").unwrap();
+
+        let rows = store.export(&HistoryQuery::default()).unwrap();
+        assert_eq!(rows.len(), 21, "20 scans, one with two findings");
+        assert_eq!(rows.iter().filter(|r| r.scan == 20).count(), 2);
+        assert_eq!(rows[0].scan, 20, "newest first");
+        assert_eq!((rows[0].review, rows[0].reviewed_by.as_deref()), (Some(Verdict::FalsePositive), Some(r"PC\me")));
+        let clean = rows.iter().find(|r| r.scan == 19).unwrap();
+        assert!(clean.finding.is_none() && clean.threat.is_none());
+        // Filters apply, on every page.
+        assert_eq!(store.export(&HistoryQuery { threats_only: true, ..Default::default() }).unwrap().len(), 3);
+
+        let csv = export_csv(&rows);
+        let lines: Vec<&str> = csv.split("\r\n").collect();
+        assert!(lines[0].starts_with("scan,kind,started_at"));
+        // A formula is text; commas, quotes and new lines are quoted.
+        assert!(csv.contains(r#""'=HYPERLINK(""http://x"")""#), "{csv}");
+        assert!(csv.contains(r#""C:\Users\me\Downloads\a, b.exe""#), "{csv}");
+        assert!(csv.contains("\"line one\nline \"\"two\"\"\""), "{csv}");
+        assert_eq!(csv.matches("\r\n").count(), 22, "a header and 21 rows, each ending in CRLF");
+
+        let back: Vec<ExportRow> = serde_json::from_str(&export_json(&rows)).unwrap();
+        assert_eq!(back, rows);
     }
 
     #[test]

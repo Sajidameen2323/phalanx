@@ -169,4 +169,27 @@ round-trip test.
     `DESKTOP-8Q8S8UH\Sajid`), shown, cleared; a normal user's delete refused
     for approval. The refusal says "this weakens protection", the generic
     approval text.
-- **Next:** milestone 5, export.
+- **Milestone 5: built (2026-10-28); the app's Export… not yet tried by hand.**
+  - `Store::export(&HistoryQuery) -> Vec<ExportRow>`: every scan the filter
+    matches on all pages (at most `MAX_EXPORT`, 100,000), newest first, one
+    row per finding with its mark; a scan that found nothing is one row with
+    the finding columns empty.
+  - `export_csv` and `export_json` format the rows, the same for the app and
+    the CLI. CSV has a header, CRLF lines, quoting for commas, quotes and
+    new lines, and a leading `'` on a cell that starts like a spreadsheet
+    formula (`=`, `+`, `-`, `@`, tab, CR): file and threat names come from
+    what was scanned, so they must not run in Excel.
+  - `Request::ExportHistory { query }` → `replies::ExportHistory` (anyone,
+    like reading history; in the contract test, now 31 requests). The
+    service only sends rows: it runs as SYSTEM and writes no file a client
+    names. The app and `phalanx-cli` write the file as the user.
+  - CLI: `service history --export FILE` with history's filters (CSV, or JSON
+    for a `.json` name). App: **Export…** beside the entry count opens a save
+    dialog (CSV or JSON, named `phalanx-history-<date>`) for what the current
+    filter and search match. `App::history_filter` is shared with **Delete
+    these…**.
+  - Test `export_has_a_row_per_finding_with_its_mark` (rows, marks, filters,
+    the formula guard, quoting, JSON back as sent). Tried through a console
+    service: 20 threat rows to CSV with a mark and its reviewer, 38
+    side-loading rows to JSON.
+- **Next:** milestone 6, integrity.

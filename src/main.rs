@@ -162,6 +162,10 @@ enum ServiceCommand {
         /// Also list each scan's findings, with the numbers `service review` takes.
         #[arg(long)]
         findings: bool,
+        /// Save every scan the filters match (all pages, one row per finding)
+        /// to this file instead: CSV, or JSON for a .json name.
+        #[arg(long)]
+        export: Option<PathBuf>,
     },
     /// Mark a finding as reviewed or a false positive, or clear its mark.
     /// Its number is in `service history --findings`.
@@ -1137,8 +1141,17 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
             println!("    other:      {} file(s) (web lists, DNS backup, signatures)", done.copied);
             println!("The old folder was left as it was.");
         }
-        ServiceCommand::History { limit, search, kinds, threats_only, days, before, findings } => {
+        ServiceCommand::History { limit, search, kinds, threats_only, days, before, findings, export } => {
             let mut client = ipc::Client::connect().map_err(|e| anyhow::anyhow!(ipc::describe(&e)))?;
+            if let Some(file) = export {
+                let query = history_filter(search, kinds, *threats_only, *days);
+                let rows: ipc::replies::ExportHistory = client.call(ipc::Request::ExportHistory { query })?.into_result()?;
+                let json = file.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+                let text = if json { threat_scanner::store::export_json(&rows) } else { threat_scanner::store::export_csv(&rows) };
+                std::fs::write(file, text).map_err(|e| anyhow::anyhow!("writing {}: {e}", file.display()))?;
+                println!("Saved {} row(s) to {}.", rows.len(), file.display());
+                return Ok(ExitCode::SUCCESS);
+            }
             let query = threat_scanner::store::HistoryQuery { before: *before, limit: *limit, ..history_filter(search, kinds, *threats_only, *days) };
             let page: ipc::replies::History = client.call(ipc::Request::History { query })?.into_result()?;
             if page.scans.is_empty() {

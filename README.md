@@ -116,6 +116,7 @@ phalanx-cli service scan D:\    # scan in the service, with progress
 phalanx-cli service events      # watch what the service reports
 phalanx-cli service settings
 phalanx-cli service history --search invoice --threats-only --days 7   # also --kind, --before, --findings
+phalanx-cli service history --threats-only --export threats.csv        # or .json; every matching scan
 phalanx-cli service review 42 --false-positive --note "our build tool"  # or --reviewed, --clear
 phalanx-cli service delete-history --scan 300   # or --all-matching with history's filters (administrator)
 phalanx-cli service protection  # watching? programs through process events?
@@ -201,7 +202,9 @@ The app has these pages:
   service records who marked it. Entries can be deleted one at a time or all
   that match the current filter (an administrator's approval is needed: it
   removes evidence); deleted entries leave the monthly totals too, and
-  quarantined files are not touched.
+  quarantined files are not touched. **Export…** saves everything the current
+  filter matches, one row per finding with its mark, as CSV (for spreadsheets;
+  a cell that starts like a formula is kept as text) or JSON.
 * **Settings**, in tabs: **General** (startup, tray, notifications, data folder),
   **Scanning** (performance, detection, quarantine), **Exclusions**, **Signatures**
   and **AI inspection**.

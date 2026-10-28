@@ -148,6 +148,7 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
             id,
             session.store(dir).and_then(|s| s.review(detection, verdict.map(|v| (v, note.as_str())), &caller.user)),
         ),
+        Request::ExportHistory { query } => reply::<replies::ExportHistory>(id, session.store(dir).and_then(|s| s.export(&query))),
         Request::DeleteHistory { target } => {
             reply::<replies::DeleteHistory>(id, session.store(dir).and_then(|s| s.delete_history(&target)).map(|n| n as u64))
         }
@@ -476,7 +477,7 @@ mod tests {
 
     /// Every kind of request there is. A new one fails the contract test
     /// until it is sent there (and given a type in [`replies`]).
-    const REQUEST_KINDS: usize = 30;
+    const REQUEST_KINDS: usize = 31;
 
     /// Reads `reply` as its request's type in [`replies`], as clients do.
     /// The match has no catch-all, so a new request does not compile
@@ -496,6 +497,7 @@ mod tests {
             Request::HistoryInfo => read::<replies::HistoryInfo>(reply),
             Request::ReviewFinding { .. } => read::<replies::ReviewFinding>(reply),
             Request::DeleteHistory { .. } => read::<replies::DeleteHistory>(reply),
+            Request::ExportHistory { .. } => read::<replies::ExportHistory>(reply),
             Request::ScanDetails { .. } => read::<replies::ScanDetails>(reply),
             Request::RecentDetections { .. } => read::<replies::RecentDetections>(reply),
             Request::MonthlySummary => read::<replies::MonthlySummary>(reply),
@@ -666,6 +668,8 @@ events:
         assert_eq!(mark.map(|m| m.by), Some(r"TEST\admin".to_string()), "who marked it is the caller, not the client's say");
         let again: replies::ScanDetails = read(service.ask(Request::ScanDetails { scan }));
         assert_eq!(again.detections[0].review.as_ref().map(|r| r.note.as_str()), Some("a test file"));
+        let rows: replies::ExportHistory = read(service.ask(Request::ExportHistory { query: crate::store::HistoryQuery { threats_only: true, ..Default::default() } }));
+        assert!(rows.iter().any(|r| r.finding == Some(finding) && r.review_note.as_deref() == Some("a test file")), "{rows:?}");
         service.ask(Request::RecentDetections { limit: 10 });
         let info: replies::HistoryInfo = read(service.ask(Request::HistoryInfo));
         assert!(info.scans >= 1 && info.bytes > 0, "{info:?}");

@@ -80,6 +80,9 @@ pub enum Request {
     },
     /// Delete scans from history (administrators only: it removes evidence).
     DeleteHistory { target: DeleteTarget },
+    /// Every scan `query` matches, one row per finding, for the client to
+    /// save as a file (the service writes none: it runs as SYSTEM).
+    ExportHistory { query: HistoryQuery },
     /// A scan's detections and errors. (Fields are not called `id`: that is
     /// the message's own.)
     ScanDetails { scan: i64 },
@@ -238,6 +241,7 @@ impl Request {
             | Request::History { .. }
             | Request::HistoryInfo
             | Request::ReviewFinding { .. }
+            | Request::ExportHistory { .. }
             | Request::ScanDetails { .. }
             | Request::RecentDetections { .. }
             | Request::MonthlySummary
@@ -390,6 +394,7 @@ pub mod replies {
     pub type ReviewFinding = Option<crate::store::Review>;
     /// Scans deleted.
     pub type DeleteHistory = u64;
+    pub type ExportHistory = Vec<crate::store::ExportRow>;
     pub type ScanDetails = super::ScanDetails;
     pub type RecentDetections = Vec<DetectionRow>;
     pub type MonthlySummary = Vec<MonthRow>;

@@ -33,6 +33,7 @@ fn every_request_reads_back_as_sent() {
             },
         },
         Request::HistoryInfo,
+        Request::ExportHistory { query: crate::store::HistoryQuery { kinds: vec!["command".into()], ..Default::default() } },
         Request::ReviewFinding { detection: 7, verdict: Some(crate::store::Verdict::FalsePositive), note: "our tool".into() },
         Request::ReviewFinding { detection: 7, verdict: None, note: String::new() },
         Request::DeleteHistory { target: crate::store::DeleteTarget::Scans { ids: vec![1, 2] } },

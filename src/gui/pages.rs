@@ -902,16 +902,20 @@ impl App {
         } else {
             let unfiltered = self.history.filter == HistoryFilter::All && self.history.since == HistorySince::Any && self.history.search.trim().is_empty();
             let matching = self.history.matching;
+            let mut export = false;
             ui.horizontal_wrapped(|ui| {
                 small(ui, if matching == 1 { "1 entry".to_string() } else { format!("{matching} entries") });
+                if small_button(ui, "Export…").clicked() {
+                    export = true;
+                }
                 if small_button(ui, "Delete these…").clicked() {
-                    let (kinds, threats_only) = self.history.filter.query();
-                    let text = Some(self.history.search.trim().to_string()).filter(|t| !t.is_empty());
-                    let query = HistoryQuery { kinds, threats_only, text, since: self.history.since.start(), ..Default::default() };
                     let what = if unfiltered { format!("all {matching} entries") } else { format!("the {matching} entries that match this filter") };
-                    self.history_delete = Some(HistoryDelete { target: DeleteTarget::Matching { query }, what, running: false });
+                    self.history_delete = Some(HistoryDelete { target: DeleteTarget::Matching { query: self.history_filter() }, what, running: false });
                 }
             });
+            if export {
+                self.export_history();
+            }
             ui.add_space(6.0);
         }
         let mut toggle = None;

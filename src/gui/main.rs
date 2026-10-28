@@ -932,6 +932,40 @@ impl App {
         );
     }
 
+    /// Everything the History page's filter and search match, on any page.
+    fn history_filter(&self) -> HistoryQuery {
+        HistoryQuery { before: None, limit: 0, ..self.history_query(None, 0) }
+    }
+
+    /// Saves what History's filter matches as a CSV or JSON file the user
+    /// picks. The service sends the rows; the app writes the file, as the
+    /// user, where they chose.
+    fn export_history(&mut self) {
+        let name = format!("phalanx-history-{}.csv", chrono::Local::now().format("%Y-%m-%d"));
+        let Some(file) = rfd::FileDialog::new()
+            .set_file_name(&name)
+            .add_filter("CSV (spreadsheets)", &["csv"])
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let query = self.history_filter();
+        self.link.run(
+            move || -> Result<(usize, PathBuf), String> {
+                let rows = link::read::<replies::ExportHistory>(Request::ExportHistory { query })?;
+                let json = file.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+                let text = if json { store::export_json(&rows) } else { store::export_csv(&rows) };
+                std::fs::write(&file, text).map_err(|e| format!("writing {}: {e}", file.display()))?;
+                Ok((rows.len(), file))
+            },
+            |app, saved| match saved {
+                Ok((rows, file)) => app.notify(format!("Saved {rows} rows to {}", file.display()), true),
+                Err(e) => app.notify(format!("Could not export: {e}"), false),
+            },
+        );
+    }
+
     /// The History query for what the page shows now.
     fn history_query(&self, before: Option<i64>, limit: u32) -> HistoryQuery {
         let (kinds, threats_only) = self.history.filter.query();
