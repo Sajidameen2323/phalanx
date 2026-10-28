@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// Without the event session, how often it is tried again.
@@ -53,6 +53,9 @@ const RETRY: Duration = Duration::from_secs(60);
 const GATHER: Duration = Duration::from_millis(400);
 /// A signed program is reported at most this often per browser.
 const REVIEW_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How long an exited program is remembered. Windows can deliver a file
+/// open after the exit of the program that made it.
+const EXITED_KEEP: Duration = Duration::from_secs(60);
 /// How often Windows is asked whether it dropped events.
 const LOST_CHECK: Duration = Duration::from_secs(60);
 /// Kept judgements and signatures, at most.
@@ -121,6 +124,9 @@ pub struct BrowserHit {
     pub connections: Vec<String>,
     /// `None` when left running; otherwise whether stopping it worked.
     pub stopped: Option<Result<(), String>>,
+    /// It had exited by the time it was caught, so there was nothing to stop.
+    #[serde(default)]
+    pub exited: bool,
     /// Remote control: the program that started the browser.
     pub controller: Option<Controller>,
 }
@@ -154,6 +160,7 @@ impl BrowserHit {
         let mut action = match (&self.stopped, self.level) {
             (Some(Ok(())), _) => "program stopped".to_string(),
             (Some(Err(e)), _) => format!("could not stop it: {e}"),
+            (None, Level::High) if self.exited || self.created == 0 => "reported (it had already exited)".into(),
             (None, Level::High) => "reported (automatic stopping is off)".into(),
             (None, Level::Review) => "reported (not stopped)".into(),
         };
@@ -526,6 +533,8 @@ struct Watch<'a, 'c> {
     browsers: etw::Watched,
     /// Processes started since the session began, by id.
     live: HashMap<u32, ProcessInfo>,
+    /// …and those of them that exited lately.
+    exited: Exited,
     /// Each process is judged once, when it first opens a file.
     judged: HashMap<ProcessId, bool>,
     /// …and once when it first opens a browser's memory.
@@ -533,10 +542,52 @@ struct Watch<'a, 'c> {
     /// DLLs already looked at, per browser process.
     dlls: HashSet<(u32, PathBuf)>,
     signatures: HashMap<PathBuf, Trust>,
-    /// Signed programs reported, by program and browser.
-    reviewed: HashMap<(PathBuf, String), Instant>,
     /// Alerts waiting for more files from the same program.
     pending: Vec<(BrowserHit, Instant)>,
+}
+
+/// Programs that exited lately, so an event that arrives after the exit can
+/// still name the program (and judge it) instead of reporting an unknown one.
+#[derive(Default)]
+struct Exited(HashMap<u32, (ProcessInfo, Instant)>);
+
+impl Exited {
+    fn remember(&mut self, info: ProcessInfo) {
+        let now = Instant::now();
+        self.0.retain(|_, (_, at)| now.duration_since(*at) < EXITED_KEEP);
+        if self.0.len() < MAX_CACHED {
+            self.0.insert(info.id.pid, (info, now));
+        }
+    }
+
+    /// The id was given to a new process.
+    fn forget(&mut self, pid: u32) {
+        self.0.remove(&pid);
+    }
+
+    fn get(&self, pid: u32) -> Option<&ProcessInfo> {
+        self.0.get(&pid).filter(|(_, at)| at.elapsed() < EXITED_KEEP).map(|(info, _)| info)
+    }
+}
+
+/// Signed programs reported, by program and what they reached. Kept for the
+/// whole service, not one watch: any settings change restarts protection, and
+/// that must not report them all again.
+static REVIEWED: LazyLock<Mutex<HashMap<(PathBuf, String), Instant>>> = LazyLock::new(Default::default);
+
+/// A signed program already reported for this browser within the hour is
+/// not reported again.
+fn reviewed_lately(image: &Path, what: &str) -> bool {
+    let mut reviewed = REVIEWED.lock().unwrap_or_else(PoisonError::into_inner);
+    let key = (image.to_path_buf(), what.to_string());
+    if reviewed.get(&key).is_some_and(|t| t.elapsed() < REVIEW_EVERY) {
+        return true;
+    }
+    if reviewed.len() > MAX_CACHED {
+        reviewed.retain(|_, t| t.elapsed() < REVIEW_EVERY);
+    }
+    reviewed.insert(key, Instant::now());
+    false
 }
 
 /// Runs the watch until protection stops. Without the event session (no
@@ -551,11 +602,11 @@ pub(super) fn run(ctx: &Ctx<'_>, store: &Store, urgent: &Sender<Item>) -> anyhow
         protected: protected_folders(),
         browsers: Arc::new(RwLock::new(HashSet::new())),
         live: HashMap::new(),
+        exited: Exited::default(),
         judged: HashMap::new(),
         judged_memory: HashSet::new(),
         dlls: HashSet::new(),
         signatures: HashMap::new(),
-        reviewed: HashMap::new(),
         pending: Vec::new(),
     };
     let mut announced = None;
@@ -586,12 +637,15 @@ pub(super) fn run(ctx: &Ctx<'_>, store: &Store, urgent: &Sender<Item>) -> anyhow
                     if BROWSERS.contains(&info.name.to_lowercase().as_str()) {
                         watch.browsers.write().unwrap_or_else(PoisonError::into_inner).insert(info.id.pid);
                     }
+                    watch.exited.forget(info.id.pid);
                     watch.live.insert(info.id.pid, info.clone());
                     watch.started(&info);
                 }
                 Ok(etw::Event::Stopped { pid }) => {
                     watch.browsers.write().unwrap_or_else(PoisonError::into_inner).remove(&pid);
-                    watch.live.remove(&pid);
+                    if let Some(info) = watch.live.remove(&pid) {
+                        watch.exited.remember(info);
+                    }
                     watch.judged.retain(|id, _| id.pid != pid);
                     watch.judged_memory.retain(|id| id.pid != pid);
                     watch.dlls.retain(|(p, _)| *p != pid);
@@ -642,6 +696,14 @@ impl Watch<'_, '_> {
         Some(ProcessInfo { id: ProcessId { pid, created }, name, image, parent: 0 })
     }
 
+    /// Like [`Self::info`], but also a program that exited lately: `true` then.
+    fn info_or_exited(&self, pid: u32) -> Option<(ProcessInfo, bool)> {
+        match self.info(pid) {
+            Some(info) => Some((info, false)),
+            None => self.exited.get(pid).map(|info| (info.clone(), true)),
+        }
+    }
+
     fn seed_browsers(&mut self) {
         let Ok(listed) = process::listed() else { return };
         let mut browsers = self.browsers.write().unwrap_or_else(PoisonError::into_inner);
@@ -651,17 +713,6 @@ impl Watch<'_, '_> {
 
     fn is_browser(&self, pid: u32) -> bool {
         self.browsers.read().unwrap_or_else(PoisonError::into_inner).contains(&pid)
-    }
-
-    /// A signed program already reported for this browser within the hour
-    /// is not reported again.
-    fn reviewed_lately(&mut self, image: &Path, what: &str) -> bool {
-        let key = (image.to_path_buf(), what.to_string());
-        if self.reviewed.get(&key).is_some_and(|t| t.elapsed() < REVIEW_EVERY) {
-            return true;
-        }
-        self.reviewed.insert(key, Instant::now());
-        false
     }
 
     fn signer(trust: &Trust) -> Option<String> {
@@ -683,7 +734,9 @@ impl Watch<'_, '_> {
             }
             return;
         }
-        let info = self.info(pid);
+        let found = self.info_or_exited(pid);
+        let gone = found.as_ref().is_some_and(|(_, gone)| *gone);
+        let info = found.map(|(info, _)| info);
         // A process that could not be identified is judged once too.
         let id = info.as_ref().map_or(ProcessId { pid, created: 0 }, |i| i.id.clone());
         if self.judged.contains_key(&id) {
@@ -705,14 +758,14 @@ impl Watch<'_, '_> {
             }
             None => (Level::High, "it exited before it could be identified".to_string(), None),
         };
-        if level == Level::Review && let Some(info) = &info && self.reviewed_lately(&info.image, secret.browser) {
+        if level == Level::Review && let Some(info) = &info && reviewed_lately(&info.image, secret.browser) {
             return;
         }
         // Where it is connected, read before it is stopped.
         let connections = net::connections(pid).iter().map(ToString::to_string).collect();
         let stop = level == Level::High && self.ctx.config.browser_guard_stop;
         let stopped = match &info {
-            Some(info) if stop => Some(process::terminate(&info.id)),
+            Some(info) if stop && !gone => Some(process::terminate(&info.id)),
             _ => None,
         };
         let hit = BrowserHit {
@@ -730,6 +783,7 @@ impl Watch<'_, '_> {
             reason,
             connections,
             stopped,
+            exited: gone || info.is_none(),
             controller: None,
         };
         self.pending.push((hit, Instant::now() + GATHER));
@@ -751,7 +805,7 @@ impl Watch<'_, '_> {
         if allowed_here(&dll, &self.ctx.config.browser_guard_allowed, None) {
             return;
         }
-        if level == Level::Review && self.reviewed_lately(&dll, "injected") {
+        if level == Level::Review && reviewed_lately(&dll, "injected") {
             return;
         }
         let stop = level == Level::High && self.ctx.config.browser_guard_stop;
@@ -772,6 +826,7 @@ impl Watch<'_, '_> {
             reason,
             connections: net::connections(pid).iter().map(ToString::to_string).collect(),
             stopped: stop.then(|| process::terminate(&info.id)),
+            exited: false,
             controller: None,
         };
         self.report(hit);
@@ -783,7 +838,7 @@ impl Watch<'_, '_> {
         if self.is_browser(pid) {
             return;
         }
-        let Some(reader) = self.info(pid) else { return };
+        let Some((reader, gone)) = self.info_or_exited(pid) else { return };
         if !self.judged_memory.insert(reader.id.clone()) {
             return;
         }
@@ -792,7 +847,7 @@ impl Watch<'_, '_> {
         }
         let trust = self.trust(&reader.image);
         let Some((level, reason)) = judge_memory(&reader.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref()) else { return };
-        if level == Level::Review && self.reviewed_lately(&reader.image, "memory") {
+        if level == Level::Review && reviewed_lately(&reader.image, "memory") {
             return;
         }
         let browser = self.info(target).map_or("a browser", |b| browser_name(&b.name));
@@ -815,7 +870,8 @@ impl Watch<'_, '_> {
             switches: Vec::new(),
             reason,
             connections,
-            stopped: stop.then(|| process::terminate(&reader.id)),
+            stopped: (stop && !gone).then(|| process::terminate(&reader.id)),
+            exited: gone,
             controller: None,
         };
         self.report(hit);
@@ -866,6 +922,7 @@ impl Watch<'_, '_> {
             reason,
             connections: Vec::new(),
             stopped: stop.then(|| process::terminate(&info.id)),
+            exited: false,
             controller,
         };
         self.report(hit);
@@ -1099,12 +1156,20 @@ mod tests {
             reason: String::new(),
             connections: Vec::new(),
             stopped: Some(Ok(())),
+            exited: false,
             controller: None,
         };
         assert_eq!(hit.headline(), "update.exe opened Chrome's saved passwords, sign-in cookies and key that unlocks saved passwords and cookies");
         assert_eq!(hit.action(), "program stopped");
         hit.stopped = None;
         assert_eq!(hit.action(), "reported (automatic stopping is off)");
+        // Gone before it was caught, named or not: there was nothing to stop.
+        hit.exited = true;
+        assert_eq!(hit.action(), "reported (it had already exited)");
+        hit.exited = false;
+        hit.created = 0;
+        assert_eq!(hit.action(), "reported (it had already exited)");
+        hit.created = 1;
         hit.kind = GuardKind::RemoteControl;
         hit.switches = vec!["--remote-debugging-port".into()];
         hit.controller = Some(Controller { pid: 8, program: "loader.exe".into(), image: PathBuf::new(), stopped: Some(Ok(())) });
@@ -1117,5 +1182,31 @@ mod tests {
         assert_eq!(hit.headline(), "An unsigned hook.dll was loaded into Chrome");
         hit.kind = GuardKind::MemoryRead;
         assert_eq!(hit.headline(), "update.exe opened Chrome to read its memory, where signed-in sessions are kept");
+    }
+
+    #[test]
+    fn exited_programs_are_still_named_for_a_while() {
+        let info = |pid: u32, name: &str| ProcessInfo {
+            id: ProcessId { pid, created: 5 },
+            name: name.into(),
+            image: PathBuf::from(format!(r"C:\Program Files\Microsoft\Edge\Application\{name}")),
+            parent: 0,
+        };
+        let mut exited = Exited::default();
+        exited.remember(info(3172, "identity_helper.exe"));
+        assert_eq!(exited.get(3172).map(|i| i.name.as_str()), Some("identity_helper.exe"));
+        assert!(exited.get(3173).is_none());
+        // The id went to a new process: the old one is not it.
+        exited.forget(3172);
+        assert!(exited.get(3172).is_none());
+    }
+
+    #[test]
+    fn a_signed_program_is_reviewed_once_an_hour_across_restarts() {
+        // Shared by every watch; a path no other test uses.
+        let image = Path::new(r"C:\Program Files\Review Testgent.exe");
+        assert!(!reviewed_lately(image, "memory"));
+        assert!(reviewed_lately(image, "memory"), "within the hour");
+        assert!(!reviewed_lately(image, "Chrome"), "another browser or kind of read");
     }
 }
