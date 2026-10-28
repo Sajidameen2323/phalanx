@@ -842,6 +842,7 @@ impl App {
                 (HistoryFilter::Watch, "Real-time protection"),
                 (HistoryFilter::Commands, "Suspicious commands"),
                 (HistoryFilter::SideLoading, "DLL side-loading"),
+                (HistoryFilter::BrowserData, "Browser data"),
             ] {
                 if chip(ui, label, self.history.filter == filter) && self.history.filter != filter {
                     self.history.filter = filter;

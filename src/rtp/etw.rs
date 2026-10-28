@@ -1,5 +1,7 @@
 //! Process and image-load events from ETW, Windows' event tracing: a
-//! real-time session on the Microsoft-Windows-Kernel-Process provider.
+//! real-time session on the Microsoft-Windows-Kernel-Process provider. A
+//! second kind of session ([`start_file_opens`]) adds file opens from
+//! Microsoft-Windows-Kernel-File, for the browser data watch.
 //!
 //! Events arrive within about 100 ms of a process starting (the session's
 //! flush timer), so programs that run only briefly are still seen, with their
@@ -22,6 +24,8 @@ pub enum Event {
     Stopped { pid: u32 },
     /// A process loaded an image: a DLL, or its own program file.
     ImageLoaded { pid: u32, image: PathBuf },
+    /// A process opened a file that the session's filter picked.
+    FileOpened { pid: u32, path: PathBuf },
 }
 
 /// A running session. Dropping it stops the session; the sender passed to
@@ -33,7 +37,15 @@ pub struct Session(#[allow(dead_code)] imp::Session);
 /// a crash, say). Image loads are reported only when `images` is set: they
 /// are by far the most frequent event.
 pub fn start(name: &str, images: bool, tx: Sender<Event>) -> std::io::Result<Session> {
-    imp::Session::start(name, images, tx).map(Session)
+    imp::Session::start(name, imp::Spec { images, files: None }, tx).map(Session)
+}
+
+/// Starts a session named `name` reporting process starts and exits, and
+/// every file opened whose NT path (`\Device\HarddiskVolume3\…`) `wanted`
+/// accepts. Every file open on the PC passes through `wanted`, on the
+/// session's thread: it must be cheap.
+pub fn start_file_opens(name: &str, wanted: fn(&str) -> bool, tx: Sender<Event>) -> std::io::Result<Session> {
+    imp::Session::start(name, imp::Spec { images: false, files: Some(wanted) }, tx).map(Session)
 }
 
 /// The session name for this program: one per program file, so the service
@@ -68,6 +80,15 @@ fn dos_path(nt: &str, devices: &[(String, String)]) -> Option<PathBuf> {
     devices.iter().find_map(|(device, target)| after(device).map(|rest| PathBuf::from(format!("{target}{rest}"))))
 }
 
+/// The NUL-terminated UTF-16 string that ends `data` (an event's last
+/// field), read back to the NUL before it. `None` if there is none.
+fn last_string(data: &[u8]) -> Option<String> {
+    let units: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let end = units.iter().rposition(|&c| c != 0)? + 1;
+    let start = units[..end].iter().rposition(|&c| c == 0).map_or(0, |i| i + 1);
+    Some(String::from_utf16_lossy(&units[start..end]))
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{dos_path, process, Event, ProcessId, ProcessInfo};
@@ -94,6 +115,12 @@ mod imp {
     const PROCESS_START: u16 = 1;
     const PROCESS_STOP: u16 = 2;
     const IMAGE_LOAD: u16 = 5;
+    /// Microsoft-Windows-Kernel-File.
+    const FILE_PROVIDER: GUID = GUID::from_u128(0xedd08927_9cc4_4e65_b970_c2560fb5c289);
+    /// KERNEL_FILE_KEYWORD_CREATE: files opened (created or not).
+    const KEYWORD_FILE_CREATE: u64 = 0x80;
+    /// The Create event; its last field is `FileName`.
+    const FILE_CREATE: u16 = 12;
     /// `FlushTimer` is in milliseconds (Windows 8 and later).
     const EVENT_TRACE_USE_MS_FLUSH_TIMER: u32 = 0x10;
     const FLUSH_MS: u32 = 100;
@@ -142,12 +169,22 @@ mod imp {
         unsafe { ControlTraceW(CONTROLTRACE_HANDLE { Value: 0 }, name.as_ptr(), &mut p.props, EVENT_TRACE_CONTROL_STOP) };
     }
 
+    /// What a session reports: process starts and exits always, image loads
+    /// when `images`, and the file opens `files` accepts.
+    pub struct Spec {
+        pub images: bool,
+        pub files: Option<fn(&str) -> bool>,
+    }
+
     /// What the event callback works with; owned by the consumer thread.
     struct Context {
         tx: Sender<Event>,
         devices: Vec<(String, String)>,
         refreshed: Instant,
         names: Names,
+        files: Option<fn(&str) -> bool>,
+        /// This process: its own file opens are never reported.
+        own_pid: u32,
     }
 
     /// Event field names, as TDH wants them.
@@ -156,6 +193,7 @@ mod imp {
         parent_id: Vec<u16>,
         create_time: Vec<u16>,
         image_name: Vec<u16>,
+        file_name: Vec<u16>,
     }
 
     pub struct Session {
@@ -171,7 +209,7 @@ mod imp {
     unsafe impl Send for ContextPtr {}
 
     impl Session {
-        pub fn start(name: &str, images: bool, tx: Sender<Event>) -> io::Result<Self> {
+        pub fn start(name: &str, spec: Spec, tx: Sender<Event>) -> io::Result<Self> {
             let name = wide(name);
             stop_named(&name);
             let mut p = Properties::new(&name);
@@ -181,23 +219,29 @@ mod imp {
             if status != ERROR_SUCCESS {
                 return Err(os_error(status));
             }
-            let keywords = KEYWORD_PROCESS | if images { KEYWORD_IMAGE } else { 0 };
-            // SAFETY: `control` is the session just started.
-            let status = unsafe {
-                EnableTraceEx2(
-                    control,
-                    &PROVIDER,
-                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                    TRACE_LEVEL_INFORMATION as u8,
-                    keywords,
-                    0,
-                    0,
-                    ptr::null(),
-                )
-            };
-            if status != ERROR_SUCCESS {
-                stop_named(&name);
-                return Err(os_error(status));
+            let keywords = KEYWORD_PROCESS | if spec.images { KEYWORD_IMAGE } else { 0 };
+            let mut providers = vec![(PROVIDER, keywords)];
+            if spec.files.is_some() {
+                providers.push((FILE_PROVIDER, KEYWORD_FILE_CREATE));
+            }
+            for (provider, keywords) in providers {
+                // SAFETY: `control` is the session just started.
+                let status = unsafe {
+                    EnableTraceEx2(
+                        control,
+                        &provider,
+                        EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                        TRACE_LEVEL_INFORMATION as u8,
+                        keywords,
+                        0,
+                        0,
+                        ptr::null(),
+                    )
+                };
+                if status != ERROR_SUCCESS {
+                    stop_named(&name);
+                    return Err(os_error(status));
+                }
             }
             let context = Box::into_raw(Box::new(Context {
                 tx,
@@ -208,7 +252,10 @@ mod imp {
                     parent_id: wide("ParentProcessID"),
                     create_time: wide("CreateTime"),
                     image_name: wide("ImageName"),
+                    file_name: wide("FileName"),
                 },
+                files: spec.files,
+                own_pid: std::process::id(),
             }));
             let mut logfile = EVENT_TRACE_LOGFILEW { LoggerName: name.as_ptr() as *mut u16, Context: context.cast(), ..Default::default() };
             logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
@@ -294,12 +341,15 @@ mod imp {
         }));
     }
 
-    fn is_provider(id: &GUID) -> bool {
-        (id.data1, id.data2, id.data3, id.data4) == (PROVIDER.data1, PROVIDER.data2, PROVIDER.data3, PROVIDER.data4)
+    fn is_provider(id: &GUID, provider: &GUID) -> bool {
+        (id.data1, id.data2, id.data3, id.data4) == (provider.data1, provider.data2, provider.data3, provider.data4)
     }
 
     fn parse(ctx: &mut Context, record: &EVENT_RECORD) -> Option<Event> {
-        if !is_provider(&record.EventHeader.ProviderId) {
+        if is_provider(&record.EventHeader.ProviderId, &FILE_PROVIDER) {
+            return file_opened(ctx, record);
+        }
+        if !is_provider(&record.EventHeader.ProviderId, &PROVIDER) {
             return None;
         }
         let names = &ctx.names;
@@ -328,6 +378,27 @@ mod imp {
             }
             _ => None,
         }
+    }
+
+    /// A file open the filter wants. Every file open on the PC comes here,
+    /// so the name is first read straight from the end of the event (where
+    /// `FileName` is), without TDH; only a wanted name is read properly.
+    fn file_opened(ctx: &mut Context, record: &EVENT_RECORD) -> Option<Event> {
+        let wanted = ctx.files?;
+        let pid = record.EventHeader.ProcessId;
+        if record.EventHeader.EventDescriptor.Id != FILE_CREATE || pid <= 4 || pid == ctx.own_pid || record.UserData.is_null() {
+            return None;
+        }
+        // SAFETY: Windows passes `UserDataLength` bytes at `UserData`.
+        let data = unsafe { std::slice::from_raw_parts(record.UserData as *const u8, record.UserDataLength as usize) };
+        if !wanted(&super::last_string(data)?) {
+            return None;
+        }
+        let nt = string_field(record, &ctx.names.file_name)?;
+        if !wanted(&nt) {
+            return None;
+        }
+        Some(Event::FileOpened { pid, path: path(ctx, &nt)? })
     }
 
     fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
@@ -383,8 +454,13 @@ mod imp {
 
     pub struct Session;
 
+    pub struct Spec {
+        pub images: bool,
+        pub files: Option<fn(&str) -> bool>,
+    }
+
     impl Session {
-        pub fn start(_name: &str, _images: bool, _tx: Sender<Event>) -> std::io::Result<Self> {
+        pub fn start(_name: &str, _spec: Spec, _tx: Sender<Event>) -> std::io::Result<Self> {
             Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "ETW is only available on Windows"))
         }
     }
@@ -422,6 +498,15 @@ mod tests {
         for (nt, want) in cases {
             assert_eq!(dos_path(nt, &d).as_deref(), want.map(Path::new), "{nt}");
         }
+    }
+
+    #[test]
+    fn the_last_string_of_an_event_is_read_back_to_its_nul() {
+        let mut data = vec![0x11, 0x22, 0, 0, 7, 0, 0, 0];
+        data.extend(r"\Device\X\Login Data".encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes));
+        assert_eq!(last_string(&data).as_deref(), Some(r"\Device\X\Login Data"));
+        assert_eq!(last_string(&[0, 0, 0, 0]), None);
+        assert_eq!(last_string(&[b'a', 0]).as_deref(), Some("a"));
     }
 
     #[test]

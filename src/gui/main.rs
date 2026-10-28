@@ -31,7 +31,8 @@ use threat_scanner::system::{self, Performance};
 use threat_scanner::update::{self, Manifest};
 use threat_scanner::risk::{DownloadOrigin, RiskyFile};
 use threat_scanner::cmdline::Confidence;
-use threat_scanner::rtp::{CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome, SideLoadHit};
+use threat_scanner::rtp::{BrowserHit, CommandHit, CommandSource, Origin, ProcessHit, RiskyOutcome, SideLoadHit};
+use threat_scanner::rtp::browser::{GuardKind as BrowserGuardKind, Level as BrowserLevel};
 use threat_scanner::Category;
 use widgets::APP_TITLE;
 
@@ -161,6 +162,12 @@ struct Settings {
     scan_new_drives: bool,
     /// Hold back non-urgent protection scans during full-screen games.
     defer_when_fullscreen: bool,
+    /// Watch for programs reading browsers' passwords and cookies.
+    browser_guard: bool,
+    /// Stop what the browser data watch catches at high confidence.
+    browser_guard_stop: bool,
+    /// Programs allowed to read browser data.
+    browser_guard_allowed: Vec<PathBuf>,
     close_to_tray: bool,
     /// Unix time the watcher was last known to be running; on start it
     /// catches up on files changed since then.
@@ -206,6 +213,9 @@ impl Default for Settings {
             scan_archives: true,
             scan_new_drives: true,
             defer_when_fullscreen: true,
+            browser_guard: false,
+            browser_guard_stop: true,
+            browser_guard_allowed: Vec::new(),
             close_to_tray: true,
             watch_checkpoint: None,
             ai_enabled: false,
@@ -354,6 +364,8 @@ enum WatchMsg {
     ProgramWatch { events: bool, reason: Option<String> },
     SideLoad(SideLoadHit),
     Command(CommandHit),
+    BrowserGuard { active: bool, reason: Option<String> },
+    BrowserData(BrowserHit),
     DriveAdded { root: PathBuf, files: usize },
     Error(String),
 }
@@ -400,6 +412,8 @@ struct WatchState {
     /// Programs are seen through Windows' process events, not by reading
     /// the process list twice a second.
     program_events: bool,
+    /// The browser data watch: running, or why not (`None`: not heard yet).
+    browser_guard: Option<Result<(), String>>,
     files_checked: i64,
     programs_checked: i64,
     /// Times protection recovered from a failure this session.
@@ -454,12 +468,13 @@ enum HistoryFilter {
     Threats,
     Commands,
     SideLoading,
+    BrowserData,
 }
 
 /// Scan kinds started by someone, rather than by real-time protection.
 const MANUAL_KINDS: [&str; 4] = ["quick", "full", "custom", "manual"];
 /// Scan kinds real-time protection records.
-const PROTECTION_KINDS: [&str; 4] = ["watch", "process", "command", "sideload"];
+const PROTECTION_KINDS: [&str; 5] = ["watch", "process", "command", "sideload", "browser"];
 
 impl HistoryFilter {
     /// The kinds it shows (empty for all) and whether only threats.
@@ -472,6 +487,7 @@ impl HistoryFilter {
             HistoryFilter::Threats => (Vec::new(), true),
             HistoryFilter::Commands => (kinds(&["command"]), false),
             HistoryFilter::SideLoading => (kinds(&["sideload"]), false),
+            HistoryFilter::BrowserData => (kinds(&["browser"]), false),
         }
     }
 }
@@ -1667,6 +1683,7 @@ impl App {
                         app.watch.watching = protection.folders;
                         app.watch.programs = protection.programs;
                         app.watch.program_events = protection.program_events;
+                        app.watch.browser_guard = protection.browser_guard;
                     }
                     app.manifest = update::load_manifest(&update::signature_dir(app.signatures_home()));
                     if moved || app.engine.is_none() {
@@ -1933,6 +1950,29 @@ impl App {
                     self.log_activity(kind, text, detail.join(" · "));
                     changed_history |= hit.in_history();
                 }
+                WatchMsg::BrowserGuard { active, reason } => {
+                    let state = if active { Ok(()) } else { Err(reason.unwrap_or_default()) };
+                    if let Err(reason) = &state
+                        && self.watch.browser_guard.as_ref() != Some(&state)
+                    {
+                        self.log_activity(ActivityKind::Problem, "The browser data watch is not running", reason.clone());
+                    }
+                    self.watch.browser_guard = Some(state);
+                }
+                WatchMsg::BrowserData(hit) => {
+                    let kind = if hit.level == BrowserLevel::High { ActivityKind::Threat } else { ActivityKind::Risky };
+                    let mut detail = vec![format!("why: {}", hit.reason)];
+                    if !hit.image.as_os_str().is_empty() {
+                        detail.push(format!("program: {} (pid {})", hit.image.display(), hit.pid));
+                    }
+                    if !hit.connections.is_empty() {
+                        detail.push(format!("connected to {}", hit.connections.join(", ")));
+                    }
+                    detail.push(capitalize_first(&hit.action()));
+                    self.log_activity(kind, capitalize_first(&hit.headline()), detail.join(" · "));
+                    self.audit.add_browser_hit(hit);
+                    changed_history = true;
+                }
                 WatchMsg::DriveAdded { root, files } => self.log_activity(
                     ActivityKind::Info,
                     format!("New drive {}", root.display()),
@@ -1991,6 +2031,9 @@ fn copy_protection(s: &mut Settings, p: &ProtectionSettings) {
     s.side_loading = p.side_loading;
     s.scan_new_drives = p.scan_new_drives;
     s.defer_when_fullscreen = p.defer_when_fullscreen;
+    s.browser_guard = p.browser_guard;
+    s.browser_guard_stop = p.browser_guard_stop;
+    s.browser_guard_allowed = p.browser_guard_allowed.clone();
     s.heuristics = p.heuristics;
     s.trust_signed = p.trust_signed;
     s.scan_archives = p.scan_archives;
@@ -2016,6 +2059,9 @@ fn protection_from(s: &Settings, service: &ProtectionSettings) -> ProtectionSett
         side_loading: s.side_loading,
         scan_new_drives: s.scan_new_drives,
         defer_when_fullscreen: s.defer_when_fullscreen,
+        browser_guard: s.browser_guard,
+        browser_guard_stop: s.browser_guard_stop,
+        browser_guard_allowed: s.browser_guard_allowed.clone(),
         heuristics: s.heuristics,
         trust_signed: s.trust_signed,
         scan_archives: s.scan_archives,
@@ -2046,6 +2092,8 @@ fn watch_msg(event: Event) -> Option<WatchMsg> {
         Event::ProgramWatch { events, reason } => WatchMsg::ProgramWatch { events, reason },
         Event::SideLoad { hit } => WatchMsg::SideLoad(hit),
         Event::Command { hit } => WatchMsg::Command(hit),
+        Event::BrowserGuard { active, reason } => WatchMsg::BrowserGuard { active, reason },
+        Event::BrowserData { hit } => WatchMsg::BrowserData(hit),
         Event::DriveAdded { root, files } => WatchMsg::DriveAdded { root, files },
         Event::Restarting { error, retry_in_secs } => WatchMsg::Restarting { error, retry_in: Duration::from_secs(retry_in_secs) },
         Event::ProtectionError { message } => WatchMsg::Error(message),
@@ -2089,6 +2137,10 @@ fn notify_event(event: &Event, prefs: &link::NotifyPrefs) {
         }
         Event::Command { hit } if prefs.threats() && hit.confidence() == Confidence::High => {
             let (title, body) = command_notification(hit);
+            system::notify(&title, &body);
+        }
+        Event::BrowserData { hit } if prefs.threats() => {
+            let (title, body) = browser_notification(hit);
             system::notify(&title, &body);
         }
         _ => {}
@@ -2150,6 +2202,23 @@ fn command_notification(hit: &CommandHit) -> (String, String) {
     let mut body = format!("{}.", capitalize_first(hit.headline()));
     body.push_str(" Phalanx only reported it. If a web page told you to run this, close it and do not run it again.");
     (title, body)
+}
+
+/// Title and body of the browser data notification.
+fn browser_notification(hit: &BrowserHit) -> (String, String) {
+    let stopped = matches!(hit.stopped, Some(Ok(())));
+    let title = match (hit.kind, stopped) {
+        (BrowserGuardKind::DataRead, true) => format!("Stopped {} reading your browser data", hit.program),
+        (BrowserGuardKind::DataRead, false) => format!("{} opened your browser data", hit.program),
+        (BrowserGuardKind::RemoteControl, true) => format!("Stopped a hidden {} under remote control", hit.browser),
+        (BrowserGuardKind::RemoteControl, false) => format!("{} started for remote control", hit.browser),
+    };
+    let advice = match (hit.level, stopped) {
+        (BrowserLevel::High, true) => "It may already have copied it: sign out of other sessions and change your email password from a device you trust.",
+        (BrowserLevel::High, false) => "Open Phalanx's Stealer check to stop it, then sign out of other sessions and change passwords.",
+        (BrowserLevel::Review, _) => "If you did not start this, open Phalanx's Stealer check to stop it.",
+    };
+    (title, format!("{}. {advice}", capitalize_first(&hit.headline())))
 }
 
 fn capitalize_first(text: &str) -> String {

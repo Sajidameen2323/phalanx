@@ -1,11 +1,16 @@
-//! The stealer check page: runs the persistence audit and lists what it
-//! found, worst first, with ways to look closer (open the folder, scan the
-//! file, ask the AI). Nothing is removed from here.
+//! The stealer check page: the browser data watch (a switch, and what it
+//! caught, with a way to stop or allow each), then the persistence audit,
+//! listing what it found, worst first, with ways to look closer (open the
+//! folder, scan the file, ask the AI). Nothing is removed from here.
 
 use super::*;
 use eframe::egui::{Align, Color32, Layout, RichText, Ui};
 use threat_scanner::audit::{self, AuditItem, AuditReport, DefenderExclusions, Severity, Signature};
+use threat_scanner::rtp::process;
 use widgets::*;
+
+/// Browser data alerts kept on the page, newest first.
+const MAX_BROWSER_HITS: usize = 20;
 
 #[derive(Default)]
 pub(super) struct AuditState {
@@ -14,6 +19,24 @@ pub(super) struct AuditState {
     exclusions_rx: Option<Receiver<Result<Option<DefenderExclusions>, String>>>,
     exclusions: Option<DefenderExclusions>,
     show_fine: bool,
+    /// What the browser data watch caught since the app started.
+    browser_hits: Vec<BrowserHit>,
+}
+
+impl AuditState {
+    pub(super) fn add_browser_hit(&mut self, hit: BrowserHit) {
+        self.browser_hits.insert(0, hit);
+        self.browser_hits.truncate(MAX_BROWSER_HITS);
+    }
+}
+
+enum WatchAction {
+    Stop(usize),
+    Allow(PathBuf),
+    Disallow(usize),
+    OpenFolder(PathBuf),
+    Scan(PathBuf),
+    History,
 }
 
 fn severity_color(s: Severity) -> Color32 {
@@ -95,8 +118,103 @@ impl App {
         self.audit.running.is_some() || self.audit.exclusions_rx.is_some()
     }
 
+    /// The browser data watch: its switches, whether it runs, and what it
+    /// caught.
+    fn browser_watch(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let mut action = None;
+        card(ui, |ui| {
+            group_title(ui, "Browser data watch", "");
+            setting_toggle(
+                ui,
+                &mut self.settings.browser_guard,
+                "Watch who opens browser passwords and cookies",
+                "Catches programs other than your browser opening its saved passwords, sign-in cookies or the key that unlocks them, and browsers started in secret for remote control. Stolen sign-in cookies let a thief read your email, password-reset codes included, without your password or second factor. It watches every file opened on the PC, so it uses some processor time and a few MB of memory.",
+            );
+            row_divider(ui);
+            ui.add_enabled_ui(self.settings.browser_guard, |ui| {
+                setting_toggle(
+                    ui,
+                    &mut self.settings.browser_guard_stop,
+                    "Stop what it catches",
+                    "End a script host, Windows tool or unsigned program the moment it opens browser data, and a hidden browser under remote control. Signed programs, such as backup tools and password managers, are only reported.",
+                );
+            });
+            ui.add_space(6.0);
+            let (color, status) = if !self.settings.browser_guard {
+                (theme().muted, "Off".to_string())
+            } else if !self.settings.watch_enabled {
+                (theme().amber, "Not running: turn on real-time protection on the Protection page".to_string())
+            } else {
+                match &self.watch.browser_guard {
+                    Some(Ok(())) => (theme().green, "Watching browser data".to_string()),
+                    Some(Err(why)) => (theme().amber, format!("Not running: {why}")),
+                    None => (theme().muted, "Starting…".to_string()),
+                }
+            };
+            ui.horizontal_wrapped(|ui| {
+                status_dot(ui, color, 4.0);
+                ui.label(RichText::new(status).color(theme().text));
+            });
+            if !self.settings.browser_guard_allowed.is_empty() {
+                ui.add_space(6.0);
+                small(ui, "Allowed to read browser data:");
+                for (i, program) in self.settings.browser_guard_allowed.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        truncated(ui, program.display().to_string(), theme().text, 12.5);
+                        if small_button(ui, "Remove").clicked() {
+                            action = Some(WatchAction::Disallow(i));
+                        }
+                    });
+                }
+            }
+        });
+
+        for (i, hit) in self.audit.browser_hits.iter().enumerate() {
+            ui.add_space(8.0);
+            let allowed = self.settings.browser_guard_allowed.iter().any(|a| a.as_os_str().eq_ignore_ascii_case(hit.image.as_os_str()));
+            browser_hit_card(ui, i, hit, allowed, &mut action);
+        }
+        if !self.audit.browser_hits.is_empty() {
+            ui.add_space(6.0);
+            if small_button(ui, "All browser data alerts in History").clicked() {
+                action = Some(WatchAction::History);
+            }
+        }
+
+        match action {
+            Some(WatchAction::Stop(i)) => {
+                let Some(hit) = self.audit.browser_hits.get_mut(i) else { return };
+                let Some(id) = hit.process() else { return };
+                let result = process::terminate(&id);
+                hit.stopped = Some(result.clone());
+                let program = hit.program.clone();
+                match result {
+                    Ok(()) => self.notify(format!("Stopped {program}"), true),
+                    Err(e) => self.notify(format!("Could not stop {program}: {e}"), false),
+                }
+            }
+            Some(WatchAction::Allow(program)) => self.settings.browser_guard_allowed.push(program),
+            Some(WatchAction::Disallow(i)) => {
+                self.settings.browser_guard_allowed.remove(i);
+            }
+            Some(WatchAction::OpenFolder(path)) => {
+                let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+            }
+            Some(WatchAction::Scan(path)) => self.start_scan(ctx, vec![path], "custom"),
+            Some(WatchAction::History) => {
+                self.history.filter = HistoryFilter::BrowserData;
+                self.page = Page::History;
+                self.load_history(Load::New);
+            }
+            None => {}
+        }
+    }
+
     pub(super) fn audit_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         page_header(ui, "Stealer check");
+
+        self.browser_watch(ui, ctx);
+        ui.add_space(14.0);
 
         let (mut run, mut exclusions) = (false, false);
         card(ui, |ui| {
@@ -190,6 +308,69 @@ impl App {
             None => {}
         }
     }
+}
+
+fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, allowed: bool, action: &mut Option<WatchAction>) {
+    let (label, color) = match hit.level {
+        BrowserLevel::High => ("HIGH", theme().red),
+        BrowserLevel::Review => ("REVIEW", theme().amber),
+    };
+    let stopped = matches!(hit.stopped, Some(Ok(())));
+    card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            badge(ui, label, color);
+            if stopped {
+                badge(ui, "STOPPED", theme().green);
+            }
+            ui.add(egui::Label::new(RichText::new(capitalize_first(&hit.headline())).strong().color(theme().text)).wrap());
+        });
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            ui.add(egui::Label::new(RichText::new(format!("• Why: {}", hit.reason)).size(13.0).color(color.lerp_to_gamma(theme().text, 0.35))).wrap());
+            if !hit.image.as_os_str().is_empty() {
+                truncated(ui, format!("Program: {} (pid {})", hit.image.display(), hit.pid), theme().muted, 12.0);
+            }
+            if let Some(signer) = &hit.signer {
+                small(ui, format!("Signed by {signer}"));
+            }
+            if let Some(c) = &hit.controller {
+                truncated(ui, format!("Started by: {} (pid {})", c.image.display(), c.pid), theme().muted, 12.0);
+            }
+            for file in hit.files.iter().take(4) {
+                truncated(ui, format!("Opened: {}", file.display()), theme().muted, 12.0);
+            }
+            if hit.files.len() > 4 {
+                small(ui, format!("and {} more file(s)", hit.files.len() - 4));
+            }
+            if !hit.switches.is_empty() {
+                truncated(ui, format!("Started with: {}", hit.switches.join(" ")), theme().muted, 12.0);
+            }
+            if !hit.connections.is_empty() {
+                truncated(ui, format!("Connected to: {}", hit.connections.join(", ")), theme().muted, 12.0);
+            }
+            small(ui, capitalize_first(&hit.action()));
+            if hit.level == BrowserLevel::High {
+                small(ui, "It may have copied the data before it was caught. From a device you trust, sign out of other sessions (Google, Microsoft and your email all offer this) and change those passwords.");
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if !stopped && hit.process().is_some() && small_button(ui, "Stop it").clicked() {
+                *action = Some(WatchAction::Stop(index));
+            }
+            let file = hit.image.is_file().then(|| hit.image.clone());
+            if let Some(path) = &file {
+                if hit.kind == BrowserGuardKind::DataRead && !allowed && small_button(ui, "Allow this program").clicked() {
+                    *action = Some(WatchAction::Allow(path.clone()));
+                }
+                if small_button(ui, "Open folder").clicked() {
+                    *action = Some(WatchAction::OpenFolder(path.clone()));
+                }
+                if small_button(ui, "Scan file").clicked() {
+                    *action = Some(WatchAction::Scan(path.clone()));
+                }
+            }
+        });
+    });
 }
 
 enum ItemAction {
