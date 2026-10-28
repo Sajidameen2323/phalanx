@@ -192,4 +192,45 @@ round-trip test.
     the formula guard, quoting, JSON back as sent). Tried through a console
     service: 20 threat rows to CSV with a mark and its reviewer, 38
     side-loading rows to JSON.
-- **Next:** milestone 6, integrity.
+- **Milestone 6: done (2026-10-28).**
+  - Schema version in `PRAGMA user_version` (`store::SCHEMA_VERSION`, 2:
+    0 the first release, 1 Scans' later columns, 2 `Reviews` and
+    `PrunedTotals`). Opening any older database brings it up to date and
+    sets the number; a database a newer Phalanx wrote keeps its number.
+  - `Store::check_file`: SQLite's full `integrity_check` of a file opened
+    read-only. `service::history::check_at_start` runs it in
+    `service::start` before anything opens the database; a damaged one is
+    renamed `history.damaged-<time>.sqlite` (with its `-wal` and `-shm`),
+    never deleted, and `history.backup.sqlite` takes its place if it passes
+    the same check; otherwise history starts empty. What happened is kept in
+    `history-upkeep.json` and reported in `HistoryInfo::recovered`.
+  - Daily backup with the prune: `quick_check` first (a damaged database
+    never replaces a good backup), then `VACUUM INTO` a `.part` file renamed
+    over the backup, so an interrupted backup never replaces a good one.
+  - App: Settings' History card adds "checked … · backed up …" and, after a
+    recovery, an amber note saying what happened and where the damaged file
+    is; a recovery in the last week is also put in the activity log once.
+  - Limit: a restored backup is up to a day old, so quarantine records from
+    that day are missing (the files stay in the quarantine folder).
+  - Tests: `a_damaged_database_is_replaced_by_the_last_backup` (the scan
+    after the backup is gone, the rest is there, the damaged file is kept),
+    `a_damaged_database_without_a_backup_starts_history_empty`,
+    `a_newer_database_keeps_its_schema_version`,
+    `the_file_check_finds_a_damaged_page` (the header intact, a data page
+    overwritten; an early page can be an empty table's root with nothing to
+    find, so the test damages the last page), and the upgrade test checks
+    the version.
+  - Tried with a console service: the first upkeep made the backup; with
+    the live database's first 100 bytes overwritten and the service started
+    again, it reported "file is not a database", kept the damaged file,
+    restored the backup, and history answered with all its entries.
+
+## Step 7 is done
+
+All six milestones are built and tested; the plan's "done when" holds:
+100,000 entries page and search in under 60 ms (200 ms allowed), a year
+of heavy use takes about 1 MB after retention (50 MB allowed), and every
+ipc reply (31 requests) has a round-trip contract test. Seen in the app:
+paging, filters, details, deleting an entry. Not yet seen by hand: the
+Settings History card, marking findings, Export…, and the daily upkeep in
+an installed service.

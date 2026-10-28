@@ -575,6 +575,8 @@ struct App {
     last_manual: Option<ScanRow>,
     /// The history database's size and upkeep, for Settings.
     history_info: Option<replies::HistoryInfo>,
+    /// A history recovery already put in the activity log (its time).
+    recovery_logged: Option<u64>,
     months: Vec<MonthRow>,
     pending_delete: Option<String>,
     toast: Option<Toast>,
@@ -764,6 +766,7 @@ impl App {
             recent_threats: Vec::new(),
             last_manual: None,
             history_info: None,
+            recovery_logged: None,
             months: Vec::new(),
             pending_delete: None,
             toast: None,
@@ -865,6 +868,15 @@ impl App {
             },
             |app, loaded| match loaded {
                 Ok((q, threats, manual, m, info)) => {
+                    // A recovery in the last week goes to the activity log,
+                    // once, so it is seen without opening Settings.
+                    if let Some(recovered) = &info.recovered {
+                        let recent = chrono::Utc::now().timestamp() - (recovered.at as i64) < 7 * 24 * 3600;
+                        if recent && app.recovery_logged != Some(recovered.at) {
+                            app.recovery_logged = Some(recovered.at);
+                            app.log_activity(ActivityKind::Problem, "History was damaged and restored", pages::recovery_text(recovered));
+                        }
+                    }
                     app.history_info = Some(info);
                     app.quarantine = q;
                     app.recent_threats = threats.scans;

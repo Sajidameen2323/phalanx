@@ -120,7 +120,7 @@ Driven by the detection report from step 0:
 
 ## Step 7: History people can manage (about 1 week)
 
-*In progress:* see [history.md](history.md) for the milestones and progress.
+*Done:* see [history.md](history.md): paging and search, retention, review marks and delete, export, integrity checks with daily backups, and contract tests for every service reply.
 
 History is the record of what Phalanx saw and did. Today the app loads the latest
 300 entries, nothing can be found, removed or exported, and every real-time batch
@@ -222,7 +222,7 @@ file shows its saved verdict without a new call.
 | 4 | Browser Guard in the stores, force-installed | days, plus review | developer accounts |
 | 5 | Command-line blocking | ~3 days | step 0 data |
 | 6 | Detection content | ongoing | step 0 reports |
-| 7 | History: paging, search, retention, review, export, contract tests | ~1 wk | |
+| 7 | History: paging, search, retention, review, export, contract tests | done | |
 | 8 | Notifications: click-through, grouping, preferences, a lasting activity log | ~1 wk | |
 | 9 | AI Inspect: retries, saved results, more sources and providers, accuracy | 1–2 wk | step 0's lab, for the accuracy check |
 

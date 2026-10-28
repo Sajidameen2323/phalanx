@@ -1226,6 +1226,19 @@ impl App {
                     lines.push(format!("last tidied {} ({} removed)", short_time(pruned), info.pruned));
                 }
                 small(ui, lines.join(" · "));
+                let mut health = Vec::new();
+                if let Some(checked) = &info.checked_at {
+                    health.push(format!("checked {}", short_time(checked)));
+                }
+                health.push(match &info.backed_up_at {
+                    Some(at) => format!("backed up {}", short_time(at)),
+                    None => "not backed up yet (daily)".to_string(),
+                });
+                small(ui, health.join(" · "));
+                if let Some(recovered) = &info.recovered {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(recovery_text(recovered)).color(theme().amber)).wrap());
+                }
             }
         });
         ui.add_space(14.0);
@@ -2175,6 +2188,22 @@ fn detection_card(ui: &mut Ui, row: &mut ResultRow, ai_enabled: bool) -> bool {
 }
 
 /// Scans recorded by real-time protection rather than started by the user.
+/// What happened when the service found the history database damaged.
+pub(super) fn recovery_text(recovered: &threat_scanner::service::history::Recovered) -> String {
+    let when = chrono::DateTime::from_timestamp(recovered.at as i64, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    let what = if recovered.from_backup {
+        "the last daily backup took its place, so history from after that backup is missing"
+    } else {
+        "there was no good backup, so history started again empty"
+    };
+    format!(
+        "On {when} the history database was found damaged ({}): {what}. The damaged file was kept as {} in the protection data folder. Quarantined files are not affected.",
+        recovered.problem, recovered.kept_as
+    )
+}
+
 fn is_protection_kind(kind: &str) -> bool {
     kind == "watch" || kind == "process" || kind == "command" || kind == "sideload"
 }

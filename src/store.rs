@@ -64,6 +64,15 @@ CREATE TABLE IF NOT EXISTS PrunedTotals (
 );
 ";
 
+/// The database's layout, kept in `PRAGMA user_version`:
+/// 0. the first release (no number),
+/// 1. Scans' later columns ([`SCAN_COLUMNS`]),
+/// 2. `Reviews` and `PrunedTotals` (0.7).
+///
+/// Every step is `CREATE … IF NOT EXISTS` or a column added when missing,
+/// so opening any older database brings it up to date.
+pub const SCHEMA_VERSION: i64 = 2;
+
 /// Columns added after the first release; added to existing databases on open.
 const SCAN_COLUMNS: &[(&str, &str)] = &[
     ("Kind", "TEXT NOT NULL DEFAULT 'manual'"),
@@ -426,7 +435,45 @@ impl Store {
     fn set_up(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
         self.conn.execute_batch(SCHEMA)?;
-        self.migrate()
+        self.migrate()?;
+        // A database a newer Phalanx wrote keeps its number: this one only
+        // uses the tables and columns it knows.
+        if self.schema_version()? < SCHEMA_VERSION {
+            self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        }
+        Ok(())
+    }
+
+    /// The layout the database has ([`SCHEMA_VERSION`] once opened here).
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    /// Whether the database at `path` is sound, by SQLite's full check,
+    /// opened read-only so nothing is changed: `Err` with what is wrong (or
+    /// why it could not be read at all).
+    pub fn check_file(path: &Path) -> Result<(), String> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("PRAGMA integrity_check").map_err(|e| e.to_string())?;
+        let problems: Vec<String> = stmt.query_map([], |r| r.get(0)).and_then(|rows| rows.collect()).map_err(|e| e.to_string())?;
+        match problems.as_slice() {
+            [ok] if ok == "ok" => Ok(()),
+            _ => Err(problems.into_iter().take(5).collect::<Vec<_>>().join("; ")),
+        }
+    }
+
+    /// SQLite's quicker check of this database, before it is backed up.
+    pub fn quick_check(&self) -> Result<bool> {
+        let first: String = self.conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        Ok(first == "ok")
+    }
+
+    /// Writes a consistent copy of the database to `path` (which must not
+    /// exist), while other connections keep using it.
+    pub fn back_up_to(&self, path: &Path) -> Result<()> {
+        self.conn.execute("VACUUM INTO ?1", [path.display().to_string()])?;
+        Ok(())
     }
 
     /// Copies every scan, detection, scan error and quarantine record from
@@ -755,6 +802,12 @@ impl Store {
     pub fn compact(&self) -> Result<()> {
         self.conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
+    }
+
+    /// The connection itself, for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn conn_for_test(&self) -> &Connection {
+        &self.conn
     }
 
     /// Backdates a scan, for tests of what retention removes.
@@ -1140,6 +1193,24 @@ mod tests {
     }
 
     #[test]
+    fn the_file_check_finds_a_damaged_page() {
+        let (tmp, store) = history_store(300);
+        store.compact().unwrap();
+        drop(store);
+        let path = tmp.path().join("history.sqlite");
+        assert_eq!(Store::check_file(&path), Ok(()));
+        // The header stays intact; a page of scans does not. (After
+        // compacting, the last page holds data: an early page may be an
+        // empty table's root, mostly unused space with nothing to find.)
+        let mut bytes = std::fs::read(&path).unwrap();
+        let page = bytes.len() - 4096;
+        bytes[page..page + 600].fill(0xA5);
+        std::fs::write(&path, bytes).unwrap();
+        let problem = Store::check_file(&path).unwrap_err();
+        assert!(!problem.is_empty(), "{problem}");
+    }
+
+    #[test]
     fn pruning_takes_reviews_with_their_findings() {
         let (_tmp, store) = history_store(20);
         let finding = store.scan_detections(10).unwrap()[0].id;
@@ -1189,6 +1260,7 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION, "brought up to date, and says so");
         let old = &store.recent_scans(10, None).unwrap()[0];
         assert_eq!((old.kind.as_str(), old.files_scanned, old.threads), ("manual", 7, 1));
 

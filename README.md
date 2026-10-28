@@ -205,6 +205,10 @@ The app has these pages:
   quarantined files are not touched. **Export…** saves everything the current
   filter matches, one row per finding with its mark, as CSV (for spreadsheets;
   a cell that starts like a formula is kept as text) or JSON.
+  The service checks the history database each time it starts and backs it up
+  daily (only if it passes a check). A damaged database is moved aside, never
+  deleted, and the last backup takes its place; the app says so in its
+  activity log and in Settings. Quarantined files are never affected.
 * **Settings**, in tabs: **General** (startup, tray, notifications, data folder),
   **Scanning** (performance, detection, quarantine), **Exclusions**, **Signatures**
   and **AI inspection**.

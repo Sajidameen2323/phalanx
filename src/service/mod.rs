@@ -352,6 +352,8 @@ impl Running {
 /// process already holds the pipe name.
 pub fn start(pipe_name: &str, data_dir: &Path) -> io::Result<Running> {
     std::fs::create_dir_all(data_dir)?;
+    // Before anything opens the history database.
+    history::check_at_start(data_dir);
     let (tx, rx) = std::sync::mpsc::channel();
     let ctx = Context::new(data_dir, tx);
     let (protector, web, updater) = (Arc::clone(&ctx.protector), Arc::clone(&ctx.web), Arc::clone(&ctx.updater));
