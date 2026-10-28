@@ -10,6 +10,7 @@ pub mod heuristics;
 pub mod ipc;
 pub mod posture;
 pub mod quarantine;
+pub mod reputation;
 pub mod risk;
 pub mod rtp;
 pub mod scan;

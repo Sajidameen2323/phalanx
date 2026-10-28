@@ -108,6 +108,26 @@ fn save_checked(data_dir: &Path) {
 
 /// Saves the abuse.ch key as the service (encrypted for SYSTEM, readable
 /// only by administrators), or removes it with `None`.
+/// Saves the VirusTotal key (or removes it, with `None`), readable only by
+/// administrators and the service.
+pub fn save_virustotal_key(data_dir: &Path, key: Option<&str>) -> Result<()> {
+    crate::reputation::save_virustotal_key(data_dir, key)?;
+    let path = data_dir.join(crate::reputation::VIRUSTOTAL_KEY_FILE);
+    if path.is_file() {
+        super::data::set_permissions(&path, super::data::SECRET_SDDL)?;
+    }
+    Ok(())
+}
+
+/// The keys hash lookups use: the abuse.ch Auth-Key and the VirusTotal key
+/// saved in the service. A key that cannot be read is left out.
+pub fn lookup_keys(data_dir: &Path) -> crate::reputation::Keys {
+    crate::reputation::Keys {
+        abuse_ch: update::auth_key(&update::signature_dir(data_dir)).ok().flatten(),
+        virustotal: crate::reputation::virustotal_key(data_dir).ok().flatten(),
+    }
+}
+
 pub fn save_auth_key(data_dir: &Path, key: Option<&str>) -> Result<()> {
     let sig_dir = update::signature_dir(data_dir);
     update::save_auth_key(&sig_dir, key)?;
