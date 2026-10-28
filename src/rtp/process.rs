@@ -72,6 +72,14 @@ pub fn identify(pid: u32) -> Option<(u64, PathBuf)> {
     imp::identify(pid)
 }
 
+/// Now, in the FILETIME ticks process creation times are in.
+pub fn now_ticks() -> u64 {
+    // From 1601, where FILETIME counts, to 1970, in 100 ns ticks.
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    let since_1970 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    UNIX_EPOCH_TICKS + (since_1970.as_nanos() / 100) as u64
+}
+
 /// Whether process listing is supported here.
 pub const SUPPORTED: bool = cfg!(windows);
 
@@ -244,6 +252,14 @@ mod imp {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn now_is_after_this_process_started() {
+        let (created, _) = identify(std::process::id()).unwrap();
+        let now = now_ticks();
+        assert!(created < now, "{created} {now}");
+        assert!(now - created < 60 * 60 * 10_000_000, "within the hour");
+    }
 
     #[test]
     fn lists_a_started_process_and_stops_it() {

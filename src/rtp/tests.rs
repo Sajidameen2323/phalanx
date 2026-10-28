@@ -6,6 +6,22 @@ fn marker() -> String {
     "threat-scanner-test-marker-7f3a".to_ascii_uppercase()
 }
 
+/// How long a test waits for protection to report something. Long: right
+/// after a build, Windows scanning the new test binary can slow everything
+/// for a minute. A test that passes stops waiting when the event comes.
+const EVENT_WAIT: Duration = Duration::from_secs(90);
+
+/// An engine that knows `program`'s exact contents as malware, and nothing
+/// else new. Phalanx installed on the PC running the tests knows the built-in
+/// marker, and Windows may remove a Microsoft program changed to carry it:
+/// either stops the test program before the protection under test can.
+fn private_hash(signatures: &Path, program: &[u8]) -> EngineConfig {
+    use sha2::{Digest, Sha256};
+    fs::create_dir_all(signatures).unwrap();
+    fs::write(signatures.join("hashes.txt"), format!("{} malware Test.Private.Program\n", hex::encode(Sha256::digest(program)))).unwrap();
+    EngineConfig { signature_dir: Some(signatures.to_path_buf()), ..Default::default() }
+}
+
 fn config(folder: &Path) -> RtpConfig {
     let mut config = RtpConfig::new(vec![folder.to_path_buf()]);
     // Tests run in parallel; only the drive test watches for new drives.
@@ -31,7 +47,8 @@ fn describe(event: RtpEvent) -> String {
             format!("detected {} {} stopped={stopped} action={}", report.worst().threat, name(Path::new(&report.path)), report.action)
         }
         RtpEvent::Blocked { report, .. } => format!("blocked {}", name(Path::new(&report.path))),
-        RtpEvent::Scanned { origin, report } => format!("scanned {origin:?} {}", report.stats.files_scanned),
+        RtpEvent::Scanned { origin, report } if report.errors.is_empty() => format!("scanned {origin:?} {}", report.stats.files_scanned),
+        RtpEvent::Scanned { origin, report } => format!("scanned {origin:?} {} errors {:?}", report.stats.files_scanned, report.errors),
         RtpEvent::RiskyFile { path, risk, .. } => format!("risky {} {}", name(&path), risk.disguise.is_some()),
         RtpEvent::RiskyChecked { path, outcome } => format!("checked {} {outcome:?}", name(&path)),
         RtpEvent::ProgramWatch { events, .. } => format!("program-watch {events}"),
@@ -59,7 +76,11 @@ struct Run {
 
 impl Run {
     fn start(data_dir: &Path, config: RtpConfig) -> Self {
-        let engine = Arc::new(Engine::new(&EngineConfig::default()).unwrap());
+        Self::start_with(data_dir, config, &EngineConfig::default())
+    }
+
+    fn start_with(data_dir: &Path, config: RtpConfig, engine: &EngineConfig) -> Self {
+        let engine = Arc::new(Engine::new(engine).unwrap());
         let (tx, rx) = mpsc::channel();
         let handle = start(engine, data_dir.to_path_buf(), config, move |e| {
             let _ = tx.send(describe(e));
@@ -68,9 +89,9 @@ impl Run {
         Self { handle, rx, seen: Vec::new() }
     }
 
-    /// Collects events until one satisfies `done` (or 20 s pass).
+    /// Collects events until one satisfies `done` (or [`EVENT_WAIT`] passes).
     fn until(&mut self, done: impl Fn(&str) -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + EVENT_WAIT;
         while Instant::now() < deadline {
             if let Ok(msg) = self.rx.recv_timeout(Duration::from_millis(200)) {
                 let hit = done(&msg);
@@ -207,11 +228,11 @@ fn an_unchanged_file_is_not_scanned_twice() {
 fn a_detected_program_is_stopped_and_quarantined() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
-    // A real, runnable program with the test marker appended (Windows
-    // ignores data past the end of the image).
+    // A real, runnable program, unchanged, that this run's engine knows as
+    // malware by its hash.
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let mut program = fs::read(Path::new(&root).join(r"System32\PING.EXE")).unwrap();
-    program.extend_from_slice(marker().as_bytes());
+    let program = fs::read(Path::new(&root).join(r"System32\PING.EXE")).unwrap();
+    let engine = private_hash(&tmp.path().join("signatures"), &program);
     let exe = tmp.path().join("bad-ping.exe");
     fs::write(&exe, &program).unwrap();
 
@@ -224,7 +245,9 @@ fn a_detected_program_is_stopped_and_quarantined() {
     cfg.quarantine_floor = Some(Category::Pup);
     cfg.defer_when_fullscreen = false;
     cfg.max_size_bytes = 1 << 20;
-    let mut run = Run::start(&data_dir, cfg);
+    // Windows' own ping has the same contents: never touch it.
+    cfg.exclude = vec![PathBuf::from(&root)];
+    let mut run = Run::start_with(&data_dir, cfg, &engine);
     assert!(run.until(|m| m.starts_with("started")));
     // The sweep of programs already running can report before this, and how
     // programs are watched (events with administrator rights, polling
@@ -232,21 +255,17 @@ fn a_detected_program_is_stopped_and_quarantined() {
     assert!(run.seen.iter().any(|m| m == "started 0 true"), "{:?}", run.seen);
     let watch_reported = run.seen.iter().any(|m| m.starts_with("program-watch"));
     assert!(watch_reported || run.until(|m| m.starts_with("program-watch")), "{:?}", run.seen);
-    // Let the first look at running programs pass, so this one counts as new.
-    std::thread::sleep(Duration::from_millis(1500));
+    // No wait for the first look at running programs: a program started
+    // after protection is new even if that look is what finds it.
 
     // Windows' own on-access scan of the new program can hold it for a
-    // moment, longer while the whole suite runs in parallel.
+    // while, longer while the whole suite runs in parallel.
     let start = || std::process::Command::new(&exe).args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn();
     let mut started = start();
-    for _ in 0..20 {
-        match &started {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                std::thread::sleep(Duration::from_millis(250));
-                started = start();
-            }
-            _ => break,
-        }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while started.is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        started = start();
     }
     let mut child = started.unwrap();
     assert!(run.until(|m| m.starts_with("detected")), "{:?}", run.seen);
@@ -282,7 +301,7 @@ fn a_crashing_part_is_restarted() {
     })
     .unwrap();
     let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + EVENT_WAIT;
     while Instant::now() < deadline && seen.iter().filter(|m: &&String| m.starts_with("started")).count() < 2 {
         if let Ok(m) = rx.recv_timeout(Duration::from_millis(200)) {
             seen.push(m);
@@ -293,7 +312,7 @@ fn a_crashing_part_is_restarted() {
 
     // Still protecting after the restart.
     fs::write(watched.join("after.txt"), marker()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + EVENT_WAIT;
     let mut detected = false;
     while Instant::now() < deadline && !detected {
         detected = rx.recv_timeout(Duration::from_millis(200)).is_ok_and(|m| m.starts_with("detected"));
@@ -603,11 +622,6 @@ fn exits_within(child: &mut std::process::Child, secs: u64) -> bool {
 fn the_browser_data_watch_catches_and_stops_stealers() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
-    // A profile where browsers keep one (the temporary folder is in AppData).
-    let profile = tmp.path().join(r"Google\Chrome\User Data\Default");
-    fs::create_dir_all(&profile).unwrap();
-    let passwords = profile.join("Login Data");
-    fs::write(&passwords, "not really a database").unwrap();
     let system32 = Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join("System32");
     let powershell = system32.join(r"WindowsPowerShell\v1.0\powershell.exe");
 
@@ -617,11 +631,20 @@ fn the_browser_data_watch_catches_and_stops_stealers() {
     cfg.browser_guard = true;
     let mut run = Run::start(&data_dir, cfg);
     assert!(run.until(|m| m.starts_with("browser-guard")), "{:?}", run.seen);
+    // Checked before the profile below is written: Phalanx installed on this
+    // PC, watching browser data and stopping unsigned programs, would stop
+    // these tests (unsigned) for writing it. With administrator rights it
+    // still may; turn its stopping off to run this test.
     if run.seen.iter().any(|m| m == "browser-guard false") {
         run.handle.stop();
         eprintln!("skipped: the browser data watch needs administrator rights");
         return;
     }
+    // A profile where browsers keep one (the temporary folder is in AppData).
+    let profile = tmp.path().join(r"Google\Chrome\User Data\Default");
+    fs::create_dir_all(&profile).unwrap();
+    let passwords = profile.join("Login Data");
+    fs::write(&passwords, "not really a database").unwrap();
     std::thread::sleep(Duration::from_millis(500));
 
     // Like a PowerShell stealer: read the file, then stay to send it.

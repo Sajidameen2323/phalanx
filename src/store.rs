@@ -4,6 +4,7 @@ use crate::Finding;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 const SCHEMA: &str = "
@@ -127,6 +128,9 @@ pub struct ScanRow {
     pub threads: i64,
     pub cancelled: bool,
     pub signatures: Option<String>,
+    /// The first thing it found, if anything: what History groups repeats by.
+    #[serde(default)]
+    pub top_threat: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +180,8 @@ pub fn now() -> String {
 
 /// The columns a [`ScanRow`] is read from, in [`scan_row`]'s order.
 const SCAN_ROW: &str = "Id, Kind, StartedAt, FinishedAt, ElapsedMs, Targets, FilesScanned, BytesScanned, FilesSkipped, Errors, \
-    Detections, Quarantined, Threads, Cancelled, Signatures";
+    Detections, Quarantined, Threads, Cancelled, Signatures, \
+    (SELECT Threat FROM Detections WHERE ScanId = Scans.Id ORDER BY Id LIMIT 1)";
 
 fn scan_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRow> {
     Ok(ScanRow {
@@ -195,6 +200,7 @@ fn scan_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRow> {
         threads: r.get(12)?,
         cancelled: r.get(13)?,
         signatures: r.get(14)?,
+        top_threat: r.get(15)?,
     })
 }
 
@@ -395,6 +401,75 @@ pub struct HistoryPage {
     pub matching: i64,
 }
 
+/// Scan kinds real-time protection records, rather than someone starting a scan.
+pub const PROTECTION_KINDS: [&str; 5] = ["watch", "process", "command", "sideload", "browser"];
+
+pub fn is_protection_kind(kind: &str) -> bool {
+    PROTECTION_KINDS.contains(&kind)
+}
+
+/// One entry of History as shown: a scan, or real-time records that repeat
+/// one another, newest first.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    /// Names the entry across reloads (a group keeps it as records arrive).
+    pub key: String,
+    pub rows: Vec<ScanRow>,
+}
+
+/// Groups a page of history (newest first) for showing. Scans someone
+/// started stay one entry each: each has its own totals. Real-time records
+/// of the same kind group by what they concern and what they found (the same
+/// program caught again, the same command rule), and the checks that found
+/// nothing group by kind. A group sits where its newest record is.
+pub fn group_history(rows: &[ScanRow]) -> Vec<HistoryEntry> {
+    let mut entries: Vec<HistoryEntry> = Vec::new();
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        let key = history_key(row);
+        match by_key.get(&key) {
+            Some(&at) => entries[at].rows.push(row.clone()),
+            None => {
+                by_key.insert(key.clone(), entries.len());
+                entries.push(HistoryEntry { key, rows: vec![row.clone()] });
+            }
+        }
+    }
+    entries
+}
+
+fn history_key(row: &ScanRow) -> String {
+    let incomplete = row.finished_at.is_none() || row.cancelled;
+    if !is_protection_kind(&row.kind) || incomplete {
+        return format!("scan {}", row.id);
+    }
+    match &row.top_threat {
+        Some(threat) => format!("{} {} {}", row.kind, row.targets.to_lowercase(), threat),
+        None => format!("{} clean", row.kind),
+    }
+}
+
+/// A file (or program) and what it was found as, across every matching scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileFinding {
+    pub path: String,
+    pub threat: String,
+    /// As last found.
+    pub category: String,
+    /// What was done the last time.
+    pub action: String,
+    /// Times found, and in how many scans.
+    pub times: i64,
+    pub scans: i64,
+    pub first_seen: String,
+    pub last_seen: String,
+    /// The scan that last found it.
+    pub last_scan: i64,
+}
+
+/// Most files [`Store::findings_by_file`] returns.
+pub const MAX_FILE_FINDINGS: u32 = 500;
+
 /// How long a connection waits for another to finish writing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -411,6 +486,14 @@ fn set_up_clash(e: &anyhow::Error) -> bool {
 }
 
 impl Store {
+    /// A transaction that holds the write lock from the start. These read
+    /// before they write: a deferred one would fail at once ("database is
+    /// locked") had another connection, such as real-time protection, written
+    /// in between, rather than wait its turn.
+    fn write_transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -488,7 +571,7 @@ impl Store {
         }
         self.conn.execute("ATTACH DATABASE ?1 AS old", [other.display().to_string()])?;
         let imported = (|| -> Result<(i64, i64)> {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = self.write_transaction()?;
             // Parents before children (foreign keys).
             for table in ["Scans", "Detections", "ScanErrors", "Quarantine"] {
                 let columns = |schema: &str| -> Result<Vec<String>> {
@@ -678,6 +761,38 @@ impl Store {
         Ok(HistoryPage { scans, next: next.flatten(), matching })
     }
 
+    /// What the scans `query` matches found, once per file and threat, most
+    /// recently found first: History's "By file" view, where a file every
+    /// scan finds again is one line. `query.before` and `query.limit` are
+    /// not used; at most `limit` files (up to [`MAX_FILE_FINDINGS`]).
+    pub fn findings_by_file(&self, query: &HistoryQuery, limit: u32) -> Result<Vec<FileFinding>> {
+        let (since, threats, kinds, text) = filter_params(query);
+        // Category, action and scan come from the newest finding of each.
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "WITH f AS (
+                 SELECT d.Path, d.Threat, MAX(d.Id) AS Newest, COUNT(*) AS Times, COUNT(DISTINCT d.ScanId) AS InScans,
+                        MIN(d.DetectedAt) AS FirstSeen, MAX(d.DetectedAt) AS LastSeen
+                 FROM Detections d JOIN (SELECT Id FROM Scans WHERE {HISTORY_FILTER}) s ON s.Id = d.ScanId
+                 GROUP BY d.Path, d.Threat ORDER BY Newest DESC LIMIT ?5)
+             SELECT f.Path, f.Threat, n.Category, n.Action, n.ScanId, f.Times, f.InScans, f.FirstSeen, f.LastSeen
+             FROM f JOIN Detections n ON n.Id = f.Newest ORDER BY f.Newest DESC"
+        ))?;
+        let rows = stmt.query_map(params![since, threats, kinds, text, limit.clamp(1, MAX_FILE_FINDINGS)], |r| {
+            Ok(FileFinding {
+                path: r.get(0)?,
+                threat: r.get(1)?,
+                category: r.get(2)?,
+                action: r.get(3)?,
+                last_scan: r.get(4)?,
+                times: r.get(5)?,
+                scans: r.get(6)?,
+                first_seen: r.get(7)?,
+                last_seen: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Every scan `query` matches, on all pages, newest first, one row per
     /// finding (a scan that found nothing is one row with no finding), for
     /// export. At most [`MAX_EXPORT`] scans.
@@ -738,7 +853,7 @@ impl Store {
     /// unlike [`Store::prune`], they leave the monthly totals too. Returns
     /// how many went. Quarantine records stay.
     pub fn delete_history(&self, target: &DeleteTarget) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_transaction()?;
         tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS Pruning (Id INTEGER PRIMARY KEY); DELETE FROM temp.Pruning;")?;
         match target {
             DeleteTarget::Scans { ids } => {
@@ -773,7 +888,7 @@ impl Store {
     /// file needs them.
     pub fn prune(&self, retention: Retention, now: chrono::DateTime<chrono::Local>) -> Result<usize> {
         let cutoff = |days: u32| (days > 0).then(|| (now - chrono::Duration::days(days.into())).to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_transaction()?;
         tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS Pruning (Id INTEGER PRIMARY KEY); DELETE FROM temp.Pruning;")?;
         tx.execute(
             "INSERT INTO temp.Pruning SELECT Id FROM Scans
@@ -1280,5 +1395,99 @@ ewa", "denied").unwrap();
         // Opening again must not try to add the columns twice.
         drop(store);
         Store::open(&path).unwrap();
+    }
+
+    /// Records a finished scan of `kind` over `targets`, finding `found`
+    /// (path, threat) if any; returns its id.
+    fn record(store: &Store, kind: &str, targets: &str, found: &[(&str, &str)]) -> i64 {
+        let id = store.begin_scan(&ScanMeta { kind, targets, threads: 1, signatures: None }).unwrap();
+        for (path, threat) in found {
+            let finding = Finding { threat: threat.to_string(), category: crate::Category::Suspicious, source: crate::Source::Yara, details: String::new() };
+            store.add_detection(id, path, "", &finding, "reported").unwrap();
+        }
+        let stats = ScanStats { files_scanned: 1, detections: found.len() as i64, ..Default::default() };
+        store.finish_scan(id, &stats, 5, false).unwrap();
+        id
+    }
+
+    #[test]
+    fn real_time_repeats_group_and_scans_stay_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("history.sqlite")).unwrap();
+        let logi = r"C:\Program Files\LogiOptionsPlus\logioptionsplus_agent.exe";
+        let memory = [(logi, "BrowserData.MemoryRead")];
+        let first = record(&store, "browser", logi, &memory);
+        let quick = record(&store, "quick", r"C:\Users", &[]);
+        let clean_a = record(&store, "watch", r"C:\Downloads\a.pdf", &[]);
+        let again = record(&store, "browser", logi, &memory);
+        let other = record(&store, "browser", r"C:\Steam\steam.exe", &[(r"C:\Steam\steam.exe", "BrowserData.MemoryRead")]);
+        let clean_b = record(&store, "watch", r"C:\Downloads\b.pdf", &[]);
+        let second_quick = record(&store, "quick", r"C:\Users", &[]);
+        // Same program, another kind of read: its own entry.
+        let data = record(&store, "browser", logi, &[(r"C:\Edge\Local State", "BrowserData.Read")]);
+        // Not finished yet: never folded into anything.
+        let running = store.begin_scan(&ScanMeta { kind: "watch", targets: r"C:\Downloads\c.pdf", threads: 1, signatures: None }).unwrap();
+
+        let page = store.history(&HistoryQuery { limit: 100, ..Default::default() }).unwrap();
+        assert_eq!(page.scans[0].top_threat, None);
+        assert_eq!(page.scans.iter().find(|s| s.id == again).unwrap().top_threat.as_deref(), Some("BrowserData.MemoryRead"));
+        let entries: Vec<Vec<i64>> = group_history(&page.scans).iter().map(|e| e.rows.iter().map(|s| s.id).collect()).collect();
+        assert_eq!(
+            entries,
+            vec![vec![running], vec![data], vec![second_quick], vec![clean_b, clean_a], vec![other], vec![again, first], vec![quick]],
+        );
+        // A group keeps its key as newer records arrive.
+        let grouped = group_history(&page.scans);
+        let older = group_history(&page.scans[2..]);
+        let key = |entries: &[HistoryEntry], id: i64| entries.iter().find(|e| e.rows.iter().any(|s| s.id == id)).unwrap().key.clone();
+        assert_eq!(key(&grouped, first), key(&older, first));
+    }
+
+    #[test]
+    fn findings_by_file_show_a_file_found_again_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("history.sqlite")).unwrap();
+        let dll = r"C:\Program Files\Git\mingw64\bin\libstdc++-6.dll";
+        let first = record(&store, "full", r"C:\", &[(dll, "MALPEDIA_Win_Bqtlock_Auto"), (r"C:\Games\steam_api64.dll", "Tampered.SignedFile")]);
+        record(&store, "quick", r"C:\Users", &[]);
+        let last = record(&store, "full", r"C:\", &[(dll, "MALPEDIA_Win_Bqtlock_Auto")]);
+        record(&store, "watch", r"C:\Downloads\x.exe", &[(r"C:\Downloads\x.exe", "Trojan.X")]);
+
+        let all = store.findings_by_file(&HistoryQuery::default(), 100).unwrap();
+        assert_eq!(all.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), [r"C:\Downloads\x.exe", dll, r"C:\Games\steam_api64.dll"]);
+        let git = &all[1];
+        assert_eq!((git.times, git.scans, git.last_scan), (2, 2, last));
+        assert!(git.first_seen <= git.last_seen);
+        assert_eq!(all[2].last_scan, first);
+
+        // The History filters apply: kinds, and text.
+        let manual = store.findings_by_file(&HistoryQuery { kinds: vec!["full".into()], ..Default::default() }, 100).unwrap();
+        assert_eq!(manual.len(), 2);
+        let steam = store.findings_by_file(&HistoryQuery { text: Some("STEAM_api".into()), ..Default::default() }, 100).unwrap();
+        // The text picks scans; their other findings come along.
+        assert_eq!(steam.len(), 2);
+        assert_eq!(store.findings_by_file(&HistoryQuery::default(), 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_waits_for_another_connection_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.sqlite");
+        let store = Store::open(&path).unwrap();
+        record(&store, "watch", r"C:\Downloads\old.pdf", &[]);
+        // Another connection (real-time protection, say) is writing.
+        let writer = Store::open(&path).unwrap();
+        writer.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let busy = std::thread::spawn(move || {
+            record(&writer, "watch", r"C:\Downloads
+ew.pdf", &[]);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            writer.conn.execute_batch("COMMIT").unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let query = HistoryQuery { text: Some("old.pdf".into()), ..Default::default() };
+        assert_eq!(store.delete_history(&DeleteTarget::Matching { query }).unwrap(), 1);
+        busy.join().unwrap();
+        assert_eq!(store.history(&HistoryQuery { limit: 10, ..Default::default() }).unwrap().scans.len(), 1);
     }
 }
