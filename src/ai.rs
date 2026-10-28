@@ -56,6 +56,8 @@ pub struct Evidence {
     pub content: Content,
     /// Only part of the file was examined (larger than the read limit).
     pub read_truncated: bool,
+    /// What MalwareBazaar and VirusTotal said about the hash, once asked.
+    pub reputation: Option<crate::reputation::Reputation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +196,7 @@ pub fn collect(path: &Path, engine: Option<&Engine>, max_text_kb: u32, send_text
         local_findings,
         content,
         read_truncated,
+        reputation: None,
     })
 }
 
@@ -440,6 +443,9 @@ impl Evidence {
         if let Some(origin) = &self.origin && let Some(host) = origin.host() {
             lines.push(format!("Download origin ({host}) from the Mark of the Web"));
         }
+        if self.reputation.is_some() {
+            lines.push("What MalwareBazaar and VirusTotal said about its hash".to_string());
+        }
         match &self.content {
             Content::Text { text, truncated_from } => lines.push(match truncated_from {
                 Some(total) => format!("The first {} KB of the file's text (of {} KB)", text.len() / 1024, total / 1024),
@@ -558,6 +564,16 @@ pub fn build_prompt(e: &Evidence) -> String {
         None => {
             let _ = writeln!(p, "Local scanner: not run.");
         }
+    }
+    if let Some(r) = &e.reputation {
+        let _ = writeln!(p, "Online reputation of the SHA-256 (looked up by the tool; only the hash was sent):");
+        for line in r.prompt_lines() {
+            let _ = writeln!(p, "- {line}");
+        }
+        let _ = writeln!(
+            p,
+            "Weigh this with the content: MalwareBazaar lists only malware; on VirusTotal one or two flags are often false positives, many are not; never seen means new or rare, not safe."
+        );
     }
     let _ = writeln!(p);
     match &e.content {

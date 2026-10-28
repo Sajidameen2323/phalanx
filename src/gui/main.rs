@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use threat_scanner::ai::{self, AiReport, Evidence};
 use threat_scanner::engine::{Engine, EngineConfig};
 use threat_scanner::posture::{self, Check};
+use threat_scanner::reputation::{self, Reputation};
 use threat_scanner::ipc::{self, replies, Event, Request};
 use threat_scanner::scan::{self, FileReport, ScanOptions, ScanReport};
 use threat_scanner::service::settings::ProtectionSettings;
@@ -180,6 +181,8 @@ struct Settings {
     /// Send the text of scripts and other text files (binaries never are).
     ai_send_text: bool,
     ai_max_text_kb: u32,
+    /// Look inspected files' hashes up on MalwareBazaar and VirusTotal.
+    hash_lookups: bool,
     /// Check the feeds for new signatures and web rules automatically.
     auto_update: bool,
     auto_update_hours: u32,
@@ -223,6 +226,7 @@ impl Default for Settings {
             ai_key_protected: None,
             ai_send_text: true,
             ai_max_text_kb: ai::DEFAULT_MAX_TEXT_KB,
+            hash_lookups: true,
             auto_update: true,
             auto_update_hours: 4,
             history_days: 365,
@@ -456,8 +460,12 @@ struct InspectState {
     target: Option<PathBuf>,
     preparing: Option<Receiver<Result<Evidence, String>>>,
     evidence: Option<Result<Evidence, String>>,
-    running: Option<(Receiver<Result<AiReport, String>>, Instant)>,
+    /// Gemini's answer, and the hash lookup made just before it (if one was).
+    running: Option<(Receiver<(Option<Result<Reputation, String>>, Result<AiReport, String>)>, Instant)>,
     report: Option<Result<AiReport, String>>,
+    /// A hash lookup is under way.
+    looking_up: bool,
+    reputation: Option<Result<Reputation, String>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -656,6 +664,9 @@ struct App {
     /// The abuse.ch Auth-Key being typed, and whether one is saved.
     abuse_key_input: String,
     abuse_key_saved: bool,
+    vt_key_input: String,
+    /// The service has a VirusTotal key.
+    vt_key_saved: bool,
     ai_models: Vec<String>,
     ai_models_rx: Option<Receiver<Result<Vec<String>, String>>>,
     audit: audit_page::AuditState,
@@ -763,6 +774,7 @@ impl App {
             let _ = system::set_autostart(true, &autostart_command());
         }
         let abuse_key_saved = update::auth_key_saved(&update::signature_dir(&data_dir));
+        let vt_key_saved = reputation::virustotal_key_saved(&data_dir);
         let notify_prefs = Arc::new(link::NotifyPrefs::default());
         notify_prefs.set(settings.notifications, settings.risky_file_alerts);
         let link = link::Link::start(ctx, Arc::clone(&notify_prefs));
@@ -836,6 +848,8 @@ impl App {
             key_visible: false,
             abuse_key_input: String::new(),
             abuse_key_saved,
+            vt_key_input: String::new(),
+            vt_key_saved,
             ai_models: Vec::new(),
             ai_models_rx: None,
             audit: audit_page::AuditState::default(),
@@ -1319,6 +1333,34 @@ impl App {
         self.link.run(move || link::call(Request::CancelScan { job: id }), |_, _| {});
     }
 
+    /// Gives the service the VirusTotal key saved for this user (`Some`), or
+    /// removes the service's: an administrator's approval either way.
+    fn set_service_vt_key(&mut self, saving: bool) {
+        let (request, args) = if saving {
+            let key = reputation::virustotal_key(&self.data_dir).ok().flatten();
+            (Request::SetVirusTotalKey { key }, "service virustotal-key --from-app")
+        } else {
+            (Request::SetVirusTotalKey { key: None }, "service virustotal-key --remove")
+        };
+        self.approval = Some("Changing the VirusTotal key needs an administrator's approval".into());
+        self.link.run(
+            move || link::with_approval::<serde_json::Value>(request, args, || Ok(serde_json::Value::Null)),
+            move |app, outcome| {
+                app.approval = None;
+                match outcome {
+                    link::Approval::Done(_) => {
+                        app.vt_key_saved = saving;
+                        // The app's own copy was only for the hand-over.
+                        let _ = reputation::save_virustotal_key(&app.data_dir, None);
+                        app.notify(if saving { "VirusTotal key saved" } else { "VirusTotal key removed" }, true);
+                    }
+                    link::Approval::Declined => app.notify("Not changed: Windows' administrator prompt was declined", false),
+                    link::Approval::Failed(e) => app.notify(format!("Could not change the VirusTotal key: {e}"), false),
+                }
+            },
+        );
+    }
+
     /// Gives the service the Auth-Key saved for this user (`Some`), or
     /// removes the service's: an administrator's approval either way.
     fn set_service_auth_key(&mut self, save: Option<()>) {
@@ -1479,6 +1521,36 @@ impl App {
         self.inspect = InspectState { target: Some(path), preparing: Some(rx), ..Default::default() };
     }
 
+    /// Asks the service what MalwareBazaar and VirusTotal know about the
+    /// inspected file's hash.
+    fn lookup_inspected(&mut self) {
+        let Some(Ok(evidence)) = &self.inspect.evidence else { return };
+        if self.inspect.looking_up {
+            return;
+        }
+        let sha256 = evidence.sha256.clone();
+        self.inspect.looking_up = true;
+        self.link.run(
+            move || lookup_hash(sha256.clone()).map(|r| (sha256, r)),
+            |app, result| {
+                app.inspect.looking_up = false;
+                app.take_reputation(result.map(|(_, r)| r));
+            },
+        );
+    }
+
+    /// Keeps a lookup's answer, if it is about the file shown.
+    fn take_reputation(&mut self, result: Result<Reputation, String>) {
+        let Some(Ok(evidence)) = &mut self.inspect.evidence else { return };
+        if let Ok(r) = &result {
+            if r.sha256 != evidence.sha256 {
+                return;
+            }
+            evidence.reputation = Some(r.clone());
+        }
+        self.inspect.reputation = Some(result);
+    }
+
     fn run_inspection(&mut self, ctx: &egui::Context) {
         let Some(Ok(evidence)) = &self.inspect.evidence else { return };
         let key = match self.settings.gemini_key() {
@@ -1491,12 +1563,18 @@ impl App {
             model: self.settings.ai_model.trim().to_string(),
             timeout: Duration::from_secs(180),
         };
-        let evidence = evidence.clone();
+        let mut evidence = evidence.clone();
+        // Look the hash up first, so Gemini weighs what the services know.
+        let lookup = self.settings.hash_lookups && self.connected && evidence.reputation.is_none() && !self.inspect.looking_up;
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let looked = lookup.then(|| lookup_hash(evidence.sha256.clone()));
+            if let Some(Ok(r)) = &looked {
+                evidence.reputation = Some(r.clone());
+            }
             let result = ai::inspect(&config, &evidence).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
+            let _ = tx.send((looked, result));
             ctx.request_repaint();
         });
         self.inspect.report = None;
@@ -1508,8 +1586,11 @@ impl App {
             self.inspect.preparing = None;
             self.inspect.evidence = Some(result);
         }
-        if let Some((rx, _)) = &self.inspect.running && let Ok(result) = rx.try_recv() {
+        if let Some((rx, _)) = &self.inspect.running && let Ok((looked, result)) = rx.try_recv() {
             self.inspect.running = None;
+            if let Some(looked) = looked {
+                self.take_reputation(looked);
+            }
             if let Ok(report) = &result {
                 let file = self.inspect.target.as_deref().map(|p| widgets::file_name(&p.display().to_string())).unwrap_or_default();
                 self.notify(format!("AI inspection of {file}: {}", report.assessment.verdict.label()), report.assessment.verdict == ai::Verdict::Safe);
@@ -1521,8 +1602,10 @@ impl App {
     /// Quarantines the inspected file if it is unchanged since inspection.
     fn quarantine_inspected(&mut self) {
         let Some(Ok(evidence)) = &self.inspect.evidence else { return };
+        let known = evidence.reputation.as_ref().filter(|r| r.standing() == reputation::Standing::Malicious);
         let threat = match &evidence.local_findings {
             Some(f) if !f.is_empty() => f[0].threat.clone(),
+            _ if known.is_some() => format!("Reputation.{}", known.and_then(|r| r.label()).unwrap_or("KnownMalware")),
             _ => match &self.inspect.report {
                 Some(Ok(r)) => format!("AI.Gemini.{:?}", r.assessment.verdict),
                 _ => "AI.Gemini.Reviewed".to_string(),
@@ -1677,6 +1760,7 @@ impl App {
                     app.web.use_service_config(web, &home);
                     app.web.service_status = Some(web_status);
                     app.abuse_key_saved = update::auth_key_saved(&update::signature_dir(&home));
+                    app.vt_key_saved = reputation::virustotal_key_saved(&home);
                     // The "started" event may have come first.
                     if protection.watching {
                         app.watch.running = true;
@@ -2145,6 +2229,12 @@ fn notify_event(event: &Event, prefs: &link::NotifyPrefs) {
         }
         _ => {}
     }
+}
+
+/// Asks the service what MalwareBazaar and VirusTotal know about `sha256`.
+/// Blocks: call it off the window's thread.
+fn lookup_hash(sha256: String) -> Result<Reputation, String> {
+    link::call(Request::LookupHash { sha256 })?.into_result::<replies::LookupHash>().map_err(|e| e.to_string())
 }
 
 /// Title and body of the "threat detected" notification; `repeat` for a

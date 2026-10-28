@@ -135,6 +135,11 @@ pub enum Request {
     },
     /// Save (or, with `None`, remove) the abuse.ch Auth-Key.
     SetAuthKey { key: Option<String> },
+    /// Save (or, with `None`, remove) the VirusTotal API key.
+    SetVirusTotalKey { key: Option<String> },
+    /// Ask MalwareBazaar and VirusTotal (with the service's keys) about a
+    /// SHA-256. Only the hash leaves the PC.
+    LookupHash { sha256: String },
     /// The web protection settings.
     GetWebSettings,
     /// Replace the web protection settings; weakening needs an administrator.
@@ -259,6 +264,7 @@ impl Request {
             | Request::CancelScan { .. }
             | Request::QuarantineDetection { .. }
             | Request::UpdateSignatures { .. }
+            | Request::LookupHash { .. }
             | Request::GetWebSettings
             | Request::SetWebSettings { .. }
             | Request::ChangeSite { .. }
@@ -269,6 +275,7 @@ impl Request {
             | Request::Migrate { .. }
             | Request::RunBoxView
             | Request::SetAuthKey { .. }
+            | Request::SetVirusTotalKey { .. }
             | Request::QuarantineFile { .. }
             | Request::DeleteHistory { .. } => {
                 Allowed::Administrator
@@ -422,6 +429,8 @@ pub mod replies {
     /// `"started"`; progress arrives as events.
     pub type UpdateSignatures = String;
     pub type SetAuthKey = ();
+    pub type SetVirusTotalKey = ();
+    pub type LookupHash = crate::reputation::Reputation;
     pub type GetWebSettings = WebConfig;
     /// The web settings now in force.
     pub type SetWebSettings = WebConfig;

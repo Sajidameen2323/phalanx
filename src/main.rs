@@ -10,7 +10,7 @@ use threat_scanner::store::Store;
 use threat_scanner::system::{self, Performance};
 use threat_scanner::posture::{self, Check, Status};
 use threat_scanner::rtp::{self, Origin, RiskyOutcome, RtpConfig, RtpEvent};
-use threat_scanner::{ai, update, web, Category};
+use threat_scanner::{ai, reputation, update, web, Category};
 
 /// Phalanx: on-demand threat scanner (hash blocklist, YARA rules, PE heuristics).
 #[derive(Parser)]
@@ -91,6 +91,19 @@ enum Command {
         json: bool,
         #[command(flatten)]
         signatures: SignatureArgs,
+    },
+    /// Look a file (or a SHA-256) up on MalwareBazaar and VirusTotal. Only
+    /// the hash is sent. Uses the service's keys when it runs, else this
+    /// user's (`update --auth-key`, `lookup --virustotal-key`).
+    Lookup {
+        /// A file, or a SHA-256.
+        target: Option<String>,
+        /// Save a VirusTotal API key for this Windows user (encrypted);
+        /// `none` removes it.
+        #[arg(long, value_name = "KEY")]
+        virustotal_key: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Check each browser profile's hardening: updates, Safe Browsing, the
     /// JavaScript optimizer, secure DNS, Browser Guard, saved passwords (read-only).
@@ -240,6 +253,18 @@ enum ServiceCommand {
         /// Download every feed again, even if unchanged.
         #[arg(long)]
         force: bool,
+    },
+    /// Save the VirusTotal API key in the service (administrator).
+    #[command(name = "virustotal-key")]
+    VirusTotalKey {
+        key: Option<String>,
+        /// Remove the saved key.
+        #[arg(long, conflicts_with_all = ["key", "from_app"])]
+        remove: bool,
+        /// Use the key saved in the app (Settings > AI inspection), so it
+        /// never has to be typed or shown.
+        #[arg(long, conflicts_with = "key")]
+        from_app: bool,
     },
     /// Save the abuse.ch Auth-Key in the service (administrator).
     AuthKey {
@@ -726,6 +751,7 @@ fn run() -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Command::Lookup { target, virustotal_key, json } => lookup(target.as_deref(), virustotal_key.as_deref(), *json, &dir),
         Command::Audit { exclusions, all, json, signatures } => {
             let engine = engine(signatures, &dir)?;
             let work = dir.join("audit");
@@ -1060,6 +1086,40 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
     }
 }
 
+/// `phalanx-cli lookup`: saves a key, or looks a file or hash up.
+fn lookup(target: Option<&str>, virustotal_key: Option<&str>, json: bool, dir: &Path) -> Result<ExitCode> {
+    if let Some(key) = virustotal_key {
+        let key = (!key.eq_ignore_ascii_case("none")).then_some(key);
+        reputation::save_virustotal_key(dir, key)?;
+        println!("{}", if key.is_some() { "VirusTotal key saved for this Windows user." } else { "VirusTotal key removed." });
+        if target.is_none() {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    let Some(target) = target else { anyhow::bail!("give a file or a SHA-256 to look up") };
+    let sha256 = if Path::new(target).is_file() { reputation::file_sha256(Path::new(target))? } else { reputation::normalize(target)? };
+    // The service's keys when it runs; otherwise this user's.
+    let answer = match threat_scanner::ipc::Client::connect() {
+        Ok(mut client) => client.call(threat_scanner::ipc::Request::LookupHash { sha256: sha256.clone() })?.into_result::<threat_scanner::ipc::replies::LookupHash>()?,
+        Err(_) => {
+            let keys = reputation::Keys {
+                abuse_ch: update::auth_key(&update::signature_dir(dir))?,
+                virustotal: reputation::virustotal_key(dir)?,
+            };
+            reputation::Checker::new(dir).check(&sha256, &keys)?
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&answer)?);
+    } else {
+        println!("{}  {}", answer.sha256, answer.headline());
+        for line in answer.prompt_lines() {
+            println!("    {line}");
+        }
+    }
+    Ok(if answer.standing() == reputation::Standing::Malicious { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
 fn print_checks(title: &str, checks: &[Check], privacy: bool) {
     match posture::score(checks) {
         Some(s) => println!("{title}: {} ({}%, {} scored, {} unknown)", posture::level(s.percent), s.percent, s.scored, s.unknown),
@@ -1318,6 +1378,22 @@ fn service_command(cmd: &ServiceCommand) -> Result<ExitCode> {
                     _ => {}
                 }
             }
+        }
+        ServiceCommand::VirusTotalKey { key, remove, from_app } => {
+            let key = match (remove, from_app) {
+                (true, _) => None,
+                (_, true) => Some(
+                    reputation::virustotal_key(&scan::default_data_dir())?
+                        .ok_or_else(|| anyhow::anyhow!("the app has no VirusTotal key saved"))?,
+                ),
+                _ => Some(key.clone().ok_or_else(|| anyhow::anyhow!("give the key, --from-app or --remove"))?),
+            };
+            let reply = connect()?.call(ipc::Request::SetVirusTotalKey { key: key.clone() })?;
+            if reply.needs_approval {
+                anyhow::bail!("saving the key needs administrator rights: run this from a terminal opened as administrator");
+            }
+            let _: serde_json::Value = reply.into_result()?;
+            println!("{}", if key.is_some() { "The VirusTotal key is saved in the service." } else { "The VirusTotal key is removed." });
         }
         ServiceCommand::AuthKey { key, remove, from_app } => {
             let key = match (remove, from_app) {

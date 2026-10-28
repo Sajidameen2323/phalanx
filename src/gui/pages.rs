@@ -7,6 +7,13 @@ use eframe::egui::{pos2, vec2, Align, Align2, FontId, Id, Layout, Margin, Rect, 
 use threat_scanner::posture::Status;
 use widgets::*;
 
+/// What the online reputation section asks for.
+enum LookUp {
+    Nothing,
+    Ask,
+    Quarantine,
+}
+
 /// How long a toast stays up, in seconds.
 const TOAST_LIFE: f32 = 6.0;
 
@@ -1482,6 +1489,61 @@ impl App {
         self.abuse_key_card(ui, ctx);
     }
 
+    /// Hash lookups on MalwareBazaar and VirusTotal, and the VirusTotal key.
+    fn hash_lookup_card(&mut self, ui: &mut Ui) {
+        let saved = self.vt_key_saved;
+        let (mut save, mut remove) = (false, false);
+        card(ui, |ui| {
+            group_title(ui, "Online hash lookups", "");
+            setting_toggle(
+                ui,
+                &mut self.settings.hash_lookups,
+                "Look up inspected files by their hash",
+                "On the AI Inspect page, ask MalwareBazaar and VirusTotal whether they know the file. Only its SHA-256 fingerprint is sent, never the file, and only when you press Look up or Inspect. Answers are kept for 24 hours. Works without Gemini.",
+            );
+            row_divider(ui);
+            let (state, color) = if saved { ("Saved", theme().green) } else { ("Not set", theme().amber) };
+            setting_row(
+                ui,
+                "VirusTotal API key",
+                "Shows how many of about 70 antivirus engines detect a file. Free keys allow 4 lookups a minute and 500 a day, for personal use. The protection service keeps the key encrypted, readable only by administrators, so saving or removing it asks for an administrator's approval.",
+                |ui| badge(ui, state, color),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.vt_key_input)
+                        .password(true)
+                        .hint_text(if saved { "Paste a new key to replace the saved one" } else { "Paste your VirusTotal API key" })
+                        .desired_width(300.0),
+                );
+                let has_input = !self.vt_key_input.trim().is_empty();
+                save = ui.add_enabled_ui(has_input && self.connected, |ui| primary_button(ui, "Save key").clicked()).inner;
+                if saved {
+                    remove = secondary_button(ui, "Remove key").clicked();
+                }
+            });
+            ui.hyperlink_to(RichText::new("Get a free key at virustotal.com (sign in, then API key)").size(12.5), reputation::VIRUSTOTAL_PORTAL);
+            row_divider(ui);
+            let abuse = if self.abuse_key_saved { "uses your abuse.ch Auth-Key (Signatures settings)" } else { "needs the abuse.ch Auth-Key from the Signatures settings" };
+            small(ui, format!("MalwareBazaar {abuse}. A file it lists is known malware."));
+        });
+        if save {
+            // Saved for this user first (encrypted for them), where the
+            // elevated `phalanx-cli` reads it: the key never goes on a
+            // command line.
+            match reputation::save_virustotal_key(&self.data_dir, Some(self.vt_key_input.trim())) {
+                Ok(()) => {
+                    self.vt_key_input.clear();
+                    self.set_service_vt_key(true);
+                }
+                Err(e) => self.notify(format!("Could not save the VirusTotal key: {e:#}"), false),
+            }
+        }
+        if remove {
+            self.set_service_vt_key(false);
+        }
+    }
+
     /// The free abuse.ch Auth-Key that MalwareBazaar, ThreatFox and URLhaus
     /// need for their known-bad hashes and malware sites.
     fn abuse_key_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
@@ -1551,6 +1613,9 @@ impl App {
                 "What is sent to Google: scripts and other text files are sent as text, up to the limit below. Programs and other binaries are never uploaded; only facts extracted on this PC (structure, imported functions, readable strings). On Gemini's free tier Google may use what you send to improve its products, so don't inspect files that contain personal or confidential information.",
             );
         });
+        ui.add_space(14.0);
+
+        self.hash_lookup_card(ui);
         ui.add_space(14.0);
 
         let enabled = self.settings.ai_enabled;
@@ -1860,6 +1925,94 @@ impl App {
         }
     }
 
+    /// What MalwareBazaar and VirusTotal said about the inspected file, or
+    /// a button to ask them.
+    fn reputation_section(&self, ui: &mut Ui, evidence: &ai::Evidence) -> LookUp {
+        let mut chosen = LookUp::Nothing;
+        ui.label(RichText::new("Online reputation").strong().color(theme().text));
+        if !self.settings.hash_lookups {
+            small(ui, "Hash lookups are off (Settings > AI inspection).");
+            return chosen;
+        }
+        if !self.connected {
+            small(ui, "Hash lookups go through the protection service, which is not running.");
+            return chosen;
+        }
+        if self.inspect.looking_up {
+            ui.horizontal(|ui| {
+                spinner(ui);
+                muted(ui, "Asking MalwareBazaar and VirusTotal…");
+            });
+            return chosen;
+        }
+        match &self.inspect.reputation {
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    if secondary_button(ui, "Look up online").clicked() {
+                        chosen = LookUp::Ask;
+                    }
+                    small(ui, "Sends only the file's SHA-256 to MalwareBazaar and VirusTotal.");
+                });
+            }
+            Some(Err(e)) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Could not look it up: {e}")).color(theme().amber));
+                    if small_button(ui, "Try again").clicked() {
+                        chosen = LookUp::Ask;
+                    }
+                });
+            }
+            Some(Ok(r)) => {
+                let color = match r.standing() {
+                    reputation::Standing::Malicious => theme().red,
+                    reputation::Standing::Suspicious => theme().amber,
+                    reputation::Standing::Clean => theme().green,
+                    reputation::Standing::Unknown => theme().muted,
+                };
+                ui.horizontal_wrapped(|ui| {
+                    status_dot(ui, color, 4.0);
+                    ui.label(RichText::new(r.headline()).strong().color(theme().text));
+                });
+                for check in &r.checks {
+                    let name = check.service.name();
+                    let said = match &check.outcome {
+                        reputation::Outcome::Found { detections: Some((flagged, answered)), label, first_seen, .. } => {
+                            let label = label.as_ref().map(|l| format!(", {l}")).unwrap_or_default();
+                            let first = first_seen.as_ref().map(|f| format!(", first seen {f}")).unwrap_or_default();
+                            format!("{flagged} of {answered} engines flag it{label}{first}")
+                        }
+                        reputation::Outcome::Found { label, first_seen, .. } => {
+                            let label = label.as_ref().map(|l| format!(" as {l}")).unwrap_or_default();
+                            let first = first_seen.as_ref().map(|f| format!(", first seen {f}")).unwrap_or_default();
+                            format!("listed as malware{label}{first}")
+                        }
+                        reputation::Outcome::NotFound => "has never seen this file".into(),
+                        reputation::Outcome::NoKey => "not asked: add its key in Settings".into(),
+                        reputation::Outcome::Limited { retry_secs } => format!("free quota used up; try again in {retry_secs} s"),
+                        reputation::Outcome::Failed { error } => format!("could not be asked: {error}"),
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        status_dot(ui, theme().muted, 2.5);
+                        ui.add(egui::Label::new(RichText::new(format!("{name}: {said}{}", if check.cached { " (from the last 24 h)" } else { "" })).size(12.5).color(theme().muted)).wrap());
+                        if matches!(check.outcome, reputation::Outcome::Found { .. }) {
+                            ui.hyperlink_to(RichText::new("Open").size(12.5), check.service.link(&r.sha256));
+                        }
+                    });
+                }
+                if r.standing() == reputation::Standing::Malicious && evidence.path.is_file() {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(danger_button("Quarantine")).clicked() {
+                            chosen = LookUp::Quarantine;
+                        }
+                        small(ui, "Moves it where it cannot run; you can restore it from Quarantine.");
+                    });
+                }
+            }
+        }
+        chosen
+    }
+
     fn inspect_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         page_header(ui, "AI Inspect");
         let has_key = self.settings.ai_key_protected.is_some() || std::env::var("GEMINI_API_KEY").is_ok_and(|k| !k.trim().is_empty());
@@ -1890,7 +2043,7 @@ impl App {
         let mut choose = false;
         card(ui, |ui| {
             section_title(ui, "Choose a file");
-            muted(ui, "Pick a file or drop one onto this page. It is checked on this PC first, and nothing is sent until you press Inspect.");
+            muted(ui, "Pick a file or drop one onto this page. It is checked on this PC first, and nothing is sent until you press Look up or Inspect.");
             ui.add_space(6.0);
             choose = secondary_button(ui, "Choose a file…").clicked();
             let mut recent: Vec<&PathBuf> = Vec::new();
@@ -1947,7 +2100,7 @@ impl App {
         };
 
         let running = self.inspect.running.is_some();
-        let mut send = false;
+        let (mut send, mut look_up) = (false, LookUp::Nothing);
         card(ui, |ui| {
             path_lines(ui, &evidence.path.display().to_string());
             facts(
@@ -1983,8 +2136,14 @@ impl App {
                 }
             }
             ui.add_space(8.0);
+            look_up = self.reputation_section(ui, &evidence);
+            ui.add_space(8.0);
             ui.label(RichText::new("What will be sent to Google Gemini").strong().color(theme().text));
-            for line in evidence.sent_summary() {
+            let mut sent = evidence.sent_summary();
+            if self.settings.hash_lookups && self.connected && evidence.reputation.is_none() {
+                sent.insert(0, "First, its SHA-256 alone to MalwareBazaar and VirusTotal; their answer goes to Gemini too".to_string());
+            }
+            for line in sent {
                 ui.horizontal_wrapped(|ui| {
                     status_dot(ui, theme().muted, 2.5);
                     ui.add(egui::Label::new(RichText::new(line).size(12.5).color(theme().muted)).wrap());
@@ -2001,6 +2160,11 @@ impl App {
         });
         if send {
             self.run_inspection(ctx);
+        }
+        match look_up {
+            LookUp::Ask => self.lookup_inspected(),
+            LookUp::Quarantine => self.quarantine_inspected(),
+            LookUp::Nothing => {}
         }
         ui.add_space(14.0);
 

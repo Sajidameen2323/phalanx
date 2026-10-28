@@ -46,6 +46,8 @@ struct Context {
     protector: Arc<Protector>,
     web: Arc<WebGuard>,
     updater: Arc<Updater>,
+    /// Hash lookups, with their cache and VirusTotal's rate limit.
+    reputation: crate::reputation::Checker,
 }
 
 impl Context {
@@ -61,7 +63,8 @@ impl Context {
             reload_engine.reload_signatures(&ProtectionSettings::load(&settings_dir).unwrap_or_default());
             reload_web.reload();
         });
-        Context { started, data_dir: data_dir.to_path_buf(), settings: Mutex::new(()), stop_requested, hub, protector, web, updater }
+        let reputation = crate::reputation::Checker::new(data_dir);
+        Context { started, data_dir: data_dir.to_path_buf(), settings: Mutex::new(()), stop_requested, hub, protector, web, updater, reputation }
     }
 
     /// Applies web settings off the pipe's threads (the DNS filter may restart).
@@ -190,6 +193,8 @@ fn handle(ctx: &Context, session: &mut Session, caller: &Caller, message: Client
         }
         Request::UpdateSignatures { force } => reply::<replies::UpdateSignatures>(id, ctx.updater.start(force).map(|()| "started".into())),
         Request::SetAuthKey { key } => reply::<replies::SetAuthKey>(id, updates::save_auth_key(dir, key.as_deref())),
+        Request::SetVirusTotalKey { key } => reply::<replies::SetVirusTotalKey>(id, updates::save_virustotal_key(dir, key.as_deref())),
+        Request::LookupHash { sha256 } => reply::<replies::LookupHash>(id, ctx.reputation.check(&sha256, &updates::lookup_keys(dir))),
         Request::GetWebSettings => reply::<replies::GetWebSettings>(id, WebConfig::load(dir)),
         Request::SetWebSettings { settings } => {
             let _one_at_a_time = ctx.settings.lock().unwrap_or_else(|p| p.into_inner());
@@ -479,7 +484,7 @@ mod tests {
 
     /// Every kind of request there is. A new one fails the contract test
     /// until it is sent there (and given a type in [`replies`]).
-    const REQUEST_KINDS: usize = 31;
+    const REQUEST_KINDS: usize = 33;
 
     /// Reads `reply` as its request's type in [`replies`], as clients do.
     /// The match has no catch-all, so a new request does not compile
@@ -515,6 +520,8 @@ mod tests {
             Request::QuarantineDetection { .. } => read::<replies::QuarantineDetection>(reply),
             Request::UpdateSignatures { .. } => read::<replies::UpdateSignatures>(reply),
             Request::SetAuthKey { .. } => read::<replies::SetAuthKey>(reply),
+            Request::SetVirusTotalKey { .. } => read::<replies::SetVirusTotalKey>(reply),
+            Request::LookupHash { .. } => read::<replies::LookupHash>(reply),
             Request::GetWebSettings => read::<replies::GetWebSettings>(reply),
             Request::SetWebSettings { .. } => read::<replies::SetWebSettings>(reply),
             Request::ChangeSite { .. } => read::<replies::ChangeSite>(reply),
@@ -629,6 +636,11 @@ mod tests {
         service.ask(Request::RunBoxView);
         service.ask(Request::Subscribe);
         service.ask(Request::SetAuthKey { key: None });
+        service.ask(Request::SetVirusTotalKey { key: None });
+        // No keys are saved here, so nothing is sent anywhere.
+        let looked: replies::LookupHash = read(service.ask(Request::LookupHash { sha256: "AB".repeat(32) }));
+        assert_eq!(looked.sha256, "ab".repeat(32));
+        assert!(looked.checks.iter().all(|c| c.outcome == crate::reputation::Outcome::NoKey), "{looked:?}");
         service.ask(Request::GetWebSettings);
         service.ask(Request::SetWebSettings { settings: web_off.clone() });
         let changed: replies::ChangeSite = read(service.ask(Request::ChangeSite { change: SiteChange::Block, site: "https://example.test/x".into() }));

@@ -15,7 +15,7 @@ account, and shows you exactly what it found and why.
 | **Web protection** | Browser Guard blocks malware and phishing sites before your browser sends them a single request, marks dangerous search results, and can block ads and trackers. A DNS filter extends the blocking to every program on the PC. It also finds malicious browser extensions and checks each browser's security settings. |
 | **Stealer check** | Looks for the start-up entries, scheduled tasks, browser switches, policies, proxies and hosts-file changes that infostealers use. An optional browser data watch catches programs opening the browser's saved passwords and sign-in cookies, and hidden remote-controlled browsers, and can stop them on the spot. |
 | **Windows protection and privacy** | Checks Microsoft Defender, SmartScreen, the firewall, memory integrity and more, and can switch on what is off. A privacy checklist does the same for Windows privacy settings. |
-| **AI Inspect** | Asks Google Gemini for a second opinion on a file (optional, needs your own API key). |
+| **AI Inspect** | Asks Google Gemini for a second opinion on a file (optional, needs your own API key), and looks its hash up on MalwareBazaar and VirusTotal. |
 | **Signature updates** | Pulls fresh malware hashes, YARA rules and malicious web addresses from public threat-intelligence feeds (abuse.ch, YARA Forge, URLhaus, HaGeZi, CERT Polska). |
 
 Protection runs in a Windows service, so it keeps going with the app closed and
@@ -694,6 +694,33 @@ read it; the `GEMINI_API_KEY` environment variable is used when no key is saved.
 On Gemini's free tier Google may use what you send to improve its products, so do
 not inspect files that contain personal or confidential information.
 
+#### Online hash lookups (MalwareBazaar and VirusTotal)
+
+The AI Inspect page can also ask **MalwareBazaar** and **VirusTotal** whether they
+know the file. **Only its SHA-256 is sent, never the file**: files uploaded to
+VirusTotal can be downloaded by its paying customers, so uploading would leak
+personal documents. A lookup runs when you press **Look up online**, and before
+**Inspect with Gemini**, whose prompt then includes the answers. It works without
+Gemini too.
+
+| Service | Key | What it says |
+| --- | --- | --- |
+| MalwareBazaar | The abuse.ch Auth-Key already used for signature updates | Listed means known malware, with its family, tags and when it was first seen |
+| VirusTotal | Your own free key (Settings > AI inspection) | How many of about 70 antivirus engines detect it, the threat name, when it was first seen |
+
+The page adds them up: **known malware** (listed by MalwareBazaar, or flagged by 3 or
+more engines, with a **Quarantine** button), **a few flags** (1 or 2 engines: often a
+false positive), **no engine detects it**, or **not known online** (new or rare,
+which is not the same as safe). Each answer links to the service's page.
+
+Lookups go through the protection service, which keeps both keys encrypted and
+readable only by administrators (saving or removing the VirusTotal key asks for an
+administrator's approval). Answers are kept for 24 hours in the data folder, and
+VirusTotal is asked at most 4 times a minute, inside its free tier (4 a minute, 500 a
+day, personal use only). Turn lookups off under **Settings > AI inspection**.
+`phalanx-cli lookup FILE-or-SHA256` does the same in a terminal (with this user's keys
+when the service is not running; `--virustotal-key KEY` saves one).
+
 ### Scan performance
 
 | Setting | Threads (8-core PC) | Priority | 468 MB test folder, 5,151 rules |
@@ -735,6 +762,7 @@ phalanx-cli audit [--exclusions]       # stealer and persistence check (read-onl
 phalanx-cli browsers [--offline]       # browser updates and hardening (read-only)
 phalanx-cli inspect FILE --dry-run   # show what AI inspection would send
 phalanx-cli inspect FILE             # ask Gemini (needs GEMINI_API_KEY)
+phalanx-cli lookup FILE              # MalwareBazaar and VirusTotal, by hash only
 
 phalanx-cli web check example.com https://x.example/a.exe [--resolve]
 phalanx-cli web status               # mode, rule counts, connected browsers, DNS filter
