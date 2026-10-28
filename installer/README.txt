@@ -43,6 +43,12 @@ WHAT IT DOES
 - Blocks malware and phishing sites in your browsers, or for the whole PC
   with its DNS filter, and can block ads and trackers.
 - Stealer check: looks for what password-stealing malware leaves behind.
+  Its browser data watch (off until you turn it on) catches programs
+  opening your browser's saved passwords and sign-in cookies, which let a
+  thief read your email without your password, and stops them.
+- AI Inspect: a second opinion on a file from Google Gemini, and what
+  MalwareBazaar and VirusTotal know about it (only its fingerprint, the
+  SHA-256, is sent; never the file).
 - Checks Windows security and privacy settings, and can switch them on.
 - Reports suspicious commands, such as ones a fake "verify you are human"
   page asks you to paste into the Run box. If a website ever asks you to
@@ -57,8 +63,9 @@ History, quarantine, protection settings and downloaded signatures are
 kept by the service in %ProgramData%\Phalanx, which only administrators can
 change. Your own app settings (appearance, notifications, AI Inspect) are in
 %LOCALAPPDATA%\threat-scanner. Phalanx connects to the internet only to
-download signature updates and browser version information, and to Google
-Gemini if you turn on AI Inspect.
+download signature updates and browser version information, to Google
+Gemini if you turn on AI Inspect, and to MalwareBazaar and VirusTotal
+(a file's SHA-256 only) when you look a file up.
 
 
 UNINSTALLING
