@@ -1,7 +1,9 @@
 //! Process and image-load events from ETW, Windows' event tracing: a
 //! real-time session on the Microsoft-Windows-Kernel-Process provider. A
-//! second kind of session ([`start_file_opens`]) adds file opens from
-//! Microsoft-Windows-Kernel-File, for the browser data watch.
+//! second kind of session ([`start_file_opens`]) adds, for the browser data
+//! watch, file opens from Microsoft-Windows-Kernel-File, and image loads into
+//! and opens of a set of watched processes (Microsoft-Windows-Kernel-Audit-
+//! API-Calls reports every `OpenProcess`).
 //!
 //! Events arrive within about 100 ms of a process starting (the session's
 //! flush timer), so programs that run only briefly are still seen, with their
@@ -13,8 +15,13 @@
 //! (`\Device\HarddiskVolume3\…`) and are turned into drive paths.
 
 use super::process::{self, ProcessId, ProcessInfo};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, RwLock};
+
+/// Processes whose image loads and opens a session reports.
+pub type Watched = Arc<RwLock<HashSet<u32>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -26,26 +33,37 @@ pub enum Event {
     ImageLoaded { pid: u32, image: PathBuf },
     /// A process opened a file that the session's filter picked.
     FileOpened { pid: u32, path: PathBuf },
+    /// Process `pid` opened watched process `target` with `access` rights.
+    ProcessOpened { pid: u32, target: u32, access: u32 },
 }
 
 /// A running session. Dropping it stops the session; the sender passed to
 /// [`start`] is dropped once the last event is delivered, so a receiver sees
 /// the channel close. It also closes if Windows ends the session.
-pub struct Session(#[allow(dead_code)] imp::Session);
+pub struct Session(imp::Session);
+
+impl Session {
+    /// Events Windows dropped so far (its buffers were full); `None` if it
+    /// cannot say.
+    pub fn events_lost(&self) -> Option<u32> {
+        self.0.events_lost()
+    }
+}
 
 /// Starts a session named `name`, replacing one of that name left behind (by
 /// a crash, say). Image loads are reported only when `images` is set: they
 /// are by far the most frequent event.
 pub fn start(name: &str, images: bool, tx: Sender<Event>) -> std::io::Result<Session> {
-    imp::Session::start(name, imp::Spec { images, files: None }, tx).map(Session)
+    imp::Session::start(name, imp::Spec { images, files: None, watched: None }, tx).map(Session)
 }
 
-/// Starts a session named `name` reporting process starts and exits, and
-/// every file opened whose NT path (`\Device\HarddiskVolume3\…`) `wanted`
-/// accepts. Every file open on the PC passes through `wanted`, on the
-/// session's thread: it must be cheap.
-pub fn start_file_opens(name: &str, wanted: fn(&str) -> bool, tx: Sender<Event>) -> std::io::Result<Session> {
-    imp::Session::start(name, imp::Spec { images: false, files: Some(wanted) }, tx).map(Session)
+/// Starts a session named `name` reporting process starts and exits, every
+/// file opened whose NT path (`\Device\HarddiskVolume3\…`) `wanted` accepts,
+/// and the image loads into, and opens of, the processes in `watched`.
+/// Every file open on the PC passes through `wanted`, on the session's
+/// thread: it must be cheap.
+pub fn start_file_opens(name: &str, wanted: fn(&str) -> bool, watched: Watched, tx: Sender<Event>) -> std::io::Result<Session> {
+    imp::Session::start(name, imp::Spec { images: true, files: Some(wanted), watched: Some(watched) }, tx).map(Session)
 }
 
 /// The session name for this program: one per program file, so the service
@@ -89,9 +107,16 @@ fn last_string(data: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&units[start..end]))
 }
 
+/// An `OpenProcess` audit event's data as Windows lays it out: the target
+/// process id, the access asked for and the result (0 when it worked).
+fn open_fields(data: &[u8]) -> Option<(u32, u32, u32)> {
+    let word = |i: usize| data.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    Some((word(0)?, word(4)?, word(8)?))
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::{dos_path, process, Event, ProcessId, ProcessInfo};
+    use super::{dos_path, process, Event, ProcessId, ProcessInfo, Watched};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::mpsc::Sender;
     use std::thread::JoinHandle;
@@ -103,7 +128,7 @@ mod imp {
     use windows_sys::Win32::System::Diagnostics::Etw::{
         CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW, TdhGetProperty,
         TdhGetPropertySize, CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD,
-        EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+        EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
         PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROPERTY_DATA_DESCRIPTOR,
         TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
     };
@@ -121,6 +146,12 @@ mod imp {
     const KEYWORD_FILE_CREATE: u64 = 0x80;
     /// The Create event; its last field is `FileName`.
     const FILE_CREATE: u16 = 12;
+    /// Microsoft-Windows-Kernel-Audit-API-Calls.
+    const AUDIT_PROVIDER: GUID = GUID::from_u128(0xe02a841c_75a3_4fa7_afc8_ae09cf9b7f23);
+    /// `OpenProcess` (PsOpenProcess).
+    const OPEN_PROCESS: u16 = 5;
+    /// Rights that let one process read, change or run code in another.
+    const INVASIVE_ACCESS: u32 = 0x0010 | 0x0020 | 0x0002;
     /// `FlushTimer` is in milliseconds (Windows 8 and later).
     const EVENT_TRACE_USE_MS_FLUSH_TIMER: u32 = 0x10;
     const FLUSH_MS: u32 = 100;
@@ -170,10 +201,12 @@ mod imp {
     }
 
     /// What a session reports: process starts and exits always, image loads
-    /// when `images`, and the file opens `files` accepts.
+    /// when `images` (only into `watched` processes, when given), the file
+    /// opens `files` accepts, and opens of `watched` processes.
     pub struct Spec {
         pub images: bool,
         pub files: Option<fn(&str) -> bool>,
+        pub watched: Option<Watched>,
     }
 
     /// What the event callback works with; owned by the consumer thread.
@@ -183,6 +216,7 @@ mod imp {
         refreshed: Instant,
         names: Names,
         files: Option<fn(&str) -> bool>,
+        watched: Option<Watched>,
         /// This process: its own file opens are never reported.
         own_pid: u32,
     }
@@ -194,6 +228,9 @@ mod imp {
         create_time: Vec<u16>,
         image_name: Vec<u16>,
         file_name: Vec<u16>,
+        target_id: Vec<u16>,
+        desired_access: Vec<u16>,
+        return_code: Vec<u16>,
     }
 
     pub struct Session {
@@ -224,6 +261,10 @@ mod imp {
             if spec.files.is_some() {
                 providers.push((FILE_PROVIDER, KEYWORD_FILE_CREATE));
             }
+            if spec.watched.is_some() {
+                // Its events carry no keywords: 0 asks for all of them.
+                providers.push((AUDIT_PROVIDER, 0));
+            }
             for (provider, keywords) in providers {
                 // SAFETY: `control` is the session just started.
                 let status = unsafe {
@@ -253,8 +294,12 @@ mod imp {
                     create_time: wide("CreateTime"),
                     image_name: wide("ImageName"),
                     file_name: wide("FileName"),
+                    target_id: wide("TargetProcessId"),
+                    desired_access: wide("DesiredAccess"),
+                    return_code: wide("ReturnCode"),
                 },
                 files: spec.files,
+                watched: spec.watched,
                 own_pid: std::process::id(),
             }));
             let mut logfile = EVENT_TRACE_LOGFILEW { LoggerName: name.as_ptr() as *mut u16, Context: context.cast(), ..Default::default() };
@@ -287,6 +332,15 @@ mod imp {
                     Err(e)
                 }
             }
+        }
+    }
+
+    impl Session {
+        pub fn events_lost(&self) -> Option<u32> {
+            let mut p = Properties::new(&self.name);
+            // SAFETY: the handle from `start` and a properly sized block.
+            let status = unsafe { ControlTraceW(self.control, ptr::null(), &mut p.props, EVENT_TRACE_CONTROL_QUERY) };
+            (status == ERROR_SUCCESS).then_some(p.props.EventsLost)
         }
     }
 
@@ -349,6 +403,9 @@ mod imp {
         if is_provider(&record.EventHeader.ProviderId, &FILE_PROVIDER) {
             return file_opened(ctx, record);
         }
+        if is_provider(&record.EventHeader.ProviderId, &AUDIT_PROVIDER) {
+            return process_opened(ctx, record);
+        }
         if !is_provider(&record.EventHeader.ProviderId, &PROVIDER) {
             return None;
         }
@@ -372,6 +429,13 @@ mod imp {
             }
             PROCESS_STOP => Some(Event::Stopped { pid: u32_field(record, &names.process_id)? }),
             IMAGE_LOAD => {
+                // With watched processes, only loads into them (checked
+                // first: the most frequent event of all).
+                if let Some(watched) = &ctx.watched
+                    && !watched.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&record.EventHeader.ProcessId)
+                {
+                    return None;
+                }
                 let pid = u32_field(record, &names.process_id)?;
                 let nt = string_field(record, &names.image_name)?;
                 Some(Event::ImageLoaded { pid, image: path(ctx, &nt)? })
@@ -398,7 +462,33 @@ mod imp {
         if !wanted(&nt) {
             return None;
         }
-        Some(Event::FileOpened { pid, path: path(ctx, &nt)? })
+        // A volume without a drive letter (a shadow copy, read by tools
+        // that copy locked files) keeps its NT path.
+        let path = path(ctx, &nt).unwrap_or_else(|| std::path::PathBuf::from(&nt));
+        Some(Event::FileOpened { pid, path })
+    }
+
+    /// A watched process opened by another with rights to read or change
+    /// it. Every `OpenProcess` on the PC comes here, so the target is read
+    /// straight from the event's data and checked first.
+    fn process_opened(ctx: &mut Context, record: &EVENT_RECORD) -> Option<Event> {
+        let watched = ctx.watched.as_ref()?;
+        let pid = record.EventHeader.ProcessId;
+        if record.EventHeader.EventDescriptor.Id != OPEN_PROCESS || pid <= 4 || pid == ctx.own_pid || record.UserData.is_null() {
+            return None;
+        }
+        // SAFETY: Windows passes `UserDataLength` bytes at `UserData`.
+        let data = unsafe { std::slice::from_raw_parts(record.UserData as *const u8, record.UserDataLength as usize) };
+        let (target, access, result) = super::open_fields(data)?;
+        if target == pid || access & INVASIVE_ACCESS == 0 || !watched.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&target) {
+            return None;
+        }
+        // The fields by name, where Windows describes them, win.
+        let names = &ctx.names;
+        let target = u32_field(record, &names.target_id).unwrap_or(target);
+        let access = u32_field(record, &names.desired_access).unwrap_or(access);
+        let result = u32_field(record, &names.return_code).unwrap_or(result);
+        (result == 0 && access & INVASIVE_ACCESS != 0).then_some(Event::ProcessOpened { pid, target, access })
     }
 
     fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
@@ -457,11 +547,16 @@ mod imp {
     pub struct Spec {
         pub images: bool,
         pub files: Option<fn(&str) -> bool>,
+        pub watched: Option<super::Watched>,
     }
 
     impl Session {
         pub fn start(_name: &str, _spec: Spec, _tx: Sender<Event>) -> std::io::Result<Self> {
             Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "ETW is only available on Windows"))
+        }
+
+        pub fn events_lost(&self) -> Option<u32> {
+            None
         }
     }
 }
@@ -507,6 +602,13 @@ mod tests {
         assert_eq!(last_string(&data).as_deref(), Some(r"\Device\X\Login Data"));
         assert_eq!(last_string(&[0, 0, 0, 0]), None);
         assert_eq!(last_string(&[b'a', 0]).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn open_process_data_is_read_in_windows_order() {
+        let data = [0x10, 0x27, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(open_fields(&data), Some((10_000, 0x10, 0)));
+        assert_eq!(open_fields(&data[..8]), None);
     }
 
     #[test]

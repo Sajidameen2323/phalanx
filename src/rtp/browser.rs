@@ -1,26 +1,34 @@
 //! Browser data watch: programs other than the browser opening the files
 //! where browsers keep saved passwords, sign-in cookies, cards and the key
-//! that unlocks them, and browsers started to be remote-controlled with the
-//! person's own profile. Both are how infostealers take over accounts: a
-//! stolen session cookie skips the password and the second factor, so the
-//! thief can read email (password-reset codes included) as if signed in.
+//! that unlocks them (and where Discord, Telegram and crypto wallets keep
+//! their sign-in data and keys), browsers started to be remote-controlled
+//! or with a planted extension, unsigned code loaded into a browser, and
+//! programs reading a browser's memory. These are how infostealers take
+//! over accounts: a stolen session cookie skips the password and the second
+//! factor, so the thief can read email (password-reset codes included) as if
+//! signed in.
 //!
-//! File opens come from an ETW session on Microsoft-Windows-Kernel-File
-//! ([`etw::start_file_opens`]), filtered by name on the session's thread so
-//! only the few opens of those files reach this module. Watching every file
-//! open costs some CPU and a few MB of event buffers, which is why the watch
-//! is a switch of its own (off by default). Needs administrator rights, so
-//! in practice the service.
+//! Everything comes from one ETW session ([`etw::start_file_opens`]): file
+//! opens from Microsoft-Windows-Kernel-File, filtered by name on the
+//! session's thread so only the few opens of those files reach this module;
+//! process starts; and, for the browsers running (the watched set), the DLLs
+//! they load and every `OpenProcess` of them with rights to read or change
+//! their memory. Watching every file open costs some CPU and a few MB of
+//! event buffers, which is why the watch is a switch of its own (off by
+//! default). Needs administrator rights, so in practice the service.
 //!
-//! Who opened the file decides what happens:
+//! Who opened a file decides what happens:
 //!
-//! * the browser itself, or another program signed by a browser maker or by
-//!   Microsoft (Windows' search, Defender, backup): nothing;
-//! * a script host or Windows tool stealers use (PowerShell, `esentutl`,
-//!   `rundll32`, Python…), or an unsigned program: **high**, stopped at once
-//!   when automatic stopping is on, and its file scanned;
-//! * any other signed program (a backup tool, a password manager importing):
-//!   reported for review, never stopped.
+//! * the browser or app itself, another program signed by a browser maker,
+//!   or one of Windows' own readers (search, Defender, Explorer, backup):
+//!   nothing;
+//! * a script host or a Windows tool that copies or sends files
+//!   (PowerShell, `curl`, `esentutl`, `robocopy`, Python…), or an unsigned
+//!   program: **high**, stopped at once when automatic stopping is on, and
+//!   its file scanned;
+//! * any other signed program, Microsoft's other programs included (a backup
+//!   tool, a password manager importing): reported for review, never
+//!   stopped.
 //!
 //! A stealer has usually copied the file by the time the event arrives
 //! (about 100 ms); stopping it then still keeps it from sending what it
@@ -33,9 +41,10 @@ use crate::store::{ScanMeta, ScanStats, Store};
 use crate::trust::{self, Trust};
 use crate::{Category, Finding, Source};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// Without the event session, how often it is tried again.
@@ -44,6 +53,8 @@ const RETRY: Duration = Duration::from_secs(60);
 const GATHER: Duration = Duration::from_millis(400);
 /// A signed program is reported at most this often per browser.
 const REVIEW_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How often Windows is asked whether it dropped events.
+const LOST_CHECK: Duration = Duration::from_secs(60);
 /// Kept judgements and signatures, at most.
 const MAX_CACHED: usize = 2_000;
 
@@ -59,10 +70,15 @@ pub enum Level {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuardKind {
-    /// A program opened a browser's password, cookie or key file.
+    /// A program opened a browser's (or app's) password, cookie or key file.
     DataRead,
-    /// A browser was started for remote control with an existing profile.
+    /// A browser was started for remote control with an existing profile,
+    /// or with an extension loaded from a folder users can write to.
     RemoteControl,
+    /// An unsigned DLL was loaded into a browser.
+    Injected,
+    /// A program opened a browser with rights to read or change its memory.
+    MemoryRead,
 }
 
 /// The program that started a remote-controlled browser.
@@ -79,6 +95,8 @@ pub struct Controller {
 pub struct BrowserHit {
     pub kind: GuardKind,
     pub level: Level,
+    /// The process concerned: the reader (a data or memory read), or the
+    /// browser (remote control, injected code).
     pub pid: u32,
     /// Creation time, so the process can be stopped later without
     /// mistaking a reused id; 0 when it exited before it was identified.
@@ -89,11 +107,11 @@ pub struct BrowserHit {
     pub image: PathBuf,
     /// Who signed it, when it is signed.
     pub signer: Option<String>,
-    /// `Chrome`, `Edge`, `Firefox`…
+    /// `Chrome`, `Edge`, `Firefox`, `Discord`…
     pub browser: String,
     /// What it reached, in plain words ("saved passwords").
     pub data: Vec<String>,
-    /// The files it opened (a data read).
+    /// The files it opened (a data read), or the DLL loaded (injected code).
     pub files: Vec<PathBuf>,
     /// The switches it was started with (remote control).
     pub switches: Vec<String>,
@@ -112,10 +130,18 @@ impl BrowserHit {
     pub fn headline(&self) -> String {
         match self.kind {
             GuardKind::DataRead => format!("{} opened {}'s {}", self.program, self.browser, join(&self.data)),
+            GuardKind::RemoteControl if !self.switches.iter().any(|s| s.starts_with("--remote-debugging")) => {
+                format!("{} was started with an extension loaded from a folder any program can write to", self.browser)
+            }
             GuardKind::RemoteControl => match &self.controller {
                 Some(c) => format!("{} started {} for remote control with your profile", c.program, self.browser),
                 None => format!("{} was started for remote control with your profile", self.browser),
             },
+            GuardKind::Injected => {
+                let dll = self.files.first().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                format!("An unsigned {dll} was loaded into {}", self.browser)
+            }
+            GuardKind::MemoryRead => format!("{} opened {} to read its memory, where signed-in sessions are kept", self.program, self.browser),
         }
     }
 
@@ -129,7 +155,7 @@ impl BrowserHit {
             (Some(Ok(())), _) => "program stopped".to_string(),
             (Some(Err(e)), _) => format!("could not stop it: {e}"),
             (None, Level::High) => "reported (automatic stopping is off)".into(),
-            (None, Level::Review) => "reported (signed program; not stopped)".into(),
+            (None, Level::Review) => "reported (not stopped)".into(),
         };
         if let Some(Controller { program, stopped: Some(result), .. }) = &self.controller {
             match result {
@@ -149,20 +175,31 @@ fn join(items: &[String]) -> String {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
     Chromium,
     Firefox,
 }
 
-/// A browser's data file: which browser, and what it holds.
+/// Whose a data file is: a browser's, or an app's (whose own programs, by
+/// name prefix or signer, may read it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Secret {
-    pub browser: &'static str,
-    pub data: &'static str,
+pub enum Owner {
+    Browser,
+    App { programs: &'static [&'static str], signers: &'static [&'static str] },
 }
 
-/// Browser data folders (as they appear in a path) and the browser's name.
+/// A data file stealers take: whose it is, and what it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Secret {
+    /// The browser's or app's name.
+    pub browser: &'static str,
+    pub data: &'static str,
+    pub owner: Owner,
+}
+
+/// Browser data folders (lowercase, as they appear in a path) and the
+/// browser's name.
 const BROWSER_FOLDERS: &[(&str, Family, &str)] = &[
     (r"\google\chrome", Family::Chromium, "Chrome"),
     (r"\microsoft\edge", Family::Chromium, "Edge"),
@@ -172,42 +209,80 @@ const BROWSER_FOLDERS: &[(&str, Family, &str)] = &[
     (r"\yandex\yandexbrowser\", Family::Chromium, "Yandex Browser"),
     (r"\chromium\", Family::Chromium, "Chromium"),
     (r"\mozilla\firefox\", Family::Firefox, "Firefox"),
+    (r"\firefoxportable\", Family::Firefox, "Firefox"),
     (r"\waterfox\", Family::Firefox, "Waterfox"),
     (r"\librewolf\", Family::Firefox, "LibreWolf"),
     (r"\thunderbird\", Family::Firefox, "Thunderbird"),
 ];
 
-/// Whether `path` (a drive or NT path, any case) is a browser's password,
-/// cookie, card or key file. Called for every file opened on the PC, so the
-/// file name is checked first and the rest only for the few that match.
+/// An app whose sign-in data or wallet keys stealers take: the folder (in
+/// AppData, lowercase), the app, what it holds, and the app's own programs
+/// (file-name prefixes) and signers.
+type AppFolder = (&'static str, &'static str, &'static str, &'static [&'static str], &'static [&'static str]);
+
+const APP_FOLDERS: &[AppFolder] = &[
+    (r"\appdata\roaming\discord\local storage\leveldb\", "Discord", "sign-in token", &["discord"], &["Discord"]),
+    (r"\appdata\roaming\discordcanary\local storage\leveldb\", "Discord", "sign-in token", &["discord"], &["Discord"]),
+    (r"\appdata\roaming\discordptb\local storage\leveldb\", "Discord", "sign-in token", &["discord"], &["Discord"]),
+    (r"\appdata\roaming\telegram desktop\tdata\", "Telegram", "sign-in session", &["telegram"], &["Telegram"]),
+    (r"\appdata\roaming\exodus\exodus.wallet\", "Exodus", "crypto wallet", &["exodus"], &["Exodus"]),
+    (r"\appdata\roaming\electrum\wallets\", "Electrum", "crypto wallet", &["electrum"], &["Electrum"]),
+    (r"\appdata\roaming\atomic\local storage\leveldb\", "Atomic Wallet", "crypto wallet", &["atomic"], &["Atomic"]),
+    (r"\appdata\roaming\ledger live\", "Ledger Live", "crypto wallet data", &["ledger"], &["Ledger"]),
+    (r"\appdata\roaming\ethereum\keystore\", "Ethereum", "crypto wallet keys", &["geth"], &[]),
+];
+
+/// Whether `path` (a drive or NT path, any case) is a file stealers take.
+/// Called for every file opened on the PC: the browser files are told by
+/// name first, and the path is lowercased once for the few folder checks.
 pub fn secret(path: &str) -> Option<Secret> {
     let name = path.rsplit(['\\', '/']).next()?;
     let is = |n: &str| name.eq_ignore_ascii_case(n);
-    let (family, data) = if is("Login Data") || is("Login Data For Account") {
-        (Family::Chromium, "saved passwords")
+    let browser_file = if is("Login Data") || is("Login Data For Account") {
+        Some((Family::Chromium, "saved passwords"))
     } else if is("Cookies") {
-        (Family::Chromium, "sign-in cookies")
+        Some((Family::Chromium, "sign-in cookies"))
     } else if is("Web Data") {
-        (Family::Chromium, "saved cards and addresses")
+        Some((Family::Chromium, "saved cards and addresses"))
     } else if is("Local State") {
-        (Family::Chromium, "key that unlocks saved passwords and cookies")
+        Some((Family::Chromium, "key that unlocks saved passwords and cookies"))
     } else if is("logins.json") {
-        (Family::Firefox, "saved passwords")
+        Some((Family::Firefox, "saved passwords"))
     } else if is("key4.db") || is("key3.db") {
-        (Family::Firefox, "key that unlocks saved passwords")
+        Some((Family::Firefox, "key that unlocks saved passwords"))
     } else if is("cookies.sqlite") {
-        (Family::Firefox, "sign-in cookies")
-    } else if leveldb_file(name) && contains(path, r"\Local Extension Settings\") {
-        (Family::Chromium, "extension data, such as crypto wallets")
+        Some((Family::Firefox, "sign-in cookies"))
     } else {
-        return None;
+        None
     };
-    if !contains(path, r"\AppData\") {
+    let lower = path.to_ascii_lowercase();
+    if let Some((family, data)) = browser_file {
+        let in_appdata = lower.contains(r"\appdata\");
+        let browser = BROWSER_FOLDERS
+            .iter()
+            .find(|(folder, f, _)| *f == family && lower.contains(folder) && (in_appdata || folder.ends_with("portable\\")))
+            .map(|(_, _, name)| *name)
+            // A Chromium profile anywhere (portable browsers, profiles on
+            // another drive) has a `User Data` folder.
+            .or_else(|| (family == Family::Chromium && lower.contains(r"\user data\")).then_some("a Chromium-based browser"))?;
+        return Some(Secret { browser, data, owner: Owner::Browser });
+    }
+    if !lower.contains(r"\appdata\") {
         return None;
     }
-    let browser = BROWSER_FOLDERS.iter().find(|(folder, f, _)| *f == family && contains(path, folder)).map(|(_, _, name)| *name);
-    let browser = browser.or_else(|| (family == Family::Chromium && contains(path, r"\User Data\")).then_some("a Chromium-based browser"))?;
-    Some(Secret { browser, data })
+    if leveldb_file(name) && lower.contains(r"\local extension settings\") {
+        let browser = BROWSER_FOLDERS.iter().find(|(folder, f, _)| *f == Family::Chromium && lower.contains(folder)).map_or("a Chromium-based browser", |(_, _, n)| *n);
+        return Some(Secret { browser, data: "extension data, such as crypto wallets", owner: Owner::Browser });
+    }
+    if is("wallet.dat") {
+        let wallets: &[&str] = &["bitcoin", "litecoin", "dogecoin", "dash"];
+        return Some(Secret { browser: "a crypto wallet app", data: "crypto wallet", owner: Owner::App { programs: wallets, signers: &[] } });
+    }
+    APP_FOLDERS.iter().find(|(folder, ..)| lower.contains(folder)).map(|(_, app, data, programs, signers)| Secret {
+        browser: app,
+        data,
+        owner: Owner::App { programs, signers },
+    })
 }
 
 /// The file filter for the event session.
@@ -226,60 +301,171 @@ fn contains(haystack: &str, needle: &str) -> bool {
     h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-/// Script hosts and Windows tools: signed, but what they do is up to whoever
-/// runs them, and stealers run them to read browser files.
+/// Script hosts, and Windows tools that copy, pack or send files: signed,
+/// but what they do is up to whoever runs them, and stealers run them to
+/// copy or upload browser files.
 const TOOLS: &[&str] = &[
     "powershell.exe", "pwsh.exe", "powershell_ise.exe", "cmd.exe", "wscript.exe", "cscript.exe", "mshta.exe", "rundll32.exe",
     "regsvr32.exe", "esentutl.exe", "certutil.exe", "msbuild.exe", "installutil.exe", "regasm.exe", "regsvcs.exe", "wmic.exe",
+    "curl.exe", "tar.exe", "robocopy.exe", "xcopy.exe", "expand.exe", "makecab.exe", "bitsadmin.exe", "ftp.exe", "scp.exe",
+    "sftp.exe", "certreq.exe", "forfiles.exe", "conhost.exe", "msxsl.exe", "odbcconf.exe", "cmstp.exe", "diskshadow.exe",
     "python.exe", "pythonw.exe", "py.exe", "node.exe", "autoit3.exe", "autohotkey.exe", "java.exe", "javaw.exe",
 ];
 
-/// Signers whose programs may read browser data: browser makers (their
-/// browsers, updaters and helpers) and Microsoft (Windows' search, Defender
-/// and backup, Edge importing from Chrome). Matched as part of the name.
-const BROWSER_MAKERS: &[&str] = &["Google", "Microsoft", "Brave Software", "Opera Norway", "Vivaldi Technologies", "Mozilla", "YANDEX"];
+/// Microsoft's programs with a reason to open browser data: Windows Search,
+/// Defender, Explorer, backup and sync, and Edge's (Edge importing from
+/// Chrome). Other Microsoft programs are reported for review.
+const MICROSOFT_READERS: &[&str] = &[
+    "explorer.exe", "searchprotocolhost.exe", "searchindexer.exe", "searchfilterhost.exe", "msmpeng.exe",
+    "mpdefendercoreservice.exe", "nissrv.exe", "mpcmdrun.exe", "svchost.exe", "filehistory.exe", "wbengine.exe",
+    "onedrive.exe", "dllhost.exe", "backgroundtaskhost.exe", "msedge.exe", "msedgewebview2.exe", "identity_helper.exe",
+    "elevation_service.exe",
+];
 
-/// Chromium browsers' program names: the ones remote control is checked on.
+/// Signers of browsers other than Microsoft's, whose programs (browsers,
+/// updaters, helpers) may read browser data.
+const BROWSER_MAKERS: &[&str] = &["Google", "Brave Software", "Opera Norway", "Vivaldi Technologies", "Mozilla", "YANDEX"];
+
+/// Chromium browsers' program names: the ones started for remote control.
 const CHROMIUM_BROWSERS: &[&str] = &["chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe", "browser.exe", "chromium.exe"];
+/// Every browser whose loaded DLLs and memory are watched.
+const BROWSERS: &[&str] = &[
+    "chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe", "browser.exe", "chromium.exe", "firefox.exe",
+    "waterfox.exe", "librewolf.exe",
+];
 
-/// Whether `image` may read browser data and, if not, how sure it is to be
-/// a stealer and why. `own_dir` is Phalanx's folder (its browser checks
-/// read these files too); `allowed` the programs people allowed.
-pub fn judge(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: Option<&Path>) -> Option<(Level, String)> {
-    let same = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
-    if allowed.iter().any(|a| same(a, image)) || own_dir.is_some_and(|dir| image.parent().is_some_and(|p| same(p, dir))) {
-        return None;
-    }
-    let name = image.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if TOOLS.contains(&name.as_str()) {
-        return Some((Level::High, "it is a script host or Windows tool, which stealers use to copy browser files".into()));
-    }
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+}
+
+fn allowed_here(image: &Path, allowed: &[PathBuf], own_dir: Option<&Path>) -> bool {
+    allowed.iter().any(|a| same_path(a, image)) || own_dir.is_some_and(|dir| image.parent().is_some_and(|p| same_path(p, dir)))
+}
+
+fn file_name(image: &Path) -> String {
+    image.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
+}
+
+/// Why an unsigned program is high, or `None` when it is signed.
+fn unsigned_reason(trust: &Trust) -> Option<String> {
     match trust {
-        Trust::Signed { signer, .. } => {
-            let signer = signer.as_deref().unwrap_or("an unnamed publisher");
-            if BROWSER_MAKERS.iter().any(|maker| contains(signer, maker)) {
-                return None;
-            }
-            Some((Level::Review, format!("it is signed by {signer}; a backup tool or password manager may do this, so it was only reported")))
-        }
-        Trust::Unsigned => Some((Level::High, "it is not digitally signed".into())),
-        Trust::Tampered => Some((Level::High, "it was changed after it was signed".into())),
-        Trust::Invalid(why) => Some((Level::High, format!("its signature does not verify ({why})"))),
-        Trust::Unknown(why) => Some((Level::High, format!("its signature could not be checked ({why})"))),
+        Trust::Signed { .. } => None,
+        Trust::Unsigned => Some("it is not digitally signed".into()),
+        Trust::Tampered => Some("it was changed after it was signed".into()),
+        Trust::Invalid(why) => Some(format!("its signature does not verify ({why})")),
+        Trust::Unknown(why) => Some(format!("its signature could not be checked ({why})")),
     }
 }
 
-/// Whether a browser's command line starts it for remote control with an
-/// existing profile, and how sure that is a hijack: high when it was also
-/// hidden (headless or off screen). The browser's own child processes, and
-/// automation with a fresh profile (how developers test), are left alone.
-/// `existing_profile` says whether a profile folder already has data.
-pub fn remote_control(command: &str, existing_profile: impl Fn(&Path) -> bool) -> Option<(Level, Vec<String>)> {
-    if contains(command, "--type=") || !(contains(command, "--remote-debugging-port") || contains(command, "--remote-debugging-pipe")) {
+/// Whether `image` may open `secret` and, if not, how sure it is to be a
+/// stealer and why. `own_dir` is Phalanx's folder (its browser checks read
+/// these files too); `allowed` the programs people allowed.
+pub fn judge(image: &Path, trust: &Trust, secret: &Secret, allowed: &[PathBuf], own_dir: Option<&Path>) -> Option<(Level, String)> {
+    if allowed_here(image, allowed, own_dir) {
         return None;
     }
-    let profile = switch_value(command, "--user-data-dir");
-    let real = match &profile {
+    let name = file_name(image);
+    if TOOLS.contains(&name.as_str()) {
+        return Some((Level::High, "it is a script host or a Windows tool that copies or sends files, which stealers use".into()));
+    }
+    let signer = match trust {
+        Trust::Signed { signer, .. } => Some(signer.as_deref().unwrap_or("an unnamed publisher")),
+        _ => None,
+    };
+    if let Owner::App { programs, signers } = secret.owner {
+        let named_like = programs.iter().any(|p| name.starts_with(p));
+        if signer.is_some_and(|s| named_like || signers.iter().any(|x| contains(s, x))) {
+            return None;
+        }
+        if named_like {
+            return Some((Level::Review, format!("it is named like {}'s own program but is not signed, so it was only reported", secret.browser)));
+        }
+    }
+    match signer {
+        Some(s) if contains(s, "Microsoft") => {
+            let lower = image.to_string_lossy().to_lowercase();
+            if MICROSOFT_READERS.contains(&name.as_str()) || lower.contains(r"\microsoft\edge") {
+                return None;
+            }
+            Some((Level::Review, format!("it is a Microsoft program ({name}) with no usual reason to open this, so it was only reported")))
+        }
+        Some(s) if secret.owner == Owner::Browser && BROWSER_MAKERS.iter().any(|m| contains(s, m)) => None,
+        Some(s) => Some((Level::Review, format!("it is signed by {s}; a backup tool or password manager may do this, so it was only reported"))),
+        None => unsigned_reason(trust).map(|why| (Level::High, why)),
+    }
+}
+
+/// Whether `image` may open a browser with rights to read its memory.
+/// Windows' own programs (crash reporting, Task Manager, Defender) and the
+/// browsers themselves do; script hosts and unsigned programs should not.
+pub fn judge_memory(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: Option<&Path>) -> Option<(Level, String)> {
+    if allowed_here(image, allowed, own_dir) {
+        return None;
+    }
+    if TOOLS.contains(&file_name(image).as_str()) {
+        return Some((Level::High, "it is a script host or Windows tool, which cookie-stealing tools run in".into()));
+    }
+    match trust {
+        Trust::Signed { signer, .. } => {
+            let s = signer.as_deref().unwrap_or("an unnamed publisher");
+            if contains(s, "Microsoft") || BROWSER_MAKERS.iter().any(|m| contains(s, m)) {
+                return None;
+            }
+            Some((Level::Review, format!("it is signed by {s}; security and monitoring tools may do this, so it was only reported")))
+        }
+        _ => unsigned_reason(trust).map(|why| (Level::High, format!("{why}; reading a browser's memory gets its sign-in cookies without touching its files"))),
+    }
+}
+
+/// Folders only administrators can change, lowercase with a trailing `\`
+/// (Windows' own and Program Files). `C:\Windows\Temp` is not one.
+fn protected_folders() -> Vec<String> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let program_files = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().filter_map(|v| std::env::var(v).ok());
+    std::iter::once(root).chain(program_files).map(|p| format!("{}\\", p.trim_end_matches('\\').to_lowercase())).collect()
+}
+
+fn is_protected(path: &Path, protected: &[String]) -> bool {
+    let lower = path.to_string_lossy().to_lowercase();
+    protected.iter().any(|p| lower.starts_with(p.as_str())) && !lower.contains(r"\windows\temp\")
+}
+
+/// How serious an unsigned DLL loaded into a browser is: high from folders
+/// where downloads and droppers land, review from anywhere else outside
+/// the protected folders. `None` for a signed DLL.
+pub fn judge_dll(dll: &Path, trust: &Trust) -> Option<(Level, String)> {
+    let why = unsigned_reason(trust)?;
+    let lower = dll.to_string_lossy().to_lowercase();
+    let dropped = [r"\temp\", r"\downloads\", r"\users\public\", r"\appdata\local\temp\"].iter().any(|f| lower.contains(f));
+    Some(if dropped {
+        (Level::High, format!("{why} and it came from a folder where downloads and droppers land; code inside the browser can take its sign-in cookies"))
+    } else {
+        (Level::Review, format!("{why}; code inside the browser can take its sign-in cookies, but some apps add plugins this way, so it was only reported"))
+    })
+}
+
+/// A browser start worth an alert: what it was started with and how sure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    pub level: Level,
+    pub switches: Vec<String>,
+    /// Remote debugging on an existing profile.
+    pub debugging: bool,
+    /// An extension loaded from a folder users can write to.
+    pub extension: Option<String>,
+}
+
+/// Whether a browser's command line starts it for remote control with an
+/// existing profile, or loads an extension from a folder users can write
+/// to, and how sure that is a hijack: high when it was also hidden
+/// (headless or off screen). The browser's own child processes, and
+/// automation with a fresh profile (how developers test), are left alone.
+/// `existing_profile` says whether a profile folder already has data.
+pub fn launch(command: &str, existing_profile: impl Fn(&Path) -> bool) -> Option<Launch> {
+    if contains(command, "--type=") {
+        return None;
+    }
+    let real_profile = || match switch_value(command, "--user-data-dir") {
         None => true,
         Some(dir) => {
             let dir = dir.trim_end_matches(['\\', '/']);
@@ -287,18 +473,24 @@ pub fn remote_control(command: &str, existing_profile: impl Fn(&Path) -> bool) -
             lower.ends_with(r"\user data") || lower.ends_with(r"\opera stable") || existing_profile(Path::new(dir))
         }
     };
-    if !real {
+    let debugging = (contains(command, "--remote-debugging-port") || contains(command, "--remote-debugging-pipe")) && real_profile();
+    let extension = switch_value(command, "--load-extension")
+        .filter(|list| list.split(',').any(|p| !p.trim().to_lowercase().contains(r"\program files")));
+    if !debugging && extension.is_none() {
         return None;
     }
     let off_screen = switch_value(command, "--window-position")
         .is_some_and(|pos| pos.split(',').any(|n| n.trim().parse::<i64>().is_ok_and(|n| n <= -1000)));
     let hidden = contains(command, "--headless") || contains(command, "--no-startup-window") || off_screen;
-    let switches = ["--remote-debugging-port", "--remote-debugging-pipe", "--remote-allow-origins", "--headless", "--no-startup-window", "--window-position", "--user-data-dir"]
-        .iter()
-        .filter(|s| contains(command, s))
-        .map(|s| s.to_string())
-        .collect();
-    Some((if hidden { Level::High } else { Level::Review }, switches))
+    let switches = [
+        "--remote-debugging-port", "--remote-debugging-pipe", "--remote-allow-origins", "--load-extension", "--headless",
+        "--no-startup-window", "--window-position", "--user-data-dir",
+    ]
+    .iter()
+    .filter(|s| contains(command, s))
+    .map(|s| s.to_string())
+    .collect();
+    Some(Launch { level: if hidden { Level::High } else { Level::Review }, switches, debugging, extension })
 }
 
 /// The value of `--name=value` in a command line, quoted or not.
@@ -328,10 +520,18 @@ struct Watch<'a, 'c> {
     store: &'a Store,
     urgent: &'a Sender<Item>,
     own_dir: Option<PathBuf>,
+    protected: Vec<String>,
+    /// Browsers running, by id: the session reports their DLL loads and
+    /// who opens them.
+    browsers: etw::Watched,
     /// Processes started since the session began, by id.
     live: HashMap<u32, ProcessInfo>,
     /// Each process is judged once, when it first opens a file.
     judged: HashMap<ProcessId, bool>,
+    /// …and once when it first opens a browser's memory.
+    judged_memory: HashSet<ProcessId>,
+    /// DLLs already looked at, per browser process.
+    dlls: HashSet<(u32, PathBuf)>,
     signatures: HashMap<PathBuf, Trust>,
     /// Signed programs reported, by program and browser.
     reviewed: HashMap<(PathBuf, String), Instant>,
@@ -348,8 +548,12 @@ pub(super) fn run(ctx: &Ctx<'_>, store: &Store, urgent: &Sender<Item>) -> anyhow
         store,
         urgent,
         own_dir,
+        protected: protected_folders(),
+        browsers: Arc::new(RwLock::new(HashSet::new())),
         live: HashMap::new(),
         judged: HashMap::new(),
+        judged_memory: HashSet::new(),
+        dlls: HashSet::new(),
         signatures: HashMap::new(),
         reviewed: HashMap::new(),
         pending: Vec::new(),
@@ -357,7 +561,8 @@ pub(super) fn run(ctx: &Ctx<'_>, store: &Store, urgent: &Sender<Item>) -> anyhow
     let mut announced = None;
     while !ctx.halted() {
         let (tx, rx) = mpsc::channel();
-        let session = match etw::start_file_opens(&format!("{} browser data", etw::session_name()), wanted, tx) {
+        let name = format!("{} browser data", etw::session_name());
+        let session = match etw::start_file_opens(&name, wanted, Arc::clone(&watch.browsers), tx) {
             Ok(session) => session,
             Err(e) => {
                 let reason = if e.raw_os_error() == Some(5) { "it needs administrator rights".to_string() } else { e.to_string() };
@@ -369,25 +574,45 @@ pub(super) fn run(ctx: &Ctx<'_>, store: &Store, urgent: &Sender<Item>) -> anyhow
                 continue;
             }
         };
+        // Browsers already running; those that start are added as they do.
+        watch.seed_browsers();
         ctx.emit(RtpEvent::BrowserGuard { active: true, reason: None });
         announced = Some(None);
+        let (mut lost, mut lost_checked) = (session.events_lost().unwrap_or(0), Instant::now());
         while !ctx.halted() {
             let wait = watch.pending.iter().map(|(_, due)| due.saturating_duration_since(Instant::now())).min().unwrap_or(Duration::from_millis(500));
             match rx.recv_timeout(wait.min(Duration::from_millis(500))) {
                 Ok(etw::Event::Started(info)) => {
+                    if BROWSERS.contains(&info.name.to_lowercase().as_str()) {
+                        watch.browsers.write().unwrap_or_else(PoisonError::into_inner).insert(info.id.pid);
+                    }
                     watch.live.insert(info.id.pid, info.clone());
                     watch.started(&info);
                 }
                 Ok(etw::Event::Stopped { pid }) => {
+                    watch.browsers.write().unwrap_or_else(PoisonError::into_inner).remove(&pid);
                     watch.live.remove(&pid);
                     watch.judged.retain(|id, _| id.pid != pid);
+                    watch.judged_memory.retain(|id| id.pid != pid);
+                    watch.dlls.retain(|(p, _)| *p != pid);
                 }
                 Ok(etw::Event::FileOpened { pid, path }) => watch.opened(pid, path),
-                Ok(etw::Event::ImageLoaded { .. }) => {}
+                Ok(etw::Event::ImageLoaded { pid, image }) => watch.loaded(pid, image),
+                Ok(etw::Event::ProcessOpened { pid, target, .. }) => watch.memory_opened(pid, target),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             watch.flush(false);
+            if lost_checked.elapsed() >= LOST_CHECK {
+                lost_checked = Instant::now();
+                if let Some(now) = session.events_lost() && now > lost {
+                    ctx.emit(RtpEvent::Error(format!(
+                        "the browser data watch missed {} events in the last minute: the disk was very busy and Windows' event buffers were full. Programs opening browser data then may have gone unseen.",
+                        now - lost
+                    )));
+                    lost = now;
+                }
+            }
         }
         watch.flush(true);
         drop(session);
@@ -417,6 +642,35 @@ impl Watch<'_, '_> {
         Some(ProcessInfo { id: ProcessId { pid, created }, name, image, parent: 0 })
     }
 
+    fn seed_browsers(&mut self) {
+        let Ok(listed) = process::listed() else { return };
+        let mut browsers = self.browsers.write().unwrap_or_else(PoisonError::into_inner);
+        browsers.clear();
+        browsers.extend(listed.iter().filter(|p| BROWSERS.contains(&p.name.to_lowercase().as_str())).map(|p| p.pid));
+    }
+
+    fn is_browser(&self, pid: u32) -> bool {
+        self.browsers.read().unwrap_or_else(PoisonError::into_inner).contains(&pid)
+    }
+
+    /// A signed program already reported for this browser within the hour
+    /// is not reported again.
+    fn reviewed_lately(&mut self, image: &Path, what: &str) -> bool {
+        let key = (image.to_path_buf(), what.to_string());
+        if self.reviewed.get(&key).is_some_and(|t| t.elapsed() < REVIEW_EVERY) {
+            return true;
+        }
+        self.reviewed.insert(key, Instant::now());
+        false
+    }
+
+    fn signer(trust: &Trust) -> Option<String> {
+        match trust {
+            Trust::Signed { signer, .. } => signer.clone(),
+            _ => None,
+        }
+    }
+
     fn opened(&mut self, pid: u32, path: PathBuf) {
         let Some(secret) = secret(&path.to_string_lossy()) else { return };
         // More files from a program already caught join its alert.
@@ -444,23 +698,15 @@ impl Watch<'_, '_> {
         let (level, reason, signer) = match &info {
             Some(info) => {
                 let trust = self.trust(&info.image);
-                let verdict = judge(&info.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref());
+                let verdict = judge(&info.image, &trust, &secret, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref());
                 self.judged.insert(info.id.clone(), verdict.is_some());
                 let Some((level, reason)) = verdict else { return };
-                let signer = match trust {
-                    Trust::Signed { signer, .. } => signer,
-                    _ => None,
-                };
-                (level, reason, signer)
+                (level, reason, Self::signer(&trust))
             }
             None => (Level::High, "it exited before it could be identified".to_string(), None),
         };
-        if level == Level::Review && let Some(info) = &info {
-            let key = (info.image.clone(), secret.browser.to_string());
-            if self.reviewed.get(&key).is_some_and(|t| t.elapsed() < REVIEW_EVERY) {
-                return;
-            }
-            self.reviewed.insert(key, Instant::now());
+        if level == Level::Review && let Some(info) = &info && self.reviewed_lately(&info.image, secret.browser) {
+            return;
         }
         // Where it is connected, read before it is stopped.
         let connections = net::connections(pid).iter().map(ToString::to_string).collect();
@@ -489,31 +735,121 @@ impl Watch<'_, '_> {
         self.pending.push((hit, Instant::now() + GATHER));
     }
 
+    /// A DLL loaded into a browser: an unsigned one from outside the
+    /// protected folders is reported, and the browser process it runs in
+    /// stopped when it came from where downloads land.
+    fn loaded(&mut self, pid: u32, dll: PathBuf) {
+        if !self.is_browser(pid) || is_protected(&dll, &self.protected) || !self.dlls.insert((pid, dll.clone())) {
+            return;
+        }
+        if self.dlls.len() > MAX_CACHED * 10 {
+            self.dlls.clear();
+        }
+        let trust = self.trust(&dll);
+        let Some((level, reason)) = judge_dll(&dll, &trust) else { return };
+        let Some(info) = self.info(pid) else { return };
+        if allowed_here(&dll, &self.ctx.config.browser_guard_allowed, None) {
+            return;
+        }
+        if level == Level::Review && self.reviewed_lately(&dll, "injected") {
+            return;
+        }
+        let stop = level == Level::High && self.ctx.config.browser_guard_stop;
+        let _ = self.urgent.send(Item::File { path: dll.clone(), announced: false });
+        let browser_trust = self.trust(&info.image);
+        let hit = BrowserHit {
+            kind: GuardKind::Injected,
+            level,
+            pid,
+            created: info.id.created,
+            program: info.name.clone(),
+            image: info.image.clone(),
+            signer: Self::signer(&browser_trust),
+            browser: browser_name(&info.name).into(),
+            data: vec!["signed-in sessions".into()],
+            files: vec![dll],
+            switches: Vec::new(),
+            reason,
+            connections: net::connections(pid).iter().map(ToString::to_string).collect(),
+            stopped: stop.then(|| process::terminate(&info.id)),
+            controller: None,
+        };
+        self.report(hit);
+    }
+
+    /// A program opened a browser with rights to read its memory.
+    fn memory_opened(&mut self, pid: u32, target: u32) {
+        // Browsers open their own processes all the time.
+        if self.is_browser(pid) {
+            return;
+        }
+        let Some(reader) = self.info(pid) else { return };
+        if !self.judged_memory.insert(reader.id.clone()) {
+            return;
+        }
+        if self.judged_memory.len() > MAX_CACHED {
+            self.judged_memory.clear();
+        }
+        let trust = self.trust(&reader.image);
+        let Some((level, reason)) = judge_memory(&reader.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref()) else { return };
+        if level == Level::Review && self.reviewed_lately(&reader.image, "memory") {
+            return;
+        }
+        let browser = self.info(target).map_or("a browser", |b| browser_name(&b.name));
+        let connections = net::connections(pid).iter().map(ToString::to_string).collect();
+        let stop = level == Level::High && self.ctx.config.browser_guard_stop;
+        if level == Level::High {
+            let _ = self.urgent.send(Item::File { path: reader.image.clone(), announced: false });
+        }
+        let hit = BrowserHit {
+            kind: GuardKind::MemoryRead,
+            level,
+            pid,
+            created: reader.id.created,
+            program: reader.name.clone(),
+            image: reader.image.clone(),
+            signer: Self::signer(&trust),
+            browser: browser.into(),
+            data: vec!["signed-in sessions in its memory".into()],
+            files: Vec::new(),
+            switches: Vec::new(),
+            reason,
+            connections,
+            stopped: stop.then(|| process::terminate(&reader.id)),
+            controller: None,
+        };
+        self.report(hit);
+    }
+
     /// A process started: a Chromium browser started for remote control
-    /// with an existing profile is reported, and stopped when hidden.
+    /// with an existing profile, or with an extension from a folder users
+    /// can write to, is reported, and stopped when hidden.
     fn started(&mut self, info: &ProcessInfo) {
         if !CHROMIUM_BROWSERS.contains(&info.name.to_lowercase().as_str()) {
             return;
         }
         let Some(command) = process::command_line(&info.id) else { return };
-        let Some((level, switches)) = remote_control(&command, profile_in_use) else { return };
+        let Some(launch) = launch(&command, profile_in_use) else { return };
+        let level = launch.level;
         let stop = level == Level::High && self.ctx.config.browser_guard_stop;
         // The program that started it, when it is not a browser itself.
         let parent = self.info(info.parent).filter(|p| !CHROMIUM_BROWSERS.contains(&p.name.to_lowercase().as_str()));
         let controller = parent.map(|p| {
             let trust = self.trust(&p.image);
-            let suspect = judge(&p.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref()).is_some_and(|(l, _)| l == Level::High);
+            let any = Secret { browser: "", data: "", owner: Owner::Browser };
+            let suspect = judge(&p.image, &trust, &any, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref()).is_some_and(|(l, _)| l == Level::High);
             let stopped = (stop && suspect).then(|| process::terminate(&p.id));
             if suspect {
                 let _ = self.urgent.send(Item::File { path: p.image.clone(), announced: false });
             }
             Controller { pid: p.id.pid, program: p.name, image: p.image, stopped }
         });
-        let reason = match level {
-            Level::High => "it was hidden (headless or off screen), so whoever started it can read your signed-in sites, email included, without you seeing".to_string(),
-            Level::Review => "remote debugging lets another program read and act on your signed-in sites; developers use it, but so do stealers".to_string(),
+        let reason = match (level, launch.debugging) {
+            (Level::High, true) => "it was hidden (headless or off screen), so whoever started it can read your signed-in sites, email included, without you seeing".to_string(),
+            (Level::Review, true) => "remote debugging lets another program read and act on your signed-in sites; developers use it, but so do stealers".to_string(),
+            (Level::High, false) => format!("it was hidden and loaded an extension from {}; an extension can read every signed-in site", launch.extension.unwrap_or_default()),
+            (Level::Review, false) => format!("it loaded an extension from {}; an extension can read every signed-in site, so check you added it", launch.extension.unwrap_or_default()),
         };
-        let browser = browser_name(&info.name);
         let trust = self.trust(&info.image);
         let hit = BrowserHit {
             kind: GuardKind::RemoteControl,
@@ -522,14 +858,11 @@ impl Watch<'_, '_> {
             created: info.id.created,
             program: info.name.clone(),
             image: info.image.clone(),
-            signer: match trust {
-                Trust::Signed { signer, .. } => signer,
-                _ => None,
-            },
-            browser: browser.into(),
+            signer: Self::signer(&trust),
+            browser: browser_name(&info.name).into(),
             data: vec!["signed-in sites".into()],
             files: Vec::new(),
-            switches,
+            switches: launch.switches,
             reason,
             connections: Vec::new(),
             stopped: stop.then(|| process::terminate(&info.id)),
@@ -568,6 +901,9 @@ fn browser_name(program: &str) -> &'static str {
         "opera.exe" => "Opera",
         "vivaldi.exe" => "Vivaldi",
         "browser.exe" => "Yandex Browser",
+        "firefox.exe" => "Firefox",
+        "waterfox.exe" => "Waterfox",
+        "librewolf.exe" => "LibreWolf",
         _ => "Chromium",
     }
 }
@@ -592,6 +928,8 @@ fn record(ctx: &Ctx<'_>, store: &Store, hit: &BrowserHit) -> anyhow::Result<()> 
         threat: match hit.kind {
             GuardKind::DataRead => "BrowserData.Read".into(),
             GuardKind::RemoteControl => "BrowserData.RemoteControl".into(),
+            GuardKind::Injected => "BrowserData.InjectedCode".into(),
+            GuardKind::MemoryRead => "BrowserData.MemoryRead".into(),
         },
         category: Category::Suspicious,
         source: Source::Heuristic,
@@ -604,7 +942,6 @@ fn record(ctx: &Ctx<'_>, store: &Store, hit: &BrowserHit) -> anyhow::Result<()> 
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,7 +949,7 @@ mod tests {
     const CHROME: &str = r"C:\Users\me\AppData\Local\Google\Chrome\User Data";
 
     #[test]
-    fn browser_secrets_are_recognised_by_name_and_folder() {
+    fn browser_and_app_secrets_are_recognised_by_name_and_folder() {
         let cases = [
             (format!(r"{CHROME}\Default\Login Data"), Some(("Chrome", "saved passwords"))),
             (format!(r"{CHROME}\Profile 2\Network\Cookies"), Some(("Chrome", "sign-in cookies"))),
@@ -620,16 +957,27 @@ mod tests {
             (format!(r"{CHROME}\Default\Web Data"), Some(("Chrome", "saved cards and addresses"))),
             (format!(r"{CHROME}\Default\Local Extension Settings\nkbihfbeogaeaoehlefnkodbefgpgknn\000003.log"), Some(("Chrome", "extension data, such as crypto wallets"))),
             (r"\Device\HarddiskVolume3\Users\me\AppData\Local\Microsoft\Edge\User Data\Default\login data".into(), Some(("Edge", "saved passwords"))),
+            // A shadow copy keeps its NT path; it is still Chrome's.
+            (r"\Device\HarddiskVolumeShadowCopy3\Users\me\AppData\Local\Google\Chrome\User Data\Default\Login Data".into(), Some(("Chrome", "saved passwords"))),
             (r"C:\Users\me\AppData\Roaming\Opera Software\Opera Stable\Login Data".into(), Some(("Opera", "saved passwords"))),
             (r"C:\Users\me\AppData\Local\Unknown\Thing\User Data\Default\Cookies".into(), Some(("a Chromium-based browser", "sign-in cookies"))),
+            // Profiles outside AppData: portable browsers, other drives.
+            (r"D:\Apps\ChromePortable\Data\User Data\Default\Login Data".into(), Some(("a Chromium-based browser", "saved passwords"))),
+            (r"E:\FirefoxPortable\Data\profile\logins.json".into(), Some(("Firefox", "saved passwords"))),
             (r"C:\Users\me\AppData\Roaming\Mozilla\Firefox\Profiles\x.default\logins.json".into(), Some(("Firefox", "saved passwords"))),
             (r"C:\Users\me\AppData\Roaming\Mozilla\Firefox\Profiles\x.default\key4.db".into(), Some(("Firefox", "key that unlocks saved passwords"))),
+            // Apps stealers take sign-in data and wallets from.
+            (r"C:\Users\me\AppData\Roaming\discord\Local Storage\leveldb\000005.ldb".into(), Some(("Discord", "sign-in token"))),
+            (r"C:\Users\me\AppData\Roaming\Telegram Desktop\tdata\key_datas".into(), Some(("Telegram", "sign-in session"))),
+            (r"C:\Users\me\AppData\Roaming\Exodus\exodus.wallet\seed.seco".into(), Some(("Exodus", "crypto wallet"))),
+            (r"C:\Users\me\AppData\Roaming\Bitcoin\wallets\main\wallet.dat".into(), Some(("a crypto wallet app", "crypto wallet"))),
             // Journals, Electron apps' own cookies, files elsewhere: not secrets.
             (format!(r"{CHROME}\Default\Network\Cookies-journal"), None),
             (r"C:\Users\me\AppData\Roaming\discord\Network\Cookies".into(), None),
-            (r"D:\Backup\Google\Chrome\User Data\Default\Login Data".into(), None),
             (format!(r"{CHROME}\Default\Local Storage\leveldb\000003.log"), None),
             (r"C:\Users\me\AppData\Roaming\Mozilla\Firefox\Profiles\x\Login Data".into(), None),
+            (r"D:\Projects\app\Login Data".into(), None),
+            (r"D:\Backup\Telegram Desktop\tdata\key_datas".into(), None),
         ];
         for (path, want) in cases {
             assert_eq!(secret(&path).map(|s| (s.browser, s.data)), want, "{path}");
@@ -642,14 +990,20 @@ mod tests {
 
     #[test]
     fn who_opened_the_file_decides_what_happens() {
-        let level = |image: &str, trust: Trust| judge(Path::new(image), &trust, &[], Some(Path::new(r"C:\Program Files\Phalanx"))).map(|(l, _)| l);
+        let chrome = secret(&format!(r"{CHROME}\Default\Login Data")).unwrap();
+        let level = |image: &str, trust: Trust| judge(Path::new(image), &trust, &chrome, &[], Some(Path::new(r"C:\Program Files\Phalanx"))).map(|(l, _)| l);
         assert_eq!(level(r"C:\Program Files\Google\Chrome\Application\chrome.exe", signed("Google LLC")), None);
         assert_eq!(level(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", signed("Microsoft Corporation")), None);
+        assert_eq!(level(r"C:\Program Files (x86)\Microsoft\EdgeUpdate\Install\setup.exe", signed("Microsoft Corporation")), None);
         assert_eq!(level(r"C:\Windows\System32\SearchProtocolHost.exe", signed("Microsoft Windows")), None);
         assert_eq!(level(r"C:\Program Files\Phalanx\phalanx.exe", Trust::Unsigned), None, "Phalanx's own browser checks");
-        // Signed by Microsoft, but a tool that runs whatever it is given.
+        // Signed by Microsoft, but tools that run, copy or send whatever they are given.
         assert_eq!(level(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", signed("Microsoft Windows")), Some(Level::High));
         assert_eq!(level(r"C:\Windows\System32\esentutl.exe", signed("Microsoft Windows")), Some(Level::High));
+        assert_eq!(level(r"C:\Windows\System32\curl.exe", signed("Microsoft Windows")), Some(Level::High));
+        assert_eq!(level(r"C:\Windows\System32\tar.exe", signed("Microsoft Windows")), Some(Level::High));
+        // Other Microsoft programs: reported, not trusted blindly.
+        assert_eq!(level(r"C:\Windows\System32\notepad.exe", signed("Microsoft Windows")), Some(Level::Review));
         assert_eq!(level(r"C:\Users\me\AppData\Local\Temp\x\update.exe", Trust::Unsigned), Some(Level::High));
         assert_eq!(level(r"C:\Users\me\Downloads\crack.exe", Trust::Tampered), Some(Level::High));
         assert_eq!(level(r"C:\Program Files\Backup\backup.exe", signed("Acme Backup Ltd")), Some(Level::Review));
@@ -657,13 +1011,47 @@ mod tests {
         assert_eq!(level(r"C:\Users\me\AppData\Roaming\chrome.exe", Trust::Unsigned), Some(Level::High));
 
         let allowed = [PathBuf::from(r"c:\tools\MYTOOL.exe")];
-        assert_eq!(judge(Path::new(r"C:\Tools\mytool.exe"), &Trust::Unsigned, &allowed, None), None, "allowed by the person");
+        assert_eq!(judge(Path::new(r"C:\Tools\mytool.exe"), &Trust::Unsigned, &chrome, &allowed, None), None, "allowed by the person");
     }
 
     #[test]
-    fn remote_control_of_an_existing_profile_is_caught() {
+    fn an_apps_own_programs_may_open_its_data() {
+        let discord = secret(r"C:\Users\me\AppData\Roaming\discord\Local Storage\leveldb\000005.ldb").unwrap();
+        let level = |image: &str, trust: Trust| judge(Path::new(image), &trust, &discord, &[], None).map(|(l, _)| l);
+        assert_eq!(level(r"C:\Users\me\AppData\Local\Discord\app-1.0.9\Discord.exe", signed("Discord Inc.")), None);
+        assert_eq!(level(r"C:\Users\me\AppData\Local\Discord\Update.exe", signed("Discord Inc.")), None);
+        // Named like Discord but unsigned: reported, not stopped.
+        assert_eq!(level(r"C:\Users\me\AppData\Local\Temp\discord.exe", Trust::Unsigned), Some(Level::Review));
+        // Google's programs may read Chrome's data, not Discord's.
+        assert_eq!(level(r"C:\Program Files\Google\Chrome\Application\chrome.exe", signed("Google LLC")), Some(Level::Review));
+        assert_eq!(level(r"C:\Users\me\AppData\Roaming\x\grab.exe", Trust::Unsigned), Some(Level::High));
+    }
+
+    #[test]
+    fn memory_reads_and_loaded_dlls_are_judged() {
+        let memory = |image: &str, trust: Trust| judge_memory(Path::new(image), &trust, &[], None).map(|(l, _)| l);
+        assert_eq!(memory(r"C:\Windows\System32\WerFault.exe", signed("Microsoft Windows")), None);
+        assert_eq!(memory(r"C:\Program Files\Google\Chrome\Application\chrome.exe", signed("Google LLC")), None);
+        assert_eq!(memory(r"C:\Users\me\AppData\Local\Temp\katz.exe", Trust::Unsigned), Some(Level::High));
+        assert_eq!(memory(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", signed("Microsoft Windows")), Some(Level::High));
+        assert_eq!(memory(r"C:\Program Files\Monitor\monitor.exe", signed("Acme")), Some(Level::Review));
+
+        let dll = |path: &str, trust: Trust| judge_dll(Path::new(path), &trust).map(|(l, _)| l);
+        assert_eq!(dll(r"C:\Users\me\AppData\Local\Temp\x\chrome_elf_hook.dll", Trust::Unsigned), Some(Level::High));
+        assert_eq!(dll(r"C:\Users\me\Downloads\inject.dll", Trust::Unsigned), Some(Level::High));
+        assert_eq!(dll(r"C:\Users\me\AppData\Local\SomeApp\plugin.dll", Trust::Unsigned), Some(Level::Review));
+        assert_eq!(dll(r"C:\Users\me\AppData\Local\Google\Chrome\Application\130.0\chrome.dll", signed("Google LLC")), None);
+
+        let protected = vec![r"c:\windows\".to_string(), r"c:\program files\".to_string()];
+        assert!(is_protected(Path::new(r"C:\Windows\System32\ntdll.dll"), &protected));
+        assert!(!is_protected(Path::new(r"C:\Windows\Temp\x.dll"), &protected), "users can write there");
+        assert!(!is_protected(Path::new(r"C:\Users\me\x.dll"), &protected));
+    }
+
+    #[test]
+    fn remote_control_and_planted_extensions_are_caught() {
         let none = |_: &Path| false;
-        let level = |cmd: &str| remote_control(cmd, none).map(|(l, _)| l);
+        let level = |cmd: &str| launch(cmd, none).map(|l| l.level);
         // The real profile, hidden: a hijack.
         assert_eq!(level(r#""C:\Program Files\Google\Chrome\Application\chrome.exe" --headless=new --remote-debugging-port=9222"#), Some(Level::High));
         assert_eq!(level(&format!(r#"chrome.exe --remote-debugging-port=9222 "--user-data-dir={CHROME}" --window-position=-32000,-32000"#)), Some(Level::High));
@@ -675,9 +1063,14 @@ mod tests {
         assert_eq!(level("chrome.exe --profile-directory=Default"), None);
         // A copy of a used profile is as good as the real one.
         let copied = |dir: &Path| dir.ends_with("copy");
-        let (got, switches) = remote_control(r#"chrome.exe --headless --remote-debugging-pipe --user-data-dir="C:\Temp\copy""#, copied).unwrap();
-        assert_eq!(got, Level::High);
-        assert_eq!(switches, ["--remote-debugging-pipe", "--headless", "--user-data-dir"]);
+        let got = launch(r#"chrome.exe --headless --remote-debugging-pipe --user-data-dir="C:\Temp\copy""#, copied).unwrap();
+        assert_eq!((got.level, got.debugging), (Level::High, true));
+        assert_eq!(got.switches, ["--remote-debugging-pipe", "--headless", "--user-data-dir"]);
+        // An extension loaded from a folder users can write to.
+        let ext = launch(r"msedge.exe --load-extension=C:\Users\me\AppData\Local\Temp\ext", none).unwrap();
+        assert_eq!((ext.level, ext.debugging, ext.extension.as_deref()), (Level::Review, false, Some(r"C:\Users\me\AppData\Local\Temp\ext")));
+        assert_eq!(level(r"brave.exe --headless --load-extension=C:\ProgramData\x"), Some(Level::High));
+        assert_eq!(level(r#"chrome.exe "--load-extension=C:\Program Files\Vendor\ext""#), None, "installed by an administrator");
     }
 
     #[test]
@@ -713,8 +1106,16 @@ mod tests {
         hit.stopped = None;
         assert_eq!(hit.action(), "reported (automatic stopping is off)");
         hit.kind = GuardKind::RemoteControl;
+        hit.switches = vec!["--remote-debugging-port".into()];
         hit.controller = Some(Controller { pid: 8, program: "loader.exe".into(), image: PathBuf::new(), stopped: Some(Ok(())) });
         assert_eq!(hit.headline(), "loader.exe started Chrome for remote control with your profile");
         assert_eq!(hit.action(), "reported (automatic stopping is off); loader.exe stopped");
+        hit.switches = vec!["--load-extension".into()];
+        assert_eq!(hit.headline(), "Chrome was started with an extension loaded from a folder any program can write to");
+        hit.kind = GuardKind::Injected;
+        hit.files = vec![PathBuf::from(r"C:\Temp\hook.dll")];
+        assert_eq!(hit.headline(), "An unsigned hook.dll was loaded into Chrome");
+        hit.kind = GuardKind::MemoryRead;
+        assert_eq!(hit.headline(), "update.exe opened Chrome to read its memory, where signed-in sessions are kept");
     }
 }

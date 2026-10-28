@@ -2302,6 +2302,10 @@ fn browser_notification(hit: &BrowserHit) -> (String, String) {
         (BrowserGuardKind::DataRead, false) => format!("{} opened your browser data", hit.program),
         (BrowserGuardKind::RemoteControl, true) => format!("Stopped a hidden {} under remote control", hit.browser),
         (BrowserGuardKind::RemoteControl, false) => format!("{} started for remote control", hit.browser),
+        (BrowserGuardKind::Injected, true) => format!("Stopped {}: unsigned code was loaded into it", hit.browser),
+        (BrowserGuardKind::Injected, false) => format!("Unsigned code was loaded into {}", hit.browser),
+        (BrowserGuardKind::MemoryRead, true) => format!("Stopped {} reading {}'s memory", hit.program, hit.browser),
+        (BrowserGuardKind::MemoryRead, false) => format!("{} read {}'s memory", hit.program, hit.browser),
     };
     let advice = match (hit.level, stopped) {
         (BrowserLevel::High, true) => "It may already have copied it: sign out of other sessions and change your email password from a device you trust.",

@@ -173,9 +173,11 @@ The app has these pages:
 * **Dashboard**: status (including threats that real-time protection found but did
   not remove), signature updates, monthly totals, and scan buttons. You can drop files
   onto the window to scan them.
-* **Scan**: choose a **quick scan** (Downloads, Desktop, Documents, temp), a **full
-  scan** (every file on the internal drives) or a **custom scan** (folders or
-  files you pick); then live progress with a cancel button, and the detections.
+* **Scan**: choose a **quick scan** (Downloads, Desktop, Documents, temp, leaving
+  out developers' dependency, build and cache folders such as `node_modules`, `.git`,
+  `.next` and Python environments, and source maps), a **full scan** (every file on
+  the internal drives) or a **custom scan** (folders or files you pick); then live
+  progress with a cancel button, and the detections.
   Select detections and quarantine them.
 * **Protection**: a **Windows protection status** card (see below), and
   **real-time protection**: new files in watched folders (for example Downloads) and
@@ -578,35 +580,55 @@ stealers get one:
   on the PC (an ETW session on Microsoft-Windows-Kernel-File) and picks out the
   files where Chrome, Edge, Brave, Opera, Vivaldi, Firefox and other browsers keep
   saved passwords (`Login Data`, `logins.json`), sign-in cookies, cards, the key
-  that unlocks them (`Local State`, `key4.db`), and wallet extensions' data. Who
-  opened it decides what happens:
+  that unlocks them (`Local State`, `key4.db`), and wallet extensions' data, in
+  AppData or anywhere a Chromium profile (`User Data`) or portable Firefox lives,
+  shadow copies included. The same goes for Discord's and Telegram's sign-in data
+  and desktop crypto wallets (Exodus, Electrum, Atomic, Ledger Live, `wallet.dat`),
+  which their own signed programs may open. Who opened it decides what happens:
 
   | Opened by | What happens |
   | --- | --- |
-  | The browser, or a program signed by a browser maker or Microsoft (Windows Search, Defender, Edge importing from Chrome) | Nothing |
-  | A script host or Windows tool stealers use (PowerShell, `cmd`, `esentutl`, `rundll32`, `mshta`, Python, Node…) | **High**: stopped at once, and its file scanned |
+  | The browser or app itself, a program signed by another browser maker, or one of Windows' own readers (Windows Search, Defender, Explorer, backup, OneDrive, Edge importing from Chrome) | Nothing |
+  | A script host, or a Windows tool that copies or sends files (PowerShell, `cmd`, `curl`, `tar`, `robocopy`, `esentutl`, `rundll32`, `mshta`, Python, Node…) | **High**: stopped at once, and its file scanned |
   | An unsigned program, or one whose signature does not verify | **High**: stopped at once, and its file scanned |
-  | Any other signed program (a backup tool, a password manager importing) | **Review**: reported only |
+  | Any other signed program, Microsoft's other programs included (a backup tool, a password manager importing) | **Review**: reported only |
+
+* **A program reading a browser's memory**, where sign-in cookies sit decrypted
+  (how tools like ChromeKatz avoid the files): Windows reports every `OpenProcess`
+  (Microsoft-Windows-Kernel-Audit-API-Calls), and the watch looks at those that
+  open a running browser with rights to read or change its memory. Windows' own
+  programs and the browsers are left alone; a script host or unsigned program is
+  **high** and stopped; another signed program is reported.
+* **Unsigned code loaded into a browser**, as tools that get around Chrome's
+  app-bound cookie encryption do: an unsigned DLL from outside Windows' and Program
+  Files' folders loaded into a running browser is reported, and the browser process
+  it runs in is stopped (**high**) when the DLL came from a temporary, Downloads or
+  Public folder. The DLL is scanned.
 
 * **A browser started for remote control** with `--remote-debugging-port` or
   `--remote-debugging-pipe` on your own profile (or a copy of it), which lets another
   program read and act on every signed-in site. Hidden (headless or off screen) it is
   **high** and stopped, along with the program that started it if that program is
   unsigned or a script host; on screen it is reported for review. Automation with a
-  fresh profile, as developers use, is left alone.
+  fresh profile, as developers use, is left alone. A browser started with
+  `--load-extension` from a folder users can write to (a planted extension can read
+  every signed-in site) is caught the same way.
 
 High catches are stopped only while **Stop what it catches** is on (it is, by
 default). Each alert says which program, which files, why, where it was connected
 when caught (from Windows' TCP table), and what was done, with **Stop it**, **Allow
-this program**, **Open folder** and **Scan file**. Alerts go to History (filter
-*Browser data*) and to a notification.
+this program** (or **Allow this DLL**), **Open folder** and **Scan file**. Alerts go
+to History (filter *Browser data*) and to a notification. If Windows drops events
+because the disk is very busy, the activity log says how many, since opens may have
+gone unseen then.
 
 Limits, plainly: the event arrives about a tenth of a second after the file is
 opened, so a stealer has usually copied it by then. Stopping it keeps it from
 sending what it took (stealers send once they have collected everything), but after
 any high alert, sign out of other sessions and change passwords from a device you
-trust. Stealers that read the browser's memory, inject into the browser itself or
-copy the disk below the file system are not seen. The watch needs real-time
+trust. Malware that reads the disk below the file system, injects into Windows'
+own processes, or runs with administrator rights (and can stop the service) is not
+caught, and blocking the open itself would need a signed kernel driver. The watch needs real-time
 protection on and the service (administrator rights), costs some processor time on
 busy disks and a few MB for event buffers, which is why it is a switch. Turning it
 off, turning stopping off, or allowing a program needs an administrator.

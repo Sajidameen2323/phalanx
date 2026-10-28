@@ -205,7 +205,12 @@ mod imp {
         }
         // SAFETY: valid handle opened with PROCESS_TERMINATE.
         if unsafe { TerminateProcess(process.0, 1) } == 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+            let e = std::io::Error::last_os_error();
+            // Windows refuses to stop a process that is already exiting.
+            if unsafe { WaitForSingleObject(process.0, 1000) } == WAIT_OBJECT_0 {
+                return Err("it had already exited".into());
+            }
+            return Err(e.to_string());
         }
         // Wait so the program file is unlocked for quarantine.
         if unsafe { WaitForSingleObject(process.0, 5000) } != WAIT_OBJECT_0 {
