@@ -32,6 +32,14 @@ pub struct ProtectionSettings {
     pub scan_new_drives: bool,
     /// Hold back non-urgent scans during full-screen games.
     pub defer_when_fullscreen: bool,
+    /// Watch for programs reading browsers' passwords and cookies, and for
+    /// browsers started for remote control. Off by default: it watches
+    /// every file opened, which costs some CPU and memory.
+    pub browser_guard: bool,
+    /// Stop what the browser data watch catches at high confidence.
+    pub browser_guard_stop: bool,
+    /// Programs allowed to read browser data.
+    pub browser_guard_allowed: Vec<PathBuf>,
     // Scanning
     pub heuristics: bool,
     /// Ignore rule and heuristic findings on validly signed files.
@@ -66,6 +74,9 @@ impl Default for ProtectionSettings {
             side_loading: true,
             scan_new_drives: true,
             defer_when_fullscreen: true,
+            browser_guard: false,
+            browser_guard_stop: true,
+            browser_guard_allowed: Vec::new(),
             heuristics: true,
             trust_signed: true,
             scan_archives: true,
@@ -116,6 +127,8 @@ impl ProtectionSettings {
         off(self.command_rules, new.command_rules, "command-line checks");
         off(self.side_loading, new.side_loading, "DLL side-loading checks");
         off(self.scan_new_drives, new.scan_new_drives, "checking new drives");
+        off(self.browser_guard, new.browser_guard, "the browser data watch");
+        off(self.browser_guard_stop, new.browser_guard_stop, "stopping programs caught reading browser data");
         off(self.heuristics, new.heuristics, "PE heuristics");
         off(self.scan_archives, new.scan_archives, "scanning inside archives");
         off(self.auto_quarantine, new.auto_quarantine, "automatic quarantine");
@@ -146,6 +159,9 @@ impl ProtectionSettings {
         }
         for path in new.exclusions.iter().filter(|p| !contains(&self.exclusions, p)) {
             out.push(format!("never scans {}", path.display()));
+        }
+        for path in new.browser_guard_allowed.iter().filter(|p| !contains(&self.browser_guard_allowed, p)) {
+            out.push(format!("lets {} read browser passwords and cookies", path.display()));
         }
         out
     }
@@ -197,6 +213,8 @@ mod tests {
             (ProtectionSettings { watch_folders: vec![], ..base.clone() }, r"stops watching C:\Users\me\Downloads"),
             (ProtectionSettings { exclusions: vec![r"C:\Temp".into()], ..base.clone() }, r"never scans C:\Temp"),
             (ProtectionSettings { history_days: 90, ..base.clone() }, "keeps history for 90 days instead of 365 days"),
+            (ProtectionSettings { browser_guard_stop: false, ..base.clone() }, "turns off stopping programs caught reading browser data"),
+            (ProtectionSettings { browser_guard_allowed: vec![r"C:\Tools\x.exe".into()], ..base.clone() }, r"lets C:\Tools\x.exe read browser passwords and cookies"),
             (ProtectionSettings { clean_history_days: 7, ..base.clone() }, "keeps clean real-time checks for 7 days instead of 30 days"),
         ];
         for (new, why) in cases {
@@ -213,12 +231,16 @@ mod tests {
             auto_update_hours: 1,
             history_days: 0,
             clean_history_days: 90,
+            browser_guard: true,
             ..base.clone()
         };
         assert!(base.weakened_by(&stronger).is_empty(), "{:?}", base.weakened_by(&stronger));
         // Removing an exclusion strengthens.
         let excluded = ProtectionSettings { exclusions: vec![r"C:\Temp".into()], ..base.clone() };
         assert!(excluded.weakened_by(&base).is_empty());
+        // Turning the watch off weakens.
+        let watching = ProtectionSettings { browser_guard: true, ..base.clone() };
+        assert_eq!(watching.weakened_by(&base), ["turns off the browser data watch"]);
     }
 
     #[test]

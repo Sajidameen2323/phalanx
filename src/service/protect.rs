@@ -74,6 +74,8 @@ struct State {
     started: Arc<Mutex<Option<(usize, bool)>>>,
     /// Programs are seen through process events.
     program_events: Arc<AtomicBool>,
+    /// The browser data watch's state, as it last said.
+    browser_guard: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
 pub(crate) struct Protector {
@@ -100,6 +102,7 @@ impl Protector {
             folders: started.map_or(0, |(folders, _)| folders),
             programs: started.is_some_and(|(_, programs)| programs),
             program_events: started.is_some_and(|(_, programs)| programs) && state.program_events.load(Ordering::Relaxed),
+            browser_guard: if state.rtp.is_some() { state.browser_guard.lock().unwrap_or_else(PoisonError::into_inner).clone() } else { None },
             scans: self.jobs.lock().unwrap_or_else(PoisonError::into_inner).len(),
         }
     }
@@ -151,6 +154,8 @@ impl Protector {
         let on_started = Arc::clone(&started);
         let program_events = Arc::new(AtomicBool::new(false));
         let on_program_events = Arc::clone(&program_events);
+        let browser_guard = Arc::new(Mutex::new(None));
+        let on_browser_guard = Arc::clone(&browser_guard);
         let hub = Arc::clone(&self.hub);
         let dir = self.data_dir.clone();
         let mut checkpoint_saved: Option<Instant> = None;
@@ -160,6 +165,10 @@ impl Protector {
             }
             if let RtpEvent::ProgramWatch { events, .. } = &event {
                 on_program_events.store(*events, Ordering::Relaxed);
+            }
+            if let RtpEvent::BrowserGuard { active, reason } = &event {
+                let state = if *active { Ok(()) } else { Err(reason.clone().unwrap_or_default()) };
+                *on_browser_guard.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
             }
             if matches!(event, RtpEvent::Started { .. } | RtpEvent::Scanned { .. }) && checkpoint_saved.is_none_or(|t| t.elapsed() >= CHECKPOINT_EVERY) {
                 save_checkpoint(&dir);
@@ -171,6 +180,7 @@ impl Protector {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.started = started;
         state.program_events = program_events;
+        state.browser_guard = browser_guard;
         match result {
             Ok(running) => state.rtp = Some(running),
             Err(e) => self.hub.send(&Event::ProtectionError { message: format!("{e:#}") }),
@@ -274,6 +284,9 @@ fn rtp_config(data_dir: &Path, s: &ProtectionSettings) -> RtpConfig {
     config.scan_archives = s.scan_archives;
     config.scan_new_drives = s.scan_new_drives;
     config.defer_when_fullscreen = s.defer_when_fullscreen;
+    config.browser_guard = s.browser_guard;
+    config.browser_guard_stop = s.browser_guard_stop;
+    config.browser_guard_allowed = s.browser_guard_allowed.clone();
     config
 }
 

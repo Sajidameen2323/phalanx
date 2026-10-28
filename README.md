@@ -13,7 +13,7 @@ account, and shows you exactly what it found and why.
 | **Scanning** | Quick, full and custom scans with hash signatures, YARA rules and Windows-program heuristics, plus a reversible quarantine and a complete history. It also looks inside ZIP and 7z archives, scans programs padded past the size limit, and checks what shortcuts run. |
 | **Real-time protection** | Scans new downloads, every program that starts (Windows reports each one within milliseconds, so even very short-lived programs are seen), and the files on a disk image or USB drive as soon as it appears, and stops running malware. It also reads the command lines of PowerShell and other Windows tools, and the commands pasted into the Run box, to catch attacks that never drop a file, such as fake CAPTCHA (ClickFix) pages, and spots a trusted program made to load a planted DLL (side-loading). These two only report for now. |
 | **Web protection** | Browser Guard blocks malware and phishing sites before your browser sends them a single request, marks dangerous search results, and can block ads and trackers. A DNS filter extends the blocking to every program on the PC. It also finds malicious browser extensions and checks each browser's security settings. |
-| **Stealer check** | Looks for the start-up entries, scheduled tasks, browser switches, policies, proxies and hosts-file changes that infostealers use. |
+| **Stealer check** | Looks for the start-up entries, scheduled tasks, browser switches, policies, proxies and hosts-file changes that infostealers use. An optional browser data watch catches programs opening the browser's saved passwords and sign-in cookies, and hidden remote-controlled browsers, and can stop them on the spot. |
 | **Windows protection and privacy** | Checks Microsoft Defender, SmartScreen, the firewall, memory integrity and more, and can switch on what is off. A privacy checklist does the same for Windows privacy settings. |
 | **AI Inspect** | Asks Google Gemini for a second opinion on a file (optional, needs your own API key). |
 | **Signature updates** | Pulls fresh malware hashes, YARA rules and malicious web addresses from public threat-intelligence feeds (abuse.ch, YARA Forge, URLhaus, HaGeZi, CERT Polska). |
@@ -567,6 +567,51 @@ AI**. Nothing is removed: after a real infection, the safe order is an offline s
 then signing out of every session and changing passwords from another device, and
 resetting Windows if malware is confirmed.
 
+#### Browser data watch
+
+A stolen sign-in cookie lets a thief use your email as you, password-reset codes
+and all, without your password or your second factor. The **browser data watch**,
+a switch at the top of the Stealer check page (off by default), catches the two ways
+stealers get one:
+
+* **A program opening browser data.** Phalanx's service watches every file opened
+  on the PC (an ETW session on Microsoft-Windows-Kernel-File) and picks out the
+  files where Chrome, Edge, Brave, Opera, Vivaldi, Firefox and other browsers keep
+  saved passwords (`Login Data`, `logins.json`), sign-in cookies, cards, the key
+  that unlocks them (`Local State`, `key4.db`), and wallet extensions' data. Who
+  opened it decides what happens:
+
+  | Opened by | What happens |
+  | --- | --- |
+  | The browser, or a program signed by a browser maker or Microsoft (Windows Search, Defender, Edge importing from Chrome) | Nothing |
+  | A script host or Windows tool stealers use (PowerShell, `cmd`, `esentutl`, `rundll32`, `mshta`, Python, Node…) | **High**: stopped at once, and its file scanned |
+  | An unsigned program, or one whose signature does not verify | **High**: stopped at once, and its file scanned |
+  | Any other signed program (a backup tool, a password manager importing) | **Review**: reported only |
+
+* **A browser started for remote control** with `--remote-debugging-port` or
+  `--remote-debugging-pipe` on your own profile (or a copy of it), which lets another
+  program read and act on every signed-in site. Hidden (headless or off screen) it is
+  **high** and stopped, along with the program that started it if that program is
+  unsigned or a script host; on screen it is reported for review. Automation with a
+  fresh profile, as developers use, is left alone.
+
+High catches are stopped only while **Stop what it catches** is on (it is, by
+default). Each alert says which program, which files, why, where it was connected
+when caught (from Windows' TCP table), and what was done, with **Stop it**, **Allow
+this program**, **Open folder** and **Scan file**. Alerts go to History (filter
+*Browser data*) and to a notification.
+
+Limits, plainly: the event arrives about a tenth of a second after the file is
+opened, so a stealer has usually copied it by then. Stopping it keeps it from
+sending what it took (stealers send once they have collected everything), but after
+any high alert, sign out of other sessions and change passwords from a device you
+trust. Stealers that read the browser's memory, inject into the browser itself or
+copy the disk below the file system are not seen. The watch needs real-time
+protection on and the service (administrator rights), costs some processor time on
+busy disks and a few MB for event buffers, which is why it is a switch. Turning it
+off, turning stopping off, or allowing a program needs an administrator.
+`phalanx-cli watch --browser-guard` (as administrator) runs it in a terminal.
+
 ### Windows protection status
 
 The Protection page checks: real-time antivirus (Microsoft Defender or another
@@ -675,6 +720,7 @@ phalanx-cli scan D:\ --performance low-impact --exclude D:\VMs
 phalanx-cli watch %USERPROFILE%\Downloads --notify   # watch until Ctrl+C
 phalanx-cli watch %USERPROFILE%\Downloads --programs # also scan programs as they start
 phalanx-cli watch --programs --report-only           # programs only; never stop them
+phalanx-cli watch --browser-guard                    # browser data watch (as administrator)
 
 phalanx-cli history [--kind watch]   # recent scans with full details (kinds: watch, process, ...)
 phalanx-cli detections       # recent detections

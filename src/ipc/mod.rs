@@ -16,7 +16,7 @@
 mod pipe;
 
 use crate::risk::{DownloadOrigin, RiskyFile};
-use crate::rtp::{CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
+use crate::rtp::{BrowserHit, CommandHit, Origin, ProcessHit, RiskyOutcome, RtpEvent, SideLoadHit};
 use crate::scan::{FileReport, ScanReport};
 use crate::service::settings::ProtectionSettings;
 use crate::store::{DeleteTarget, DetectionRow, HistoryQuery, ScanErrorRow, Verdict};
@@ -175,6 +175,11 @@ pub enum Event {
     RiskyFile { path: PathBuf, risk: RiskyFile, origin: Option<DownloadOrigin> },
     RiskyChecked { path: PathBuf, outcome: RiskyOutcome },
     Command { hit: CommandHit },
+    /// Whether the browser data watch is running; `reason` says why not.
+    BrowserGuard { active: bool, reason: Option<String> },
+    /// A program reached browser data, or a browser was started for remote
+    /// control; it may have been stopped.
+    BrowserData { hit: BrowserHit },
     DriveAdded { root: PathBuf, files: usize },
     Restarting { error: String, retry_in_secs: u64 },
     ProtectionError { message: String },
@@ -211,6 +216,8 @@ impl From<RtpEvent> for Event {
             RtpEvent::ProgramWatch { events, reason } => Event::ProgramWatch { events, reason },
             RtpEvent::SideLoad(hit) => Event::SideLoad { hit },
             RtpEvent::Command(hit) => Event::Command { hit },
+            RtpEvent::BrowserGuard { active, reason } => Event::BrowserGuard { active, reason },
+            RtpEvent::BrowserData(hit) => Event::BrowserData { hit },
             RtpEvent::DriveAdded { root, files } => Event::DriveAdded { root, files },
             RtpEvent::Restarting { error, retry_in } => Event::Restarting { error, retry_in_secs: retry_in.as_secs() },
             RtpEvent::Error(message) => Event::ProtectionError { message },
@@ -455,6 +462,10 @@ pub struct ProtectionStatus {
     /// reading the process list twice a second).
     #[serde(default)]
     pub program_events: bool,
+    /// The browser data watch is running (`None` while it starts or when
+    /// off); `Some(Err)` says why it cannot.
+    #[serde(default)]
+    pub browser_guard: Option<Result<(), String>>,
     /// Scans running now.
     pub scans: usize,
 }

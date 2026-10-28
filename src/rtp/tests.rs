@@ -40,6 +40,11 @@ fn describe(event: RtpEvent) -> String {
             let rules: Vec<&str> = hit.matches.iter().map(|m| m.rule.as_str()).collect();
             format!("command {:?} {} {}", hit.source, hit.program.to_ascii_lowercase(), rules.join(","))
         }
+        RtpEvent::BrowserGuard { active, .. } => format!("browser-guard {active}"),
+        RtpEvent::BrowserData(hit) => {
+            let stopped = matches!(hit.stopped, Some(Ok(())));
+            format!("browser-data {:?} {:?} {} stopped={stopped}", hit.kind, hit.level, hit.program.to_ascii_lowercase())
+        }
         RtpEvent::DriveAdded { root, files } => format!("drive {} {files}", root.display()),
         RtpEvent::Restarting { error, .. } => format!("restarting {error}"),
         RtpEvent::Error(e) => format!("error {e}"),
@@ -569,6 +574,59 @@ fn a_signed_program_loading_a_planted_windows_dll_is_reported() {
     let store = scan::open_store(&data_dir).unwrap();
     let row = &store.recent_scans(5, Some("sideload")).unwrap()[0];
     assert_eq!(store.scan_detections(row.id).unwrap()[0].threat, "SideLoad.iphlpapi.dll");
+}
+
+/// Needs administrator rights (file opens come from an event session);
+/// skipped, and says so, without them.
+#[cfg(windows)]
+#[test]
+fn a_script_host_opening_saved_passwords_is_caught_and_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    // A profile where browsers keep one (the temporary folder is in AppData).
+    let profile = tmp.path().join(r"Google\Chrome\User Data\Default");
+    fs::create_dir_all(&profile).unwrap();
+    let passwords = profile.join("Login Data");
+    fs::write(&passwords, "not really a database").unwrap();
+
+    let mut cfg = RtpConfig::new(Vec::new());
+    cfg.scan_new_drives = false;
+    cfg.defer_when_fullscreen = false;
+    cfg.browser_guard = true;
+    let mut run = Run::start(&data_dir, cfg);
+    assert!(run.until(|m| m.starts_with("browser-guard")), "{:?}", run.seen);
+    if run.seen.iter().any(|m| m == "browser-guard false") {
+        run.handle.stop();
+        eprintln!("skipped: the browser data watch needs administrator rights");
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Like a PowerShell stealer: read the file, then stay to send it.
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let powershell = Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let script = format!("Get-Content -LiteralPath '{}' | Out-Null; Start-Sleep 60", passwords.display());
+    let mut child = std::process::Command::new(powershell).args(["-NoProfile", "-Command", &script]).spawn().unwrap();
+    let found = run.until(|m| m.starts_with("browser-data"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exited = loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break true,
+            None if Instant::now() > deadline => break false,
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    if !exited {
+        let _ = child.kill();
+    }
+    run.handle.stop();
+    assert!(found, "{:?}", run.seen);
+    assert!(run.seen.contains(&"browser-data DataRead High powershell.exe stopped=true".to_string()), "{:?}", run.seen);
+    assert!(exited, "PowerShell was stopped");
+    let store = scan::open_store(&data_dir).unwrap();
+    let row = &store.recent_scans(5, Some("browser")).unwrap()[0];
+    let finding = &store.scan_detections(row.id).unwrap()[0];
+    assert_eq!(finding.threat, "BrowserData.Read");
 }
 
 #[test]

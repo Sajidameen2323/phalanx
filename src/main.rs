@@ -498,14 +498,14 @@ impl LoadArgs {
 #[derive(Args)]
 struct WatchArgs {
     /// Folders to watch, e.g. your Downloads folder.
-    #[arg(required_unless_present = "programs")]
+    #[arg(required_unless_present_any = ["programs", "browser_guard"])]
     folders: Vec<PathBuf>,
     /// Also scan every program as it starts (Windows), and stop it if it is
     /// malware (PUPs and hacking tools are only reported).
     #[arg(long)]
     programs: bool,
-    /// With --programs, only report detected programs; never stop them.
-    #[arg(long, requires = "programs")]
+    /// With --programs or --browser-guard, only report; never stop programs.
+    #[arg(long)]
     report_only: bool,
     /// Report rule and heuristic findings even on validly signed files.
     #[arg(long)]
@@ -516,6 +516,11 @@ struct WatchArgs {
     /// Don't check drives that appear (mounted disk images, USB drives).
     #[arg(long)]
     no_new_drives: bool,
+    /// Watch for programs opening browsers' password and cookie files, and
+    /// browsers started for remote control (Windows, as administrator).
+    /// High-confidence catches are stopped unless --report-only is given.
+    #[arg(long)]
+    browser_guard: bool,
     #[command(flatten)]
     signatures: SignatureArgs,
     /// Quarantine malware, PUP and hacktool detections.
@@ -937,6 +942,8 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
     config.trust_signed = !args.no_trust_signed;
     config.scan_archives = !args.no_archives;
     config.scan_new_drives = !args.no_new_drives;
+    config.browser_guard = args.browser_guard;
+    config.browser_guard_stop = !args.report_only;
     let notify = args.notify;
     let _handle = rtp::start(engine, dir.to_path_buf(), config, move |event| match event {
         RtpEvent::Started { watching, failed, programs } => {
@@ -1012,6 +1019,34 @@ fn watch(args: &WatchArgs, dir: &Path) -> Result<ExitCode> {
             println!("    report-only: nothing was stopped");
             if notify && hit.confidence() == threat_scanner::cmdline::Confidence::High {
                 system::notify(&format!("Suspicious command: {at}"), hit.headline());
+            }
+        }
+        RtpEvent::BrowserGuard { active: true, .. } => println!("watching browser data: programs opening saved passwords and cookies"),
+        RtpEvent::BrowserGuard { active: false, reason } => {
+            eprintln!("warning: the browser data watch is not running ({})", reason.unwrap_or_default())
+        }
+        RtpEvent::BrowserData(hit) => {
+            let level = match hit.level {
+                rtp::browser::Level::High => "browser data, high",
+                rtp::browser::Level::Review => "browser data, review",
+            };
+            println!("[{level}] {} (pid {})", hit.headline(), hit.pid);
+            println!("    why: {}", hit.reason);
+            if !hit.image.as_os_str().is_empty() {
+                println!("    program: {}", hit.image.display());
+            }
+            for file in &hit.files {
+                println!("    opened: {}", file.display());
+            }
+            if !hit.switches.is_empty() {
+                println!("    started with: {}", hit.switches.join(" "));
+            }
+            if !hit.connections.is_empty() {
+                println!("    connected to: {}", hit.connections.join(", "));
+            }
+            println!("    {}", hit.action());
+            if notify {
+                system::notify("A program reached your browser data", &hit.headline());
             }
         }
         RtpEvent::DriveAdded { root, files } => println!("new drive {}: checking {files} file(s) near its top", root.display()),

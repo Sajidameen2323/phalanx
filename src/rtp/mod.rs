@@ -31,22 +31,29 @@
 //! with process events, the DLLs programs load are checked for side-loading
 //! (see [`sideload`]; report-only too).
 //!
+//! With the browser data watch on, programs opening browsers' password and
+//! cookie files, and browsers started for remote control, are caught and,
+//! when allowed, stopped (see [`browser`]).
+//!
 //! A supervisor restarts the whole pipeline if any part fails or panics,
 //! with backoff, and catches up on files that changed while it was down.
 //! Verdicts are cached for the lifetime of a [`RtpHandle`]; callers start a
 //! new one when signatures or settings change, which also clears the cache.
 
+pub mod browser;
 mod cache;
 pub mod commands;
 mod dirwatch;
 mod drives;
 mod etw;
 mod files;
+mod net;
 pub mod process;
 pub mod sideload;
 
 use serde::{Deserialize, Serialize};
 use self::cache::{Disposition, DispositionCache, FileKey};
+pub use self::browser::BrowserHit;
 pub use self::commands::{CommandHit, CommandSource};
 pub use self::sideload::SideLoadHit;
 use self::process::ProcessInfo;
@@ -129,6 +136,13 @@ pub struct RtpConfig {
     pub scan_new_drives: bool,
     /// Hold back non-urgent scans while a full-screen game or presentation runs.
     pub defer_when_fullscreen: bool,
+    /// Watch for programs opening browsers' password and cookie files, and
+    /// for browsers started for remote control (Windows, administrators).
+    pub browser_guard: bool,
+    /// With `browser_guard`: stop what it catches at high confidence.
+    pub browser_guard_stop: bool,
+    /// Programs allowed to read browser data.
+    pub browser_guard_allowed: Vec<PathBuf>,
 }
 
 impl RtpConfig {
@@ -153,6 +167,9 @@ impl RtpConfig {
             scan_archives: true,
             scan_new_drives: true,
             defer_when_fullscreen: true,
+            browser_guard: false,
+            browser_guard_stop: true,
+            browser_guard_allowed: Vec::new(),
         }
     }
 }
@@ -213,6 +230,12 @@ pub enum RtpEvent {
     SideLoad(SideLoadHit),
     /// A command line matched the command-line rules (reported only).
     Command(CommandHit),
+    /// Whether the browser data watch is running; `reason` says why not.
+    /// Sent when it starts and whenever this changes.
+    BrowserGuard { active: bool, reason: Option<String> },
+    /// A program reached browser data, or a browser was started for remote
+    /// control; it may have been stopped.
+    BrowserData(BrowserHit),
     /// A drive appeared (a mounted disk image or a USB drive); `files` near
     /// its top are being scanned.
     DriveAdded { root: PathBuf, files: usize },
@@ -317,6 +340,10 @@ impl Ctx<'_> {
         self.programs_enabled() && self.config.command_rules
     }
 
+    fn browser_guard_enabled(&self) -> bool {
+        self.config.browser_guard && process::SUPPORTED
+    }
+
     fn lookup(&self, path: &Path) -> Lookup {
         let Some(key) = FileKey::of(path) else { return Lookup::Gone };
         match self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
@@ -418,6 +445,11 @@ fn run_once(ctx: &Ctx<'_>, catch_up: Option<SystemTime>) -> Result<(), String> {
             }
         } else {
             drop(sweep_rx);
+        }
+        if ctx.browser_guard_enabled() {
+            let urgent = urgent_tx.clone();
+            let watch = move || browser::run(ctx, &scan::open_store(ctx.data_dir)?, &urgent);
+            add(spawn_part(s, ctx, "browser-data-watch", false, watch), "browser-data-watch");
         }
         if ctx.config.scan_new_drives && cfg!(windows) {
             let urgent = urgent_tx.clone();
@@ -537,6 +569,7 @@ fn programs(ctx: &Ctx<'_>, urgent: &Sender<Item>, sweep: &Sender<Item>, side: Op
                 live.remove(&pid);
                 known.retain(|id| id.pid != pid);
             }
+            Ok(etw::Event::FileOpened { .. }) => {}
             Ok(etw::Event::ImageLoaded { pid, image: dll }) => {
                 if let Some(side) = &side && filter.candidate(&dll) {
                     let image = live.get(&pid).map(|p| p.image.clone()).or_else(|| process::identify(pid).map(|(_, image)| image));
