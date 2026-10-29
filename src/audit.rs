@@ -105,6 +105,24 @@ pub struct AuditItem {
     pub reasons: Vec<String>,
     /// Local engine matches on the program.
     pub detections: Vec<Finding>,
+    /// Left behind by an uninstall: the program is gone from a folder only
+    /// administrators can write to, so nothing can be planted in its place.
+    pub leftover: bool,
+    /// How to remove the entry itself, for start-up entries, tasks and
+    /// services.
+    pub removal: Option<Removal>,
+}
+
+/// What removing a start-up entry, task or service deletes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Removal {
+    /// A value under a Run key (`HKCU:\…\Run`).
+    RunValue { key: String, name: String },
+    /// A file in a Startup folder.
+    StartupFile { path: String },
+    Task { path: String, name: String },
+    Service { name: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -234,22 +252,28 @@ pub fn run(engine: Option<&Engine>, exclusions: Option<&DefenderExclusions>, wor
     let mut items = Vec::new();
     for r in &raw.run {
         let hive = if r.key.starts_with("HKLM") { "all users" } else { "this user" };
-        items.push(item(Kind::StartupEntry, &r.name, &format!("{} ({hive})", r.key), &r.command, &env));
+        let mut it = item(Kind::StartupEntry, &r.name, &format!("{} ({hive})", r.key), &r.command, &env);
+        it.removal = Some(Removal::RunValue { key: r.key.clone(), name: r.name.clone() });
+        items.push(it);
     }
     for l in &raw.startup {
         let name = file_name(&l.file);
         let command = if l.target.is_empty() { quote(&l.file) } else { format!("{} {}", quote(&l.target), l.args) };
-        items.push(item(Kind::StartupEntry, &name, &parent(&l.file), command.trim(), &env));
+        let mut it = item(Kind::StartupEntry, &name, &parent(&l.file), command.trim(), &env);
+        it.removal = Some(Removal::StartupFile { path: l.file.clone() });
+        items.push(it);
     }
     for t in &raw.tasks {
         let mut it = item(Kind::ScheduledTask, &t.name, &format!("Task Scheduler {}", t.path), format!("{} {}", quote(&t.execute), t.args).trim(), &env);
         if t.state.eq_ignore_ascii_case("disabled") {
             it.reasons.push("the task is disabled".into());
         }
+        it.removal = Some(Removal::Task { path: t.path.clone(), name: t.name.clone() });
         items.push(it);
     }
     for s in &raw.services {
         let mut it = item(Kind::Service, &s.display, &format!("service {} (start: {})", s.name, s.start), &s.path, &env);
+        it.removal = Some(Removal::Service { name: s.name.clone() });
         // Windows' own services are numerous and signed by catalog; only
         // list a service when something about it stands out.
         if it.program.as_deref().is_some_and(|p| env.is_windows_dir(p)) && it.reasons.is_empty() {
@@ -368,6 +392,8 @@ fn item(kind: Kind, title: &str, location: &str, command: &str, env: &Env) -> Au
         signature: Signature::Unknown,
         reasons,
         detections: Vec::new(),
+        leftover: false,
+        removal: None,
     }
 }
 
@@ -408,8 +434,16 @@ fn rate(it: &mut AuditItem, env: &Env) {
         let writable = env.user_writable(&path);
         match (&it.signature, exists) {
             (_, false) if matches!(it.kind, Kind::StartupEntry | Kind::ScheduledTask | Kind::Service) => {
-                it.reasons.push("the program it starts no longer exists".into());
-                bump(Severity::Low);
+                if writable {
+                    it.reasons.push(format!("the program it starts is missing from a folder any program can write to ({}), so another program could be put in its place", short_dir(&path)));
+                    bump(Severity::Medium);
+                } else if env.admin_only(&path) {
+                    it.reasons.push("left over from an uninstall: the program it starts no longer exists".into());
+                    it.leftover = true;
+                } else {
+                    it.reasons.push("the program it starts no longer exists".into());
+                    bump(Severity::Low);
+                }
             }
             (Signature::Unsigned, true) if writable => {
                 it.reasons.push(format!("unsigned program in a folder any program can write to ({})", short_dir(&path)));
@@ -516,6 +550,8 @@ struct Env {
     windows: PathBuf,
     writable: Vec<PathBuf>,
     temp: Vec<PathBuf>,
+    /// Program Files folders: only administrators can write to them.
+    program_files: Vec<PathBuf>,
 }
 
 impl Env {
@@ -531,7 +567,8 @@ impl Env {
         }
         writable.push(windows.join("Temp"));
         let temp = ["TEMP", "TMP"].iter().filter_map(|n| var(n)).map(PathBuf::from).chain(Some(windows.join("Temp"))).collect();
-        Self { vars, windows, writable, temp }
+        let program_files = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().filter_map(|n| var(n)).map(PathBuf::from).collect();
+        Self { vars, windows, writable, temp, program_files }
     }
 
     /// `%SystemRoot%\x` → `C:\Windows\x`; unknown variables are kept.
@@ -591,6 +628,12 @@ impl Env {
     fn user_writable(&self, path: &Path) -> bool {
         let p = lower(path);
         self.writable.iter().any(|d| p.starts_with(&lower(d)))
+    }
+
+    /// In Program Files or Windows, outside the folders users can write to.
+    fn admin_only(&self, path: &Path) -> bool {
+        let p = lower(path);
+        !self.user_writable(path) && (self.is_windows_dir(path) || self.program_files.iter().any(|d| p.starts_with(&lower(d))))
     }
 
     fn is_temp(&self, path: &Path) -> bool {
@@ -671,6 +714,8 @@ fn browser_policies(#[cfg_attr(windows, allow(unused_variables))] errors: &mut V
                             "a policy installs this extension and stops you from removing it; malware uses this to keep a data-stealing extension in your browser (fine if your PC is managed by work or school)".into(),
                         ],
                         detections: Vec::new(),
+                        leftover: false,
+                        removal: None,
                     });
                 }
             }
@@ -702,6 +747,8 @@ fn proxy_items() -> Vec<AuditItem> {
             signature: Signature::Unknown,
             reasons: vec![reason.to_string()],
             detections: Vec::new(),
+            leftover: false,
+            removal: None,
         };
         let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) == 1;
         let server: String = key.get_value("ProxyServer").unwrap_or_default();
@@ -771,6 +818,8 @@ fn hosts_findings(text: &str, location: &str) -> Vec<AuditItem> {
                 signature: Signature::Unknown,
                 reasons: vec![reason],
                 detections: Vec::new(),
+                leftover: false,
+                removal: None,
             });
         }
     }
@@ -814,6 +863,61 @@ pub fn read_defender_exclusions(work_dir: &Path) -> anyhow::Result<Option<Defend
     }
 }
 
+/// Deletes what the script is given, one entry at a time, and writes the
+/// entries it could not delete. The entries travel as a file of JSON data,
+/// never as part of the script.
+const REMOVE_SCRIPT: &str = r#"
+$failed = @()
+# Windows PowerShell passes a JSON array on as one object; a variable unrolls it.
+$list = Get-Content -Raw -Encoding UTF8 -LiteralPath $in | ConvertFrom-Json
+foreach ($r in $list) {
+  try {
+    switch ($r.kind) {
+      'run_value' { Remove-ItemProperty -LiteralPath $r.key -Name $r.name -ErrorAction Stop }
+      'startup_file' { Remove-Item -LiteralPath $r.path -Force -ErrorAction Stop }
+      'task' { Unregister-ScheduledTask -TaskPath $r.path -TaskName $r.name -Confirm:$false -ErrorAction Stop }
+      'service' { $o = & sc.exe delete $r.name 2>&1; if ($LASTEXITCODE -ne 0) { throw ([string]$o).Trim() } }
+      default { throw 'unknown kind' }
+    }
+  } catch { $failed += ('{0} {1}{2}: {3}' -f $r.kind, $r.path, $r.name, $_.Exception.Message) }
+}
+ConvertTo-Json -Compress -InputObject @($failed) | Set-Content -Encoding UTF8 -LiteralPath $out
+"#;
+
+/// Removes leftover start-up entries, tasks and services as administrator,
+/// after Windows' consent prompt. Only entries still marked as leftovers
+/// whose program is still missing are removed. `Ok(None)`: the user
+/// declined; otherwise what could not be removed.
+pub fn remove_leftovers(items: &[AuditItem], work_dir: &Path) -> anyhow::Result<Option<Vec<String>>> {
+    let mut removals: Vec<&Removal> = Vec::new();
+    for it in items.iter().filter(|i| i.leftover && i.program.as_ref().is_some_and(|p| !p.exists())) {
+        // A task with several actions is listed once per action.
+        if let Some(r) = &it.removal && !removals.contains(&r) {
+            removals.push(r);
+        }
+    }
+    if removals.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    std::fs::create_dir_all(work_dir)?;
+    let (input, out) = (work_dir.join("remove-leftovers.json"), work_dir.join("remove-leftovers-result.json"));
+    let _ = std::fs::remove_file(&out);
+    std::fs::write(&input, serde_json::to_string(&removals)?)?;
+    let literal = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+    let script = format!("$in = {}; $out = {}\n{REMOVE_SCRIPT}", literal(&input), literal(&out));
+    let result = crate::system::run_elevated_powershell(&script);
+    let _ = std::fs::remove_file(&input);
+    match result? {
+        crate::system::Elevated::Declined => Ok(None),
+        crate::system::Elevated::Exited(0) => {
+            let text = std::fs::read_to_string(&out)?;
+            let _ = std::fs::remove_file(&out);
+            Ok(Some(serde_json::from_str(text.trim_start_matches('\u{feff}'))?))
+        }
+        crate::system::Elevated::Exited(code) => anyhow::bail!("removing the leftovers failed (exit code {code})"),
+    }
+}
+
 fn exclusion_items(ex: &DefenderExclusions, env: &Env) -> Vec<AuditItem> {
     let mut out = Vec::new();
     let mut add = |kind: &str, value: &str, severity: Severity, reason: String| {
@@ -827,6 +931,8 @@ fn exclusion_items(ex: &DefenderExclusions, env: &Env) -> Vec<AuditItem> {
             signature: Signature::Unknown,
             reasons: vec![reason],
             detections: Vec::new(),
+            leftover: false,
+            removal: None,
         });
     };
     for p in &ex.paths {
@@ -861,6 +967,37 @@ mod tests {
     #[test]
     fn collection_script_is_valid_powershell() {
         assert_eq!(crate::system::powershell_syntax_errors(COLLECT_SCRIPT), Vec::<String>::new());
+        assert_eq!(crate::system::powershell_syntax_errors(REMOVE_SCRIPT), Vec::<String>::new());
+    }
+
+    #[test]
+    fn removals_are_sent_as_data_the_script_reads() {
+        let all = [
+            Removal::RunValue { key: r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run".into(), name: "Old's app".into() },
+            Removal::StartupFile { path: r"C:\x\a.lnk".into() },
+            Removal::Task { path: r"\".into(), name: "Adobe Uninstaller".into() },
+            Removal::Service { name: "AdskNLM".into() },
+        ];
+        let json = serde_json::to_value(&all).unwrap();
+        let kinds: Vec<&str> = json.as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["run_value", "startup_file", "task", "service"]);
+        for kind in kinds {
+            assert!(REMOVE_SCRIPT.contains(&format!("'{kind}'")), "the script handles {kind}");
+        }
+        assert_eq!(json[0]["name"], "Old's app");
+    }
+
+    #[test]
+    fn only_leftovers_still_missing_are_removed() {
+        let e = env();
+        let mut present = item(Kind::Service, "Here", "Services", "x", &e);
+        present.program = Some(std::env::current_exe().unwrap());
+        present.leftover = true; // stale: the program came back
+        present.removal = Some(Removal::Service { name: "Here".into() });
+        let mut flagged = item(Kind::Service, "Flagged", "Services", r"C:\gone\x.exe", &e);
+        flagged.removal = Some(Removal::Service { name: "Flagged".into() });
+        // Nothing qualifies, so no administrator prompt is shown.
+        assert_eq!(remove_leftovers(&[present, flagged], Path::new("unused")).unwrap(), Some(Vec::new()));
     }
 
     fn env() -> Env {
@@ -869,6 +1006,7 @@ mod tests {
             windows: PathBuf::from(r"C:\Windows"),
             writable: vec![PathBuf::from(r"C:\Users\u\AppData\Roaming"), PathBuf::from(r"C:\Users\u\AppData\Local\Temp")],
             temp: vec![PathBuf::from(r"C:\Users\u\AppData\Local\Temp")],
+            program_files: vec![PathBuf::from(r"C:\Program Files"), PathBuf::from(r"C:\Program Files (x86)")],
         }
     }
 
@@ -920,7 +1058,15 @@ mod tests {
 
         let mut missing = item(Kind::ScheduledTask, "Old", "Tasks", r"C:\gone\nothing.exe", &e);
         rate(&mut missing, &e);
-        assert_eq!(missing.severity, Severity::Low);
+        assert_eq!((missing.severity, missing.leftover), (Severity::Low, false));
+
+        let mut uninstalled = item(Kind::Service, "AdskNLM", "Services", r#""C:\Program Files\Gone App\lmgrd.exe" -z"#, &e);
+        rate(&mut uninstalled, &e);
+        assert_eq!((uninstalled.severity, uninstalled.leftover), (Severity::Info, true), "{:?}", uninstalled.reasons);
+
+        let mut plantable = item(Kind::StartupEntry, "Upd", "Run", r"C:\Users\u\AppData\Roaming\Gone\upd.exe", &e);
+        rate(&mut plantable, &e);
+        assert_eq!((plantable.severity, plantable.leftover), (Severity::Medium, false), "{:?}", plantable.reasons);
 
         let mut encoded = item(Kind::ScheduledTask, "Sync", "Tasks", "powershell.exe -w hidden -enc AAAA", &e);
         rate(&mut encoded, &e);

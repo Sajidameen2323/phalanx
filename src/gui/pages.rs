@@ -3,7 +3,7 @@
 
 use super::*;
 use dots::{HeroScan, Outcome, StageMode};
-use eframe::egui::{pos2, vec2, Align, Align2, FontId, Id, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{pos2, vec2, Align, Align2, Color32, FontId, Id, Layout, Margin, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use threat_scanner::posture::Status;
 use widgets::*;
 
@@ -942,47 +942,62 @@ impl App {
             self.history_files(ui);
             return;
         }
-        // Real-time records that repeat one another show as one entry, the
-        // newest, with the earlier ones under it when opened.
+        // Browser data alerts about programs allowed since are kept but not shown.
+        let (allowed, scans): (Vec<ScanRow>, Vec<ScanRow>) = scans.into_iter().partition(|s| s.kind == "browser" && self.allowed_to_read(Path::new(&s.targets)));
+        if !allowed.is_empty() {
+            small(ui, format!("{} browser data alert(s) about programs you allowed are hidden.", allowed.len()));
+            ui.add_space(6.0);
+        }
+        // Real-time records that repeat one another show as one parent entry;
+        // opening it lists each record under it.
         let mut visible: Vec<Shown> = Vec::new();
         for entry in store::group_history(&scans) {
             let open = self.history.open_groups.contains(&entry.key);
-            let count = entry.rows.len();
-            let first = entry.rows.last().map(|r| r.started_at.clone()).unwrap_or_default();
-            let mut rows = entry.rows.into_iter();
-            if let Some(newest) = rows.next() {
-                visible.push(Shown { row: newest, group: (count > 1).then(|| Repeats { count, first, key: entry.key.clone() }), earlier: false });
+            if entry.rows.len() == 1 {
+                visible.extend(entry.rows.into_iter().map(Shown::Record));
+                continue;
             }
+            let first = entry.rows.last().map(|r| r.started_at.clone()).unwrap_or_default();
+            let ids = entry.rows.iter().map(|r| r.id).collect();
+            visible.push(Shown::Group(Repeats { newest: entry.rows[0].clone(), first, ids, key: entry.key.clone(), open }));
             if open {
-                visible.extend(rows.map(|row| Shown { row, group: None, earlier: true }));
+                visible.extend(entry.rows.into_iter().map(Shown::Child));
             }
         }
         let mut toggle_group = None;
+        let mut delete_group = None;
         let mut toggle = None;
         let mut delete_one = None;
         let mut review = None;
-        for Shown { row: s, group, earlier } in &visible {
+        for shown in &visible {
+            let (s, child) = match shown {
+                Shown::Group(group) => {
+                    if let Some(action) = group_card(ui, group) {
+                        match action {
+                            GroupAction::Toggle => toggle_group = Some(group.key.clone()),
+                            GroupAction::Delete => delete_group = Some(group.ids.clone()),
+                        }
+                    }
+                    ui.add_space(if group.open { 6.0 } else { 8.0 });
+                    continue;
+                }
+                Shown::Record(s) => (s, false),
+                Shown::Child(s) => (s, true),
+            };
             let expanded = self.expanded.get(&s.id);
-            card(ui, |ui| {
+            let body = |ui: &mut Ui| {
                 ui.horizontal_wrapped(|ui| {
-                    let kind_color = if store::is_protection_kind(&s.kind) { theme().green } else { theme().accent };
-                    badge(ui, &s.kind.to_uppercase(), kind_color);
+                    if !child {
+                        let kind_color = if store::is_protection_kind(&s.kind) { theme().green } else { theme().accent };
+                        badge(ui, &s.kind.to_uppercase(), kind_color);
+                    }
                     ui.label(RichText::new(format!("#{} · {}", s.id, short_time(&s.started_at))).strong().color(theme().text));
-                    let (status, color) = match (&s.finished_at, s.cancelled, s.detections) {
-                        // A command line, not a file scan; nothing was stopped.
-                        _ if s.kind == "command" => ("Suspicious command".to_string(), theme().amber),
-                        _ if s.kind == "sideload" => ("Possible DLL side-loading".to_string(), theme().amber),
-                        (None, _, _) => ("Incomplete".to_string(), theme().amber),
-                        (_, true, _) => ("Cancelled".to_string(), theme().amber),
-                        (_, _, 0) => ("Clean".to_string(), theme().green),
-                        (_, _, n) => (format!("{n} threat(s)"), theme().red),
-                    };
+                    let (status, color) = history_status(s);
                     badge(ui, &status, color);
                 });
-                if *earlier {
-                    small(ui, "An earlier record of the entry above");
-                }
-                if s.kind == "command" {
+                if child {
+                    // The parent already says what and where.
+                } else if s.kind == "command" {
                     facts(ui, &[("Action", "Reported only: command-line rules do not stop programs yet".to_string())]);
                 } else if s.kind == "sideload" {
                     facts(ui, &[("Action", "Reported only: side-loading checks do not stop programs yet".to_string())]);
@@ -1001,15 +1016,9 @@ impl App {
                         ],
                     );
                 }
-                truncated(ui, s.targets.clone(), theme().muted, 12.5);
-                if let Some(Repeats { count, first, key }) = group {
-                    ui.horizontal_wrapped(|ui| {
-                        small(ui, format!("Seen {count} times since {}", short_time(first)));
-                        let label = if self.history.open_groups.contains(key) { "Hide earlier".to_string() } else { format!("Show earlier ({})", count - 1) };
-                        if small_button(ui, &label).clicked() {
-                            toggle_group = Some(key.clone());
-                        }
-                    });
+                // Children of a clean group each concern something different.
+                if !child || s.top_threat.is_none() {
+                    truncated(ui, s.targets.clone(), theme().muted, 12.5);
                 }
                 ui.horizontal(|ui| {
                     if s.detections > 0 || s.errors > 0 {
@@ -1082,8 +1091,13 @@ impl App {
                         }
                     }
                 }
-            });
-            ui.add_space(8.0);
+            };
+            if child {
+                child_card(ui, body);
+            } else {
+                card(ui, body);
+            }
+            ui.add_space(if child { 6.0 } else { 8.0 });
         }
         if self.history.next.is_some() {
             ui.horizontal(|ui| {
@@ -1097,6 +1111,10 @@ impl App {
         }
         if let Some(key) = toggle_group && !self.history.open_groups.remove(&key) {
             self.history.open_groups.insert(key);
+        }
+        if let Some(ids) = delete_group {
+            let what = format!("these {} entries", ids.len());
+            self.history_delete = Some(HistoryDelete { target: DeleteTarget::Scans { ids }, what, running: false });
         }
         if let Some(id) = delete_one {
             self.history_delete = Some(HistoryDelete { target: DeleteTarget::Scans { ids: vec![id] }, what: format!("entry #{id}"), running: false });
@@ -1142,7 +1160,8 @@ impl App {
         let most = if files.len() as u32 >= store::MAX_FILE_FINDINGS { " (the most recent)" } else { "" };
         small(ui, format!("{} file(s), each shown once{most}", files.len()));
         ui.add_space(6.0);
-        for f in &files {
+        // Browser data alerts about programs allowed since are not shown.
+        for f in files.iter().filter(|f| !(f.threat.starts_with("BrowserData.") && self.allowed_to_read(Path::new(&f.path)))) {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     badge(ui, &f.category.to_uppercase(), category_color_str(&f.category));
@@ -2450,20 +2469,79 @@ pub(super) fn recovery_text(recovered: &threat_scanner::service::history::Recove
     )
 }
 
-/// A History card: a record, with the group it heads, if any.
-struct Shown {
-    row: ScanRow,
-    group: Option<Repeats>,
-    /// An earlier record of an opened group, under its newest.
-    earlier: bool,
+/// A History card.
+enum Shown {
+    /// A record on its own.
+    Record(ScanRow),
+    /// Records that repeat one another, as one parent entry.
+    Group(Repeats),
+    /// A record of an opened group, under it.
+    Child(ScanRow),
 }
 
 /// Real-time records that repeat one another.
 struct Repeats {
-    count: usize,
+    newest: ScanRow,
     /// When the oldest was.
     first: String,
+    ids: Vec<i64>,
     key: String,
+    open: bool,
+}
+
+enum GroupAction {
+    Toggle,
+    Delete,
+}
+
+fn history_status(s: &ScanRow) -> (String, Color32) {
+    match (&s.finished_at, s.cancelled, s.detections) {
+        // A command line, not a file scan; nothing was stopped.
+        _ if s.kind == "command" => ("Suspicious command".to_string(), theme().amber),
+        _ if s.kind == "sideload" => ("Possible DLL side-loading".to_string(), theme().amber),
+        (None, _, _) => ("Incomplete".to_string(), theme().amber),
+        (_, true, _) => ("Cancelled".to_string(), theme().amber),
+        (_, _, 0) => ("Clean".to_string(), theme().green),
+        (_, _, n) => (format!("{n} threat(s)"), theme().red),
+    }
+}
+
+/// The parent entry of a group: what repeats, how often and since when.
+/// Clicking its title row opens or closes it.
+fn group_card(ui: &mut Ui, g: &Repeats) -> Option<GroupAction> {
+    let mut action = None;
+    let s = &g.newest;
+    card(ui, |ui| {
+        let row = ui.horizontal_wrapped(|ui| {
+            if chevron(ui, g.open).clicked() {
+                action = Some(GroupAction::Toggle);
+            }
+            let kind_color = if store::is_protection_kind(&s.kind) { theme().green } else { theme().accent };
+            badge(ui, &s.kind.to_uppercase(), kind_color);
+            let title = s.top_threat.clone().unwrap_or_else(|| "Checks that found nothing".into());
+            ui.add(egui::Label::new(RichText::new(title).strong().color(theme().text)).wrap());
+            let (status, color) = history_status(s);
+            badge(ui, &status, color);
+            badge(ui, &format!("{}×", g.ids.len()), theme().muted);
+        });
+        if row.response.interact(Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            action = Some(GroupAction::Toggle);
+        }
+        small(ui, format!("Latest {} · first {}", short_time(&s.started_at), short_time(&g.first)));
+        if s.top_threat.is_some() {
+            truncated(ui, s.targets.clone(), theme().muted, 12.5);
+        }
+        ui.horizontal(|ui| {
+            let label = if g.open { "Hide records".to_string() } else { format!("Show {} records", g.ids.len()) };
+            if small_button(ui, &label).clicked() {
+                action = Some(GroupAction::Toggle);
+            }
+            if small_button(ui, "Delete all…").clicked() {
+                action = Some(GroupAction::Delete);
+            }
+        });
+    });
+    action
 }
 
 fn capitalize(text: &str) -> String {

@@ -19,6 +19,9 @@ pub(super) struct AuditState {
     exclusions_rx: Option<Receiver<Result<Option<DefenderExclusions>, String>>>,
     exclusions: Option<DefenderExclusions>,
     show_fine: bool,
+    show_leftovers: bool,
+    /// Removing leftovers as administrator: what could not be removed.
+    cleaning: Option<Receiver<Result<Option<Vec<String>>, String>>>,
     /// What the browser data watch caught since the app started.
     browser_hits: Vec<BrowserHit>,
 }
@@ -49,6 +52,12 @@ fn severity_color(s: Severity) -> Color32 {
 }
 
 impl App {
+    /// Whether the browser data watch was told to let this program (or DLL)
+    /// read browser data.
+    pub(super) fn allowed_to_read(&self, path: &Path) -> bool {
+        self.settings.browser_guard_allowed.iter().any(|a| a.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+    }
+
     fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
@@ -86,7 +95,39 @@ impl App {
         self.audit.exclusions_rx = Some(rx);
     }
 
+    /// Removes the leftovers as administrator, then checks again.
+    fn clean_leftovers(&mut self, ctx: &egui::Context) {
+        let Some(report) = &self.audit.report else { return };
+        if self.audit.cleaning.is_some() {
+            return;
+        }
+        let items: Vec<AuditItem> = report.items.iter().filter(|i| i.leftover).cloned().collect();
+        let (tx, rx) = mpsc::channel();
+        let dir = self.audit_dir();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(audit::remove_leftovers(&items, &dir).map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.audit.cleaning = Some(rx);
+    }
+
     pub(super) fn poll_audit(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.audit.cleaning && let Ok(result) = rx.try_recv() {
+            self.audit.cleaning = None;
+            match result {
+                Ok(Some(failed)) if failed.is_empty() => {
+                    self.notify("Leftovers removed; checking again", true);
+                    self.start_audit(ctx);
+                }
+                Ok(Some(failed)) => {
+                    self.notify(format!("Some leftovers could not be removed: {}", failed.join("; ")), false);
+                    self.start_audit(ctx);
+                }
+                Ok(None) => self.notify("Cancelled at the Windows prompt; nothing was removed", false),
+                Err(e) => self.notify(format!("Could not remove the leftovers: {e}"), false),
+            }
+        }
         if let Some((rx, _)) = &self.audit.running && let Ok(report) = rx.try_recv() {
             self.audit.running = None;
             let high = report.count(Severity::High);
@@ -115,7 +156,7 @@ impl App {
     }
 
     pub(super) fn audit_busy(&self) -> bool {
-        self.audit.running.is_some() || self.audit.exclusions_rx.is_some()
+        self.audit.running.is_some() || self.audit.exclusions_rx.is_some() || self.audit.cleaning.is_some()
     }
 
     /// The browser data watch: its switches, whether it runs, and what it
@@ -169,10 +210,19 @@ impl App {
             }
         });
 
+        // Alerts about programs allowed since are no longer shown.
+        let mut hidden = 0;
         for (i, hit) in self.audit.browser_hits.iter().enumerate() {
+            if self.allowed_to_read(subject(hit)) {
+                hidden += 1;
+                continue;
+            }
             ui.add_space(8.0);
-            let allowed = self.settings.browser_guard_allowed.iter().any(|a| a.as_os_str().eq_ignore_ascii_case(subject(hit).as_os_str()));
-            browser_hit_card(ui, i, hit, allowed, &mut action);
+            browser_hit_card(ui, i, hit, &mut action);
+        }
+        if hidden > 0 {
+            ui.add_space(6.0);
+            small(ui, format!("{hidden} alert(s) about programs you allowed are hidden."));
         }
         if !self.audit.browser_hits.is_empty() {
             ui.add_space(6.0);
@@ -238,7 +288,8 @@ impl App {
                         ("High", report.count(Severity::High).to_string()),
                         ("To review", report.count(Severity::Medium).to_string()),
                         ("Low", report.count(Severity::Low).to_string()),
-                        ("Fine", report.count(Severity::Info).to_string()),
+                        ("Fine", report.items.iter().filter(|i| i.severity == Severity::Info && !i.leftover).count().to_string()),
+                        ("Leftovers", report.items.iter().filter(|i| i.leftover).count().to_string()),
                         ("Took", fmt_duration(Duration::from_millis(report.elapsed_ms as u64))),
                     ],
                 );
@@ -283,7 +334,34 @@ impl App {
             ui.add_space(8.0);
         }
 
-        let fine = report.items.len() - flagged.len();
+        let leftovers: Vec<&AuditItem> = report.items.iter().filter(|i| i.leftover && i.severity == Severity::Info).collect();
+        let mut clean = false;
+        if !leftovers.is_empty() {
+            ui.add_space(6.0);
+            let n = leftovers.len();
+            ui.horizontal_wrapped(|ui| {
+                let label = if self.audit.show_leftovers { format!("Hide {n} leftover(s) from uninstalled programs") } else { format!("Show {n} leftover(s) from uninstalled programs") };
+                if small_button(ui, &label).clicked() {
+                    self.audit.show_leftovers = !self.audit.show_leftovers;
+                }
+                if self.audit.cleaning.is_some() {
+                    spinner(ui);
+                    muted(ui, "Removing…");
+                } else {
+                    clean = ui.add_enabled_ui(self.audit.running.is_none(), |ui| small_button(ui, "Remove leftovers…").clicked()).inner;
+                }
+            });
+            if self.audit.show_leftovers {
+                small(ui, "Tasks, services and start-up entries whose program was removed from Program Files. They fail harmlessly at start-up, and only an administrator could put a program in their place. Remove leftovers deletes these entries (not any files), as administrator: Windows asks first.");
+                ui.add_space(6.0);
+                for it in &leftovers {
+                    item_card(ui, it, self.settings.ai_enabled, &mut action);
+                    ui.add_space(8.0);
+                }
+            }
+        }
+
+        let fine = report.items.len() - flagged.len() - leftovers.len();
         if fine > 0 {
             ui.add_space(6.0);
             let label = if self.audit.show_fine { format!("Hide {fine} entries with nothing wrong") } else { format!("Show {fine} entries with nothing wrong") };
@@ -292,13 +370,16 @@ impl App {
             }
             if self.audit.show_fine {
                 ui.add_space(6.0);
-                for it in report.items.iter().filter(|i| i.severity == Severity::Info) {
+                for it in report.items.iter().filter(|i| i.severity == Severity::Info && !i.leftover) {
                     item_card(ui, it, self.settings.ai_enabled, &mut action);
                     ui.add_space(8.0);
                 }
             }
         }
 
+        if clean {
+            self.clean_leftovers(ctx);
+        }
         match action {
             Some(ItemAction::OpenFolder(path)) => {
                 let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
@@ -310,7 +391,7 @@ impl App {
     }
 }
 
-fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, allowed: bool, action: &mut Option<WatchAction>) {
+fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, action: &mut Option<WatchAction>) {
     let (label, color) = match hit.level {
         BrowserLevel::High => ("HIGH", theme().red),
         BrowserLevel::Review => ("REVIEW", theme().amber),
@@ -360,7 +441,7 @@ fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, allowed: bool, 
             let file = subject(hit).is_file().then(|| subject(hit).to_path_buf());
             if let Some(path) = &file {
                 let label = if hit.kind == BrowserGuardKind::Injected { "Allow this DLL" } else { "Allow this program" };
-                if hit.kind != BrowserGuardKind::RemoteControl && !allowed && small_button(ui, label).clicked() {
+                if hit.kind != BrowserGuardKind::RemoteControl && small_button(ui, label).clicked() {
                     *action = Some(WatchAction::Allow(path.clone()));
                 }
                 if small_button(ui, "Open folder").clicked() {

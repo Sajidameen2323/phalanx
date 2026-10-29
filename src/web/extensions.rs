@@ -213,13 +213,23 @@ fn read_json(path: &Path) -> Option<Value> {
 
 /// `extensions.settings`, merged from both preference files (the secure one
 /// wins, as in the browser).
-/// Display names of the profiles that have extension `id` installed.
-pub fn profiles_with_extension(user_data: &Path, id: &str) -> Vec<String> {
+/// Display names of the profiles that have extension `id` installed, and
+/// whether it is turned on in each.
+pub fn profiles_with_extension(user_data: &Path, id: &str) -> Vec<(String, bool)> {
     profiles(user_data)
         .into_iter()
-        .filter(|(dir, _)| extension_settings(&user_data.join(dir)).is_ok_and(|s| s.contains_key(id)))
-        .map(|(_, name)| name)
+        .filter_map(|(dir, name)| {
+            let settings = extension_settings(&user_data.join(dir)).ok()?;
+            settings.get(id).map(|entry| (name, !turned_off(entry)))
+        })
         .collect()
+}
+
+/// Whether the browser lists an extension as turned off (by the person, or
+/// by the browser for a reason it keeps).
+fn turned_off(entry: &Value) -> bool {
+    entry.get("state").and_then(Value::as_i64) == Some(0)
+        || entry.get("disable_reasons").is_some_and(|d| d.as_i64().is_some_and(|n| n != 0) || d.as_array().is_some_and(|a| !a.is_empty()))
 }
 
 fn extension_settings(profile_dir: &Path) -> Result<Map<String, Value>> {
@@ -306,8 +316,7 @@ fn assess(id: &str, entry: &Value, manifest: &Value, dir: Option<&Path>, known_b
     let version = manifest.get("version").and_then(Value::as_str).unwrap_or("").to_string();
     let location = entry.get("location").and_then(Value::as_i64).unwrap_or(0);
     let from_web_store = entry.get("from_webstore").and_then(Value::as_bool).unwrap_or(false);
-    let disabled = entry.get("state").and_then(Value::as_i64) == Some(0)
-        || entry.get("disable_reasons").is_some_and(|d| d.as_i64().is_some_and(|n| n != 0) || d.as_array().is_some_and(|a| !a.is_empty()));
+    let disabled = turned_off(entry);
 
     let mut permissions = strings(manifest.get("permissions"));
     permissions.extend(strings(manifest.get("host_permissions")));

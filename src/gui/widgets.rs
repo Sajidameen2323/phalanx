@@ -264,6 +264,42 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
+/// A card nested under the one above it, joined to it by a line.
+pub fn child_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    const INDENT: i8 = 28;
+    let shown = egui::Frame::new()
+        .fill(theme().card)
+        .stroke(Stroke::new(1.0, theme().hairline))
+        .corner_radius(12.0)
+        .inner_margin(Margin::same(14))
+        .outer_margin(Margin { left: INDENT, right: 0, top: 0, bottom: 0 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        });
+    let rect = shown.response.rect;
+    let x = rect.left() + INDENT as f32 / 2.0;
+    let stroke = Stroke::new(1.5, theme().hairline.lerp_to_gamma(theme().muted, 0.4));
+    let y = rect.top() + 24.0;
+    ui.painter().line_segment([egui::pos2(x, rect.top() - 10.0), egui::pos2(x, y)], stroke);
+    ui.painter().line_segment([egui::pos2(x, y), egui::pos2(rect.left() + INDENT as f32, y)], stroke);
+    shown.inner
+}
+
+/// A disclosure triangle: right when closed, down when open.
+pub fn chevron(ui: &mut Ui, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::click());
+    let color = if response.hovered() { theme().text } else { theme().muted };
+    let c = rect.center();
+    let points = if open {
+        vec![egui::pos2(c.x - 5.0, c.y - 2.5), egui::pos2(c.x + 5.0, c.y - 2.5), egui::pos2(c.x, c.y + 3.5)]
+    } else {
+        vec![egui::pos2(c.x - 2.5, c.y - 5.0), egui::pos2(c.x + 3.5, c.y), egui::pos2(c.x - 2.5, c.y + 5.0)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub fn section_title(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).font(semibold(16.0)).extra_letter_spacing(-0.1).color(theme().text));
 }
