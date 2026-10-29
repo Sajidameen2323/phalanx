@@ -51,6 +51,8 @@ use std::time::{Duration, Instant};
 const RETRY: Duration = Duration::from_secs(60);
 /// Files the same program opens this soon after the first join its alert.
 const GATHER: Duration = Duration::from_millis(400);
+/// How long a file alert for a program not yet known waits for its start.
+const IDENTIFY_WAIT: Duration = Duration::from_secs(2);
 /// A signed program is reported at most this often per browser.
 const REVIEW_EVERY: Duration = Duration::from_secs(60 * 60);
 /// How long an exited program is remembered. Windows can deliver a file
@@ -405,10 +407,10 @@ pub fn judge(image: &Path, trust: &Trust, secret: &Secret, allowed: &[PathBuf], 
 /// Whether `image` may open a browser with rights to read its memory.
 /// Windows' own programs (crash reporting, Task Manager, Defender) and the
 /// browsers themselves do; script hosts and unsigned programs should not.
-/// Signed programs installed in `protected` folders (game overlays, mouse
-/// and keyboard software, screen recorders) open every window's process
-/// and are not reported.
-pub fn judge_memory(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: Option<&Path>, protected: &[String]) -> Option<(Level, String)> {
+/// Other signed programs (anti-cheat, game overlays, mouse and keyboard
+/// software, screen recorders) open every window's process and are only
+/// reported when they run from where downloads and droppers land.
+pub fn judge_memory(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: Option<&Path>) -> Option<(Level, String)> {
     if allowed_here(image, allowed, own_dir) {
         return None;
     }
@@ -418,10 +420,10 @@ pub fn judge_memory(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: O
     match trust {
         Trust::Signed { signer, .. } => {
             let s = signer.as_deref().unwrap_or("an unnamed publisher");
-            if contains(s, "Microsoft") || BROWSER_MAKERS.iter().any(|m| contains(s, m)) || is_protected(image, protected) {
+            if !dropped(image) {
                 return None;
             }
-            Some((Level::Review, format!("it is signed by {s}; security and monitoring tools may do this, so it was only reported")))
+            Some((Level::Review, format!("it is signed by {s} but runs from a folder where downloads and droppers land, so it was reported")))
         }
         _ => unsigned_reason(trust).map(|why| (Level::High, format!("{why}; reading a browser's memory gets its sign-in cookies without touching its files"))),
     }
@@ -445,13 +447,17 @@ fn is_protected(path: &Path, protected: &[String]) -> bool {
 /// the protected folders. `None` for a signed DLL.
 pub fn judge_dll(dll: &Path, trust: &Trust) -> Option<(Level, String)> {
     let why = unsigned_reason(trust)?;
-    let lower = dll.to_string_lossy().to_lowercase();
-    let dropped = [r"\temp\", r"\downloads\", r"\users\public\", r"\appdata\local\temp\"].iter().any(|f| lower.contains(f));
-    Some(if dropped {
+    Some(if dropped(dll) {
         (Level::High, format!("{why} and it came from a folder where downloads and droppers land; code inside the browser can take its sign-in cookies"))
     } else {
         (Level::Review, format!("{why}; code inside the browser can take its sign-in cookies, but some apps add plugins this way, so it was only reported"))
     })
+}
+
+/// Whether `path` is in a folder where downloads and droppers land.
+fn dropped(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_lowercase();
+    [r"\temp\", r"\downloads\", r"\users\public\"].iter().any(|f| lower.contains(f))
 }
 
 /// A browser start worth an alert: what it was started with and how sure.
@@ -789,7 +795,37 @@ impl Watch<'_, '_> {
             exited: gone || info.is_none(),
             controller: None,
         };
-        self.pending.push((hit, Instant::now() + GATHER));
+        // Windows can deliver a program's start after its file opens; one not
+        // yet known is looked up again before it is reported.
+        let wait = if info.is_none() { IDENTIFY_WAIT } else { GATHER };
+        self.pending.push((hit, Instant::now() + wait));
+    }
+
+    /// A file alert held for a program that was not yet known: judged again
+    /// now that its start may have arrived. `None` when it may open it.
+    fn identify_late(&mut self, mut hit: BrowserHit) -> Option<BrowserHit> {
+        if hit.kind != GuardKind::DataRead || !hit.image.as_os_str().is_empty() {
+            return Some(hit);
+        }
+        let Some((info, gone)) = self.info_or_exited(hit.pid) else { return Some(hit) };
+        let secret = secret(&hit.files.first()?.to_string_lossy())?;
+        let trust = self.trust(&info.image);
+        let verdict = judge(&info.image, &trust, &secret, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref());
+        self.judged.insert(info.id.clone(), verdict.is_some());
+        let (level, reason) = verdict?;
+        if level == Level::Review && reviewed_lately(&info.image, secret.browser) {
+            return None;
+        }
+        let stop = level == Level::High && self.ctx.config.browser_guard_stop && !gone;
+        hit.level = level;
+        hit.reason = reason;
+        hit.created = info.id.created;
+        hit.program = info.name.clone();
+        hit.signer = Self::signer(&trust);
+        hit.stopped = stop.then(|| process::terminate(&info.id));
+        hit.exited = gone && hit.stopped.is_none();
+        hit.image = info.image;
+        Some(hit)
     }
 
     /// A DLL loaded into a browser: an unsigned one from outside the
@@ -849,7 +885,7 @@ impl Watch<'_, '_> {
             self.judged_memory.clear();
         }
         let trust = self.trust(&reader.image);
-        let Some((level, reason)) = judge_memory(&reader.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref(), &self.protected) else { return };
+        let Some((level, reason)) = judge_memory(&reader.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref()) else { return };
         if level == Level::Review && reviewed_lately(&reader.image, "memory") {
             return;
         }
@@ -937,7 +973,9 @@ impl Watch<'_, '_> {
         let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending).into_iter().partition(|(_, at)| all || *at <= now);
         self.pending = waiting;
         for (hit, _) in due {
-            self.report(hit);
+            if let Some(hit) = self.identify_late(hit) {
+                self.report(hit);
+            }
         }
     }
 
@@ -1089,17 +1127,16 @@ mod tests {
 
     #[test]
     fn memory_reads_and_loaded_dlls_are_judged() {
-        let memory = |image: &str, trust: Trust| judge_memory(Path::new(image), &trust, &[], None, &[]).map(|(l, _)| l);
-        let protected = [r"c:\program files\".to_string(), r"c:\program files (x86)\".to_string()];
-        let installed = |image: &str, trust: Trust| judge_memory(Path::new(image), &trust, &[], None, &protected).map(|(l, _)| l);
-        assert_eq!(installed(r"C:\Program Files (x86)\Steam\steam.exe", signed("Valve Corp.")), None, "signed and installed");
-        assert_eq!(installed(r"C:\Users\me\AppData\Local\Tool\tool.exe", signed("Valve Corp.")), Some(Level::Review), "signed but in a user folder");
-        assert_eq!(installed(r"C:\Program Files (x86)\Steam\fake.exe", Trust::Unsigned), Some(Level::High), "unsigned is never let off");
+        let memory = |image: &str, trust: Trust| judge_memory(Path::new(image), &trust, &[], None).map(|(l, _)| l);
+        assert_eq!(memory(r"C:\Program Files (x86)\Steam\steam.exe", signed("Valve Corp.")), None, "signed and installed");
+        assert_eq!(memory(r"C:\Riot Games\Riot Client\RiotClientServices.exe", signed("Riot Games, Inc.")), None, "signed anti-cheat");
+        assert_eq!(memory(r"C:\Users\me\Downloads\tool.exe", signed("Valve Corp.")), Some(Level::Review), "signed but where droppers land");
+        assert_eq!(memory(r"C:\Program Files (x86)\Steam\fake.exe", Trust::Unsigned), Some(Level::High), "unsigned is never let off");
         assert_eq!(memory(r"C:\Windows\System32\WerFault.exe", signed("Microsoft Windows")), None);
         assert_eq!(memory(r"C:\Program Files\Google\Chrome\Application\chrome.exe", signed("Google LLC")), None);
         assert_eq!(memory(r"C:\Users\me\AppData\Local\Temp\katz.exe", Trust::Unsigned), Some(Level::High));
         assert_eq!(memory(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", signed("Microsoft Windows")), Some(Level::High));
-        assert_eq!(memory(r"C:\Program Files\Monitor\monitor.exe", signed("Acme")), Some(Level::Review));
+        assert_eq!(memory(r"C:\Program Files\Monitor\monitor.exe", signed("Acme")), None);
 
         let dll = |path: &str, trust: Trust| judge_dll(Path::new(path), &trust).map(|(l, _)| l);
         assert_eq!(dll(r"C:\Users\me\AppData\Local\Temp\x\chrome_elf_hook.dll", Trust::Unsigned), Some(Level::High));
