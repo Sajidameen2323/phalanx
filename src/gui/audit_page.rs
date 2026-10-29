@@ -20,6 +20,8 @@ pub(super) struct AuditState {
     exclusions: Option<DefenderExclusions>,
     show_fine: bool,
     show_leftovers: bool,
+    /// Removing leftovers as administrator: what could not be removed.
+    cleaning: Option<Receiver<Result<Option<Vec<String>>, String>>>,
     /// What the browser data watch caught since the app started.
     browser_hits: Vec<BrowserHit>,
 }
@@ -93,7 +95,39 @@ impl App {
         self.audit.exclusions_rx = Some(rx);
     }
 
+    /// Removes the leftovers as administrator, then checks again.
+    fn clean_leftovers(&mut self, ctx: &egui::Context) {
+        let Some(report) = &self.audit.report else { return };
+        if self.audit.cleaning.is_some() {
+            return;
+        }
+        let items: Vec<AuditItem> = report.items.iter().filter(|i| i.leftover).cloned().collect();
+        let (tx, rx) = mpsc::channel();
+        let dir = self.audit_dir();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(audit::remove_leftovers(&items, &dir).map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.audit.cleaning = Some(rx);
+    }
+
     pub(super) fn poll_audit(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.audit.cleaning && let Ok(result) = rx.try_recv() {
+            self.audit.cleaning = None;
+            match result {
+                Ok(Some(failed)) if failed.is_empty() => {
+                    self.notify("Leftovers removed; checking again", true);
+                    self.start_audit(ctx);
+                }
+                Ok(Some(failed)) => {
+                    self.notify(format!("Some leftovers could not be removed: {}", failed.join("; ")), false);
+                    self.start_audit(ctx);
+                }
+                Ok(None) => self.notify("Cancelled at the Windows prompt; nothing was removed", false),
+                Err(e) => self.notify(format!("Could not remove the leftovers: {e}"), false),
+            }
+        }
         if let Some((rx, _)) = &self.audit.running && let Ok(report) = rx.try_recv() {
             self.audit.running = None;
             let high = report.count(Severity::High);
@@ -122,7 +156,7 @@ impl App {
     }
 
     pub(super) fn audit_busy(&self) -> bool {
-        self.audit.running.is_some() || self.audit.exclusions_rx.is_some()
+        self.audit.running.is_some() || self.audit.exclusions_rx.is_some() || self.audit.cleaning.is_some()
     }
 
     /// The browser data watch: its switches, whether it runs, and what it
@@ -301,15 +335,24 @@ impl App {
         }
 
         let leftovers: Vec<&AuditItem> = report.items.iter().filter(|i| i.leftover && i.severity == Severity::Info).collect();
+        let mut clean = false;
         if !leftovers.is_empty() {
             ui.add_space(6.0);
             let n = leftovers.len();
-            let label = if self.audit.show_leftovers { format!("Hide {n} leftover(s) from uninstalled programs") } else { format!("Show {n} leftover(s) from uninstalled programs") };
-            if small_button(ui, &label).clicked() {
-                self.audit.show_leftovers = !self.audit.show_leftovers;
-            }
+            ui.horizontal_wrapped(|ui| {
+                let label = if self.audit.show_leftovers { format!("Hide {n} leftover(s) from uninstalled programs") } else { format!("Show {n} leftover(s) from uninstalled programs") };
+                if small_button(ui, &label).clicked() {
+                    self.audit.show_leftovers = !self.audit.show_leftovers;
+                }
+                if self.audit.cleaning.is_some() {
+                    spinner(ui);
+                    muted(ui, "Removing…");
+                } else {
+                    clean = ui.add_enabled_ui(self.audit.running.is_none(), |ui| small_button(ui, "Remove leftovers…").clicked()).inner;
+                }
+            });
             if self.audit.show_leftovers {
-                small(ui, "Tasks and services whose program was removed from Program Files. They fail harmlessly at start-up, and only an administrator could put a program in their place. Delete them in Task Scheduler or with `sc delete <name>` as administrator if you like.");
+                small(ui, "Tasks, services and start-up entries whose program was removed from Program Files. They fail harmlessly at start-up, and only an administrator could put a program in their place. Remove leftovers deletes these entries (not any files), as administrator: Windows asks first.");
                 ui.add_space(6.0);
                 for it in &leftovers {
                     item_card(ui, it, self.settings.ai_enabled, &mut action);
@@ -334,6 +377,9 @@ impl App {
             }
         }
 
+        if clean {
+            self.clean_leftovers(ctx);
+        }
         match action {
             Some(ItemAction::OpenFolder(path)) => {
                 let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
