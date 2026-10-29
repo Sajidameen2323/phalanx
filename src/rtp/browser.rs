@@ -405,7 +405,10 @@ pub fn judge(image: &Path, trust: &Trust, secret: &Secret, allowed: &[PathBuf], 
 /// Whether `image` may open a browser with rights to read its memory.
 /// Windows' own programs (crash reporting, Task Manager, Defender) and the
 /// browsers themselves do; script hosts and unsigned programs should not.
-pub fn judge_memory(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: Option<&Path>) -> Option<(Level, String)> {
+/// Signed programs installed in `protected` folders (game overlays, mouse
+/// and keyboard software, screen recorders) open every window's process
+/// and are not reported.
+pub fn judge_memory(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: Option<&Path>, protected: &[String]) -> Option<(Level, String)> {
     if allowed_here(image, allowed, own_dir) {
         return None;
     }
@@ -415,7 +418,7 @@ pub fn judge_memory(image: &Path, trust: &Trust, allowed: &[PathBuf], own_dir: O
     match trust {
         Trust::Signed { signer, .. } => {
             let s = signer.as_deref().unwrap_or("an unnamed publisher");
-            if contains(s, "Microsoft") || BROWSER_MAKERS.iter().any(|m| contains(s, m)) {
+            if contains(s, "Microsoft") || BROWSER_MAKERS.iter().any(|m| contains(s, m)) || is_protected(image, protected) {
                 return None;
             }
             Some((Level::Review, format!("it is signed by {s}; security and monitoring tools may do this, so it was only reported")))
@@ -846,7 +849,7 @@ impl Watch<'_, '_> {
             self.judged_memory.clear();
         }
         let trust = self.trust(&reader.image);
-        let Some((level, reason)) = judge_memory(&reader.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref()) else { return };
+        let Some((level, reason)) = judge_memory(&reader.image, &trust, &self.ctx.config.browser_guard_allowed, self.own_dir.as_deref(), &self.protected) else { return };
         if level == Level::Review && reviewed_lately(&reader.image, "memory") {
             return;
         }
@@ -1086,7 +1089,12 @@ mod tests {
 
     #[test]
     fn memory_reads_and_loaded_dlls_are_judged() {
-        let memory = |image: &str, trust: Trust| judge_memory(Path::new(image), &trust, &[], None).map(|(l, _)| l);
+        let memory = |image: &str, trust: Trust| judge_memory(Path::new(image), &trust, &[], None, &[]).map(|(l, _)| l);
+        let protected = [r"c:\program files\".to_string(), r"c:\program files (x86)\".to_string()];
+        let installed = |image: &str, trust: Trust| judge_memory(Path::new(image), &trust, &[], None, &protected).map(|(l, _)| l);
+        assert_eq!(installed(r"C:\Program Files (x86)\Steam\steam.exe", signed("Valve Corp.")), None, "signed and installed");
+        assert_eq!(installed(r"C:\Users\me\AppData\Local\Tool\tool.exe", signed("Valve Corp.")), Some(Level::Review), "signed but in a user folder");
+        assert_eq!(installed(r"C:\Program Files (x86)\Steam\fake.exe", Trust::Unsigned), Some(Level::High), "unsigned is never let off");
         assert_eq!(memory(r"C:\Windows\System32\WerFault.exe", signed("Microsoft Windows")), None);
         assert_eq!(memory(r"C:\Program Files\Google\Chrome\Application\chrome.exe", signed("Google LLC")), None);
         assert_eq!(memory(r"C:\Users\me\AppData\Local\Temp\katz.exe", Trust::Unsigned), Some(Level::High));

@@ -105,6 +105,9 @@ pub struct AuditItem {
     pub reasons: Vec<String>,
     /// Local engine matches on the program.
     pub detections: Vec<Finding>,
+    /// Left behind by an uninstall: the program is gone from a folder only
+    /// administrators can write to, so nothing can be planted in its place.
+    pub leftover: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -368,6 +371,7 @@ fn item(kind: Kind, title: &str, location: &str, command: &str, env: &Env) -> Au
         signature: Signature::Unknown,
         reasons,
         detections: Vec::new(),
+        leftover: false,
     }
 }
 
@@ -408,8 +412,16 @@ fn rate(it: &mut AuditItem, env: &Env) {
         let writable = env.user_writable(&path);
         match (&it.signature, exists) {
             (_, false) if matches!(it.kind, Kind::StartupEntry | Kind::ScheduledTask | Kind::Service) => {
-                it.reasons.push("the program it starts no longer exists".into());
-                bump(Severity::Low);
+                if writable {
+                    it.reasons.push(format!("the program it starts is missing from a folder any program can write to ({}), so another program could be put in its place", short_dir(&path)));
+                    bump(Severity::Medium);
+                } else if env.admin_only(&path) {
+                    it.reasons.push("left over from an uninstall: the program it starts no longer exists".into());
+                    it.leftover = true;
+                } else {
+                    it.reasons.push("the program it starts no longer exists".into());
+                    bump(Severity::Low);
+                }
             }
             (Signature::Unsigned, true) if writable => {
                 it.reasons.push(format!("unsigned program in a folder any program can write to ({})", short_dir(&path)));
@@ -516,6 +528,8 @@ struct Env {
     windows: PathBuf,
     writable: Vec<PathBuf>,
     temp: Vec<PathBuf>,
+    /// Program Files folders: only administrators can write to them.
+    program_files: Vec<PathBuf>,
 }
 
 impl Env {
@@ -531,7 +545,8 @@ impl Env {
         }
         writable.push(windows.join("Temp"));
         let temp = ["TEMP", "TMP"].iter().filter_map(|n| var(n)).map(PathBuf::from).chain(Some(windows.join("Temp"))).collect();
-        Self { vars, windows, writable, temp }
+        let program_files = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().filter_map(|n| var(n)).map(PathBuf::from).collect();
+        Self { vars, windows, writable, temp, program_files }
     }
 
     /// `%SystemRoot%\x` → `C:\Windows\x`; unknown variables are kept.
@@ -591,6 +606,12 @@ impl Env {
     fn user_writable(&self, path: &Path) -> bool {
         let p = lower(path);
         self.writable.iter().any(|d| p.starts_with(&lower(d)))
+    }
+
+    /// In Program Files or Windows, outside the folders users can write to.
+    fn admin_only(&self, path: &Path) -> bool {
+        let p = lower(path);
+        !self.user_writable(path) && (self.is_windows_dir(path) || self.program_files.iter().any(|d| p.starts_with(&lower(d))))
     }
 
     fn is_temp(&self, path: &Path) -> bool {
@@ -671,6 +692,7 @@ fn browser_policies(#[cfg_attr(windows, allow(unused_variables))] errors: &mut V
                             "a policy installs this extension and stops you from removing it; malware uses this to keep a data-stealing extension in your browser (fine if your PC is managed by work or school)".into(),
                         ],
                         detections: Vec::new(),
+                        leftover: false,
                     });
                 }
             }
@@ -702,6 +724,7 @@ fn proxy_items() -> Vec<AuditItem> {
             signature: Signature::Unknown,
             reasons: vec![reason.to_string()],
             detections: Vec::new(),
+            leftover: false,
         };
         let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) == 1;
         let server: String = key.get_value("ProxyServer").unwrap_or_default();
@@ -771,6 +794,7 @@ fn hosts_findings(text: &str, location: &str) -> Vec<AuditItem> {
                 signature: Signature::Unknown,
                 reasons: vec![reason],
                 detections: Vec::new(),
+                leftover: false,
             });
         }
     }
@@ -827,6 +851,7 @@ fn exclusion_items(ex: &DefenderExclusions, env: &Env) -> Vec<AuditItem> {
             signature: Signature::Unknown,
             reasons: vec![reason],
             detections: Vec::new(),
+            leftover: false,
         });
     };
     for p in &ex.paths {
@@ -869,6 +894,7 @@ mod tests {
             windows: PathBuf::from(r"C:\Windows"),
             writable: vec![PathBuf::from(r"C:\Users\u\AppData\Roaming"), PathBuf::from(r"C:\Users\u\AppData\Local\Temp")],
             temp: vec![PathBuf::from(r"C:\Users\u\AppData\Local\Temp")],
+            program_files: vec![PathBuf::from(r"C:\Program Files"), PathBuf::from(r"C:\Program Files (x86)")],
         }
     }
 
@@ -920,7 +946,15 @@ mod tests {
 
         let mut missing = item(Kind::ScheduledTask, "Old", "Tasks", r"C:\gone\nothing.exe", &e);
         rate(&mut missing, &e);
-        assert_eq!(missing.severity, Severity::Low);
+        assert_eq!((missing.severity, missing.leftover), (Severity::Low, false));
+
+        let mut uninstalled = item(Kind::Service, "AdskNLM", "Services", r#""C:\Program Files\Gone App\lmgrd.exe" -z"#, &e);
+        rate(&mut uninstalled, &e);
+        assert_eq!((uninstalled.severity, uninstalled.leftover), (Severity::Info, true), "{:?}", uninstalled.reasons);
+
+        let mut plantable = item(Kind::StartupEntry, "Upd", "Run", r"C:\Users\u\AppData\Roaming\Gone\upd.exe", &e);
+        rate(&mut plantable, &e);
+        assert_eq!((plantable.severity, plantable.leftover), (Severity::Medium, false), "{:?}", plantable.reasons);
 
         let mut encoded = item(Kind::ScheduledTask, "Sync", "Tasks", "powershell.exe -w hidden -enc AAAA", &e);
         rate(&mut encoded, &e);

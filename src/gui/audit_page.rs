@@ -19,6 +19,7 @@ pub(super) struct AuditState {
     exclusions_rx: Option<Receiver<Result<Option<DefenderExclusions>, String>>>,
     exclusions: Option<DefenderExclusions>,
     show_fine: bool,
+    show_leftovers: bool,
     /// What the browser data watch caught since the app started.
     browser_hits: Vec<BrowserHit>,
 }
@@ -49,6 +50,12 @@ fn severity_color(s: Severity) -> Color32 {
 }
 
 impl App {
+    /// Whether the browser data watch was told to let this program (or DLL)
+    /// read browser data.
+    pub(super) fn allowed_to_read(&self, path: &Path) -> bool {
+        self.settings.browser_guard_allowed.iter().any(|a| a.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+    }
+
     fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
@@ -169,10 +176,19 @@ impl App {
             }
         });
 
+        // Alerts about programs allowed since are no longer shown.
+        let mut hidden = 0;
         for (i, hit) in self.audit.browser_hits.iter().enumerate() {
+            if self.allowed_to_read(subject(hit)) {
+                hidden += 1;
+                continue;
+            }
             ui.add_space(8.0);
-            let allowed = self.settings.browser_guard_allowed.iter().any(|a| a.as_os_str().eq_ignore_ascii_case(subject(hit).as_os_str()));
-            browser_hit_card(ui, i, hit, allowed, &mut action);
+            browser_hit_card(ui, i, hit, &mut action);
+        }
+        if hidden > 0 {
+            ui.add_space(6.0);
+            small(ui, format!("{hidden} alert(s) about programs you allowed are hidden."));
         }
         if !self.audit.browser_hits.is_empty() {
             ui.add_space(6.0);
@@ -238,7 +254,8 @@ impl App {
                         ("High", report.count(Severity::High).to_string()),
                         ("To review", report.count(Severity::Medium).to_string()),
                         ("Low", report.count(Severity::Low).to_string()),
-                        ("Fine", report.count(Severity::Info).to_string()),
+                        ("Fine", report.items.iter().filter(|i| i.severity == Severity::Info && !i.leftover).count().to_string()),
+                        ("Leftovers", report.items.iter().filter(|i| i.leftover).count().to_string()),
                         ("Took", fmt_duration(Duration::from_millis(report.elapsed_ms as u64))),
                     ],
                 );
@@ -283,7 +300,25 @@ impl App {
             ui.add_space(8.0);
         }
 
-        let fine = report.items.len() - flagged.len();
+        let leftovers: Vec<&AuditItem> = report.items.iter().filter(|i| i.leftover && i.severity == Severity::Info).collect();
+        if !leftovers.is_empty() {
+            ui.add_space(6.0);
+            let n = leftovers.len();
+            let label = if self.audit.show_leftovers { format!("Hide {n} leftover(s) from uninstalled programs") } else { format!("Show {n} leftover(s) from uninstalled programs") };
+            if small_button(ui, &label).clicked() {
+                self.audit.show_leftovers = !self.audit.show_leftovers;
+            }
+            if self.audit.show_leftovers {
+                small(ui, "Tasks and services whose program was removed from Program Files. They fail harmlessly at start-up, and only an administrator could put a program in their place. Delete them in Task Scheduler or with `sc delete <name>` as administrator if you like.");
+                ui.add_space(6.0);
+                for it in &leftovers {
+                    item_card(ui, it, self.settings.ai_enabled, &mut action);
+                    ui.add_space(8.0);
+                }
+            }
+        }
+
+        let fine = report.items.len() - flagged.len() - leftovers.len();
         if fine > 0 {
             ui.add_space(6.0);
             let label = if self.audit.show_fine { format!("Hide {fine} entries with nothing wrong") } else { format!("Show {fine} entries with nothing wrong") };
@@ -292,7 +327,7 @@ impl App {
             }
             if self.audit.show_fine {
                 ui.add_space(6.0);
-                for it in report.items.iter().filter(|i| i.severity == Severity::Info) {
+                for it in report.items.iter().filter(|i| i.severity == Severity::Info && !i.leftover) {
                     item_card(ui, it, self.settings.ai_enabled, &mut action);
                     ui.add_space(8.0);
                 }
@@ -310,7 +345,7 @@ impl App {
     }
 }
 
-fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, allowed: bool, action: &mut Option<WatchAction>) {
+fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, action: &mut Option<WatchAction>) {
     let (label, color) = match hit.level {
         BrowserLevel::High => ("HIGH", theme().red),
         BrowserLevel::Review => ("REVIEW", theme().amber),
@@ -360,7 +395,7 @@ fn browser_hit_card(ui: &mut Ui, index: usize, hit: &BrowserHit, allowed: bool, 
             let file = subject(hit).is_file().then(|| subject(hit).to_path_buf());
             if let Some(path) = &file {
                 let label = if hit.kind == BrowserGuardKind::Injected { "Allow this DLL" } else { "Allow this program" };
-                if hit.kind != BrowserGuardKind::RemoteControl && !allowed && small_button(ui, label).clicked() {
+                if hit.kind != BrowserGuardKind::RemoteControl && small_button(ui, label).clicked() {
                     *action = Some(WatchAction::Allow(path.clone()));
                 }
                 if small_button(ui, "Open folder").clicked() {

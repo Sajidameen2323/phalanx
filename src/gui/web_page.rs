@@ -468,7 +468,7 @@ impl App {
                 let state = b.state();
                 let color = match state {
                     GuardState::Protecting => theme().green,
-                    GuardState::Waiting | GuardState::ExtensionMissing | GuardState::OtherCopy => theme().amber,
+                    GuardState::Waiting | GuardState::ExtensionMissing | GuardState::TurnedOff | GuardState::OtherCopy => theme().amber,
                     GuardState::NotConnected if b.installed => theme().amber,
                     _ => theme().muted,
                 };

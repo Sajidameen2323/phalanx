@@ -685,8 +685,11 @@ pub struct BrowserRegistration {
     pub current: bool,
     /// The browser has a profile on this PC.
     pub installed: bool,
-    /// Profiles (display names) where the Browser Guard extension is added.
+    /// Profiles (display names) where the Browser Guard extension is added
+    /// and turned on.
     pub extension_profiles: Vec<String>,
+    /// Profiles where it is added but turned off.
+    pub turned_off_profiles: Vec<String>,
     /// Last time this browser's extension reached Phalanx (RFC 3339).
     pub last_contact: Option<String>,
 }
@@ -701,6 +704,8 @@ pub enum GuardState {
     Waiting,
     /// The connector is registered, but the extension is not added.
     ExtensionMissing,
+    /// The extension is added but turned off in the browser.
+    TurnedOff,
     /// The registration points at another copy of Phalanx.
     OtherCopy,
     /// The browser is installed but the connector is not registered for it.
@@ -722,6 +727,7 @@ impl BrowserRegistration {
             }
             GuardState::Waiting => "extension added; waiting for it to reach Phalanx (restart the browser if this stays)".into(),
             GuardState::ExtensionMissing => "ready, but the extension is not added".into(),
+            GuardState::TurnedOff => format!("the extension is turned off in {}; turn it on in the browser's extensions page", self.turned_off_profiles.join(", ")),
             GuardState::OtherCopy => "linked to another copy of Phalanx; reconnect".into(),
             GuardState::NotConnected => "not connected".into(),
             GuardState::NotInstalled => "not installed".into(),
@@ -735,6 +741,8 @@ impl BrowserRegistration {
             GuardState::NotConnected
         } else if !self.current {
             GuardState::OtherCopy
+        } else if self.extension_profiles.is_empty() && !self.turned_off_profiles.is_empty() {
+            GuardState::TurnedOff
         } else if self.extension_profiles.is_empty() {
             GuardState::ExtensionMissing
         } else if self.last_contact.is_none() {
@@ -827,6 +835,17 @@ fn manifest_json(exe: &Path, firefox: bool) -> Value {
     manifest
 }
 
+/// Whether a connector manifest starts the connector next to this program.
+/// Unknown (no connector here, as in tests) counts as yes.
+fn starts_this_copy(manifest: &Path) -> bool {
+    let Ok(exe) = host_exe() else { return true };
+    let path = std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|m| m.get("path").and_then(|p| p.as_str()).map(PathBuf::from));
+    path.is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(exe.as_os_str()))
+}
+
 fn manifest_paths(data_dir: &Path) -> (PathBuf, PathBuf) {
     let dir = connector_dir(data_dir);
     (dir.join("chromium.json"), dir.join("firefox.json"))
@@ -890,9 +909,13 @@ pub fn status(data_dir: &Path) -> Vec<BrowserRegistration> {
             #[cfg(not(windows))]
             let manifest: Option<String> = None;
             let expected = if *is_firefox { &firefox } else { &chromium };
-            let current = manifest.as_deref().is_some_and(|m| Path::new(m) == expected.as_path() && expected.is_file());
-            let (installed, extension_profiles) = if *is_firefox {
-                firefox_extension()
+            // Ours only when it is this installation's manifest and starts
+            // this installation's connector (a development build may have
+            // written the same file).
+            let current = manifest.as_deref().is_some_and(|m| Path::new(m) == expected.as_path() && expected.is_file() && starts_this_copy(expected));
+            let (installed, extension_profiles, turned_off_profiles) = if *is_firefox {
+                let (installed, profiles) = firefox_extension();
+                (installed, profiles, Vec::new())
             } else {
                 // The Chromium row covers Vivaldi and Chromium.
                 let names: Vec<&str> = match *browser {
@@ -900,11 +923,11 @@ pub fn status(data_dir: &Path) -> Vec<BrowserRegistration> {
                     other => vec![other],
                 };
                 let found: Vec<&super::extensions::Browser> = chromium_browsers.iter().filter(|b| names.contains(&b.name.as_str())).collect();
-                let profiles = found
+                let (on, off): (Vec<_>, Vec<_>) = found
                     .iter()
                     .flat_map(|b| super::extensions::profiles_with_extension(&b.user_data, CHROMIUM_EXTENSION_ID))
-                    .collect();
-                (!found.is_empty(), profiles)
+                    .partition(|(_, on)| *on);
+                (!found.is_empty(), on.into_iter().map(|(name, _)| name).collect(), off.into_iter().map(|(name, _)| name).collect())
             };
             BrowserRegistration {
                 browser: browser.to_string(),
@@ -912,6 +935,7 @@ pub fn status(data_dir: &Path) -> Vec<BrowserRegistration> {
                 current,
                 installed,
                 extension_profiles,
+                turned_off_profiles,
                 last_contact: contacts.get(*browser).cloned(),
             }
         })
@@ -1136,8 +1160,11 @@ mod tests {
             current,
             installed,
             extension_profiles: if ext { vec!["Person 1".into()] } else { Vec::new() },
+            turned_off_profiles: Vec::new(),
             last_contact: contact.then(|| "2026-10-19T10:00:00+05:30".into()),
         };
+        let off = BrowserRegistration { turned_off_profiles: vec!["Person 1".into()], ..row(true, true, true, false, true) };
+        assert_eq!(off.state(), GuardState::TurnedOff, "an extension turned off in the browser protects nothing");
         assert_eq!(row(true, true, false, false, false).state(), GuardState::NotInstalled);
         assert_eq!(row(false, false, true, false, false).state(), GuardState::NotConnected);
         assert_eq!(row(true, false, true, true, true).state(), GuardState::OtherCopy);
